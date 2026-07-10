@@ -1,5 +1,4 @@
 use crate::runtime::RuntimeConfig;
-use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -11,7 +10,6 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str) -> Re
     }
 
     run_command("sudo", &["systemctl", "start", "containerd"])?;
-    ensure_cni_config_compatible()?;
     import_image(config)?;
     remove_stale_container(container_name)?;
 
@@ -33,36 +31,6 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str) -> Re
             container_name,
         ],
     )
-}
-
-fn ensure_cni_config_compatible() -> Result<(), String> {
-    let path = Path::new("/etc/cni/net.d/00-bunkerbox.conflist");
-    let Ok(contents) = fs::read_to_string(path) else {
-        return Ok(());
-    };
-
-    if !contents.contains("\"cniVersion\": \"1.0.0\"") {
-        return Ok(());
-    }
-
-    let fixed = contents.replace("\"cniVersion\": \"1.0.0\"", "\"cniVersion\": \"0.4.0\"");
-    let temp = std::env::temp_dir().join(format!("bunkerbox-cni-{}.conflist", std::process::id()));
-    fs::write(&temp, fixed).map_err(|err| format!("failed to write {}: {err}", temp.display()))?;
-
-    let result = run_command(
-        "sudo",
-        &[
-            "install",
-            "-m",
-            "0644",
-            temp.to_str()
-                .ok_or_else(|| format!("path is not valid UTF-8: {}", temp.display()))?,
-            "/etc/cni/net.d/00-bunkerbox.conflist",
-        ],
-    );
-
-    let _ = fs::remove_file(&temp);
-    result
 }
 
 fn import_image(config: &RuntimeConfig) -> Result<(), String> {

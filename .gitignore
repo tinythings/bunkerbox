@@ -1,0 +1,12 @@
+target/
+.bunker/
+.PLAN.md
+
+# Generated image archives
+*.oci
+kata-static-*.tar.zst
+
+# Demo-generated runtime files
+/demo/*/share/
+/demo/*/*-image.conf
+/demo/opencode/opencode

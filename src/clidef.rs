@@ -20,6 +20,14 @@ pub fn cli(version: &'static str) -> Command {
             Command::new("install-image").about("IT: import prepared OCI image").styles(styles.clone()).disable_help_flag(true).arg(help_arg()),
         )
         .subcommand(
+            Command::new("prepare")
+                .about("Create disposable bunker workspace")
+                .styles(styles.clone())
+                .disable_help_flag(true)
+                .arg(Arg::new("reset").long("reset").action(ArgAction::SetTrue).help("Recreate workspace if it already exists"))
+                .arg(help_arg()),
+        )
+        .subcommand(
             Command::new("run")
                 .about("Run named embedded YAML sequence")
                 .styles(styles.clone())
@@ -29,6 +37,11 @@ pub fn cli(version: &'static str) -> Command {
         )
         .subcommand(Command::new("list").about("List embedded YAML sequences").styles(styles.clone()).disable_help_flag(true).arg(help_arg()))
         .next_help_heading("Other")
+        .arg(
+            Arg::new("share")
+                .long("share")
+                .help("Override bunkerbox share directory")
+        )
         .arg(help_arg())
         .arg(Arg::new("version").short('v').long("version").action(ArgAction::SetTrue).help("Get the current version."))
         .disable_help_flag(true)

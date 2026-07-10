@@ -46,7 +46,7 @@ setup:
       set -Eeuo pipefail
 
       missing=""
-      for package in ca-certificates containerd containernetworking-plugins curl podman zstd; do
+      for package in ca-certificates containerd curl podman zstd; do
         if ! dpkg-query -W -f='${db:Status-Status}\n' "$package" 2>/dev/null | grep -qx installed; then
           missing="$missing $package"
         fi
@@ -69,112 +69,22 @@ setup:
     - |
       set -Eeuo pipefail
 
-      CNI_PLUGIN_DIR="/opt/cni/bin"
-      CNI_CONFIG="/etc/cni/net.d/00-bunkerbox.conflist"
-
-      if [ ! -d "$CNI_PLUGIN_DIR" ]; then
-        sudo install -d -m 0755 "$CNI_PLUGIN_DIR"
-      fi
-
-      if [ ! -d "$(dirname "$CNI_CONFIG")" ]; then
-        sudo install -d -m 0755 "$(dirname "$CNI_CONFIG")"
-      fi
-
-      for plugin in bridge host-local firewall; do
-        source="/usr/lib/cni/${plugin}"
-        target="${CNI_PLUGIN_DIR}/${plugin}"
-
-        if [ ! -x "$source" ]; then
-          echo "CNI plugin missing after package install: $source" >&2
-          exit 1
-        fi
-
-        if [ -e "$target" ] || [ -L "$target" ]; then
-          if [ "$(readlink -f "$target")" != "$source" ]; then
-            echo "refusing to replace existing CNI plugin: $target" >&2
-            exit 1
-          fi
-        else
-          echo "Linking CNI plugin: $target"
-          sudo ln -s "$source" "$target"
-        fi
-      done
-
-    - |
-      set -Eeuo pipefail
-
-      CNI_CONFIG="/etc/cni/net.d/00-bunkerbox.conflist"
-      CNI_NETWORK_NAME="bunkerbox"
-      CNI_BRIDGE="bunkerbox0"
-      CNI_SUBNET="${BUNKERBOX_CNI_SUBNET:-10.247.0.0/24}"
-      tmp="$(mktemp)"
-      trap 'rm -f "$tmp"' EXIT
-
-      if [ -f "$CNI_CONFIG" ] && ! grep -q '"name": "bunkerbox"' "$CNI_CONFIG"; then
-        echo "refusing to overwrite existing CNI config: $CNI_CONFIG" >&2
-        exit 1
-      fi
-
-      cat > "$tmp" <<EOF_CNI
-      {
-        "cniVersion": "1.0.0",
-        "name": "${CNI_NETWORK_NAME}",
-        "plugins": [
-          {
-            "type": "bridge",
-            "bridge": "${CNI_BRIDGE}",
-            "isGateway": true,
-            "ipMasq": true,
-            "hairpinMode": true,
-            "ipam": {
-              "type": "host-local",
-              "ranges": [
-                [
-                  { "subnet": "${CNI_SUBNET}" }
-                ]
-              ],
-              "routes": [
-                { "dst": "0.0.0.0/0" }
-              ]
-            }
-          },
-          {
-            "type": "firewall",
-            "backend": "iptables"
-          }
-        ]
-      }
-      EOF_CNI
-
-      if [ ! -f "$CNI_CONFIG" ] || ! sudo cmp -s "$tmp" "$CNI_CONFIG"; then
-        echo "Writing CNI config: $CNI_CONFIG"
-        sudo install -m 0644 "$tmp" "$CNI_CONFIG"
-      fi
-
-    - |
-      set -Eeuo pipefail
-
-      KATA_VERSION="${KATA_VERSION:-3.32.0}"
-      KATA_TARBALL="/tmp/kata-static-${KATA_VERSION}-amd64.tar.zst"
-      KATA_URL="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/$(basename "$KATA_TARBALL")"
+      KATA_DIR="${BUNKERBOX_KATA_DIR:-/usr/lib/bunkerbox/kata}"
       SHIM_LINK="/usr/local/bin/containerd-shim-kata-v2"
+      KATA_CONFIG_DIR="/etc/kata-containers"
+      KATA_CONFIG_LINK="${KATA_CONFIG_DIR}/configuration.toml"
+      KATA_CONFIG_SOURCE="${KATA_DIR}/share/defaults/kata-containers/configuration.toml"
 
-      if [ -x /opt/kata/bin/containerd-shim-kata-v2 ] && [ -L "$SHIM_LINK" ] && [ "$(readlink -f "$SHIM_LINK")" = "/opt/kata/bin/containerd-shim-kata-v2" ]; then
-        exit 0
-      fi
-
-      if [ ! -f "$KATA_TARBALL" ]; then
-        echo "Downloading Kata ${KATA_VERSION}..."
-        curl -fsSL "$KATA_URL" -o "$KATA_TARBALL"
-      fi
-
-      echo "Installing Kata ${KATA_VERSION}"
-      sudo rm -rf /opt/kata
-      sudo tar --use-compress-program=unzstd -xf "$KATA_TARBALL" -C /
-      sudo ln -sfn /opt/kata/bin/containerd-shim-kata-v2 "$SHIM_LINK"
-      rm -f "$KATA_TARBALL"
-
-      if [ ! -x /opt/kata/bin/containerd-shim-kata-v2 ]; then
-        echo "Kata shim installation failed" >&2
+      if [ ! -x "${KATA_DIR}/bin/containerd-shim-kata-v2" ]; then
+        echo "Kata shim missing from share install: ${KATA_DIR}/bin/containerd-shim-kata-v2" >&2
         exit 1
       fi
+
+      if [ ! -f "$KATA_CONFIG_SOURCE" ]; then
+        echo "Kata config missing from share install: $KATA_CONFIG_SOURCE" >&2
+        exit 1
+      fi
+
+      sudo ln -sfn "${KATA_DIR}/bin/containerd-shim-kata-v2" "$SHIM_LINK"
+      sudo install -d -m 0755 "$KATA_CONFIG_DIR"
+      sudo ln -sfn "$KATA_CONFIG_SOURCE" "$KATA_CONFIG_LINK"

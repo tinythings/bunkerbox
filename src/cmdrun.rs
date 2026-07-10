@@ -17,8 +17,7 @@ pub fn run_sequence(name: &str) -> Result<(), String> {
         .get(name)
         .ok_or_else(|| format!("unknown sequence: {name}"))?;
 
-    for (index, command) in script.commands.iter().enumerate() {
-        println!("==> {name}: command {}/{}", index + 1, script.commands.len());
+    for command in &script.commands {
         run_shell(command)?;
     }
 

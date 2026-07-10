@@ -1,7 +1,5 @@
+mod clidef;
 mod cmdrun;
-
-use std::env;
-use std::ffi::OsString;
 
 fn main() {
     if let Err(err) = run() {
@@ -11,41 +9,75 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let args: Vec<OsString> = env::args_os().collect();
+    let mut cli = clidef::cli(env!("CARGO_PKG_VERSION"));
+    let matches = cli.clone().get_matches();
 
-    match args.get(1).and_then(|arg| arg.to_str()) {
-        Some("--setup") => cmdrun::run_sequence("setup"),
-        Some("--image") => cmdrun::run_sequence("image"),
-        Some("run") => {
-            let sequence = args
-                .get(2)
-                .and_then(|arg| arg.to_str())
+    if matches.get_flag("help") {
+        cli.print_help().map_err(|err| err.to_string())?;
+        println!();
+        return Ok(());
+    }
+
+    if matches.get_flag("version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    match matches.subcommand() {
+        Some(("setup", submatches)) => {
+            if submatches.get_flag("help") {
+                print_subcommand_help("setup")?;
+                return Ok(());
+            }
+            cmdrun::run_sequence("setup")
+        }
+        Some(("install-image", submatches)) => {
+            if submatches.get_flag("help") {
+                print_subcommand_help("install-image")?;
+                return Ok(());
+            }
+            cmdrun::run_sequence("install-image")
+        }
+        Some(("run", submatches)) => {
+            if submatches.get_flag("help") {
+                print_subcommand_help("run")?;
+                return Ok(());
+            }
+            let name = submatches
+                .get_one::<String>("name")
                 .ok_or_else(|| "missing sequence name".to_string())?;
-            cmdrun::run_sequence(sequence)
+            cmdrun::run_sequence(name)
         }
-        Some("--help") | Some("-h") => {
-            usage()?;
-            Ok(())
+        Some(("list", submatches)) => {
+            if submatches.get_flag("help") {
+                print_subcommand_help("list")?;
+                return Ok(());
+            }
+            list_sequences()
         }
-        Some(other) => Err(format!("unknown argument: {other}\n\nRun `bunkerbox --help` for usage.")),
+        Some((name, _)) => Err(format!("unknown command: {name}")),
         None => {
-            usage()?;
+            cli.print_help().map_err(|err| err.to_string())?;
+            println!();
             Ok(())
         }
     }
 }
 
-fn usage() -> Result<(), String> {
-    println!("Usage:");
-    println!("  bunkerbox --setup       Run setup sequence");
-    println!("  bunkerbox --image       Run image sequence");
-    println!("  bunkerbox run <name>    Run named YAML sequence");
-    println!("  bunkerbox --help        Show help");
-    println!();
-    println!("Sequences:");
+fn print_subcommand_help(name: &str) -> Result<(), String> {
+    let mut cli = clidef::cli(env!("CARGO_PKG_VERSION"));
+    let subcommand = cli
+        .find_subcommand_mut(name)
+        .ok_or_else(|| format!("unknown command: {name}"))?;
 
+    subcommand.print_help().map_err(|err| err.to_string())?;
+    println!();
+    Ok(())
+}
+
+fn list_sequences() -> Result<(), String> {
     for name in cmdrun::sequence_names()? {
-        println!("  {name}");
+        println!("{name}");
     }
 
     Ok(())

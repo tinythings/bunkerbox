@@ -1,10 +1,23 @@
-# Build the container image
-image:
+# IT: import a prepared agent image built by a separate tool
+install-image:
   commands:
     - |
-      echo "image sequence not implemented yet"
+      set -Eeuo pipefail
 
-# Setup the environment
+      if [ -z "${BUNKERBOX_OCI_ARCHIVE:-}" ]; then
+        echo "BUNKERBOX_OCI_ARCHIVE is required" >&2
+        exit 1
+      fi
+
+      if [ ! -f "$BUNKERBOX_OCI_ARCHIVE" ]; then
+        echo "OCI archive not found: $BUNKERBOX_OCI_ARCHIVE" >&2
+        exit 1
+      fi
+
+      sudo systemctl start containerd
+      sudo ctr images import "$BUNKERBOX_OCI_ARCHIVE"
+
+# IT: setup host runtime
 setup:
   commands:
     - |
@@ -32,14 +45,26 @@ setup:
     - |
       set -Eeuo pipefail
 
-      sudo apt-get update
-      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        ca-certificates \
-        containerd \
-        containernetworking-plugins \
-        curl \
-        zstd
-      sudo systemctl enable --now containerd
+      missing=""
+      for package in ca-certificates containerd containernetworking-plugins curl zstd; do
+        if ! dpkg-query -W -f='${db:Status-Status}\n' "$package" 2>/dev/null | grep -qx installed; then
+          missing="$missing $package"
+        fi
+      done
+
+      if [ -n "$missing" ]; then
+        echo "Installing missing packages:$missing"
+        sudo apt-get update
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y $missing
+      fi
+
+      if ! systemctl is-enabled containerd >/dev/null 2>&1; then
+        sudo systemctl enable containerd >/dev/null
+      fi
+
+      if ! systemctl is-active containerd >/dev/null 2>&1; then
+        sudo systemctl start containerd
+      fi
 
     - |
       set -Eeuo pipefail
@@ -47,7 +72,13 @@ setup:
       CNI_PLUGIN_DIR="/opt/cni/bin"
       CNI_CONFIG="/etc/cni/net.d/00-bunkerbox.conflist"
 
-      sudo install -d -m 0755 "$CNI_PLUGIN_DIR" "$(dirname "$CNI_CONFIG")"
+      if [ ! -d "$CNI_PLUGIN_DIR" ]; then
+        sudo install -d -m 0755 "$CNI_PLUGIN_DIR"
+      fi
+
+      if [ ! -d "$(dirname "$CNI_CONFIG")" ]; then
+        sudo install -d -m 0755 "$(dirname "$CNI_CONFIG")"
+      fi
 
       for plugin in bridge host-local firewall; do
         source="/usr/lib/cni/${plugin}"
@@ -64,6 +95,7 @@ setup:
             exit 1
           fi
         else
+          echo "Linking CNI plugin: $target"
           sudo ln -s "$source" "$target"
         fi
       done
@@ -75,13 +107,15 @@ setup:
       CNI_NETWORK_NAME="bunkerbox"
       CNI_BRIDGE="bunkerbox0"
       CNI_SUBNET="${BUNKERBOX_CNI_SUBNET:-10.247.0.0/24}"
+      tmp="$(mktemp)"
+      trap 'rm -f "$tmp"' EXIT
 
       if [ -f "$CNI_CONFIG" ] && ! grep -q '"name": "bunkerbox"' "$CNI_CONFIG"; then
         echo "refusing to overwrite existing CNI config: $CNI_CONFIG" >&2
         exit 1
       fi
 
-      sudo tee "$CNI_CONFIG" >/dev/null <<EOF_CNI
+      cat > "$tmp" <<EOF_CNI
       {
         "cniVersion": "1.0.0",
         "name": "${CNI_NETWORK_NAME}",
@@ -112,29 +146,35 @@ setup:
       }
       EOF_CNI
 
+      if [ ! -f "$CNI_CONFIG" ] || ! sudo cmp -s "$tmp" "$CNI_CONFIG"; then
+        echo "Writing CNI config: $CNI_CONFIG"
+        sudo install -m 0644 "$tmp" "$CNI_CONFIG"
+      fi
+
     - |
       set -Eeuo pipefail
 
       KATA_VERSION="${KATA_VERSION:-3.32.0}"
-      KATA_TARBALL="${PWD}/kata-static-${KATA_VERSION}-amd64.tar.zst"
+      KATA_TARBALL="/tmp/kata-static-${KATA_VERSION}-amd64.tar.zst"
       KATA_URL="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/$(basename "$KATA_TARBALL")"
       SHIM_LINK="/usr/local/bin/containerd-shim-kata-v2"
 
-      if [ -f "$KATA_TARBALL" ]; then
-        echo "Using existing tarball: $KATA_TARBALL"
-      else
-        echo "Downloading Kata ${KATA_VERSION}..."
-        curl -fL "$KATA_URL" -o "$KATA_TARBALL"
+      if [ -x /opt/kata/bin/containerd-shim-kata-v2 ] && [ -L "$SHIM_LINK" ] && [ "$(readlink -f "$SHIM_LINK")" = "/opt/kata/bin/containerd-shim-kata-v2" ]; then
+        exit 0
       fi
 
+      if [ ! -f "$KATA_TARBALL" ]; then
+        echo "Downloading Kata ${KATA_VERSION}..."
+        curl -fsSL "$KATA_URL" -o "$KATA_TARBALL"
+      fi
+
+      echo "Installing Kata ${KATA_VERSION}"
       sudo rm -rf /opt/kata
       sudo tar --use-compress-program=unzstd -xf "$KATA_TARBALL" -C /
       sudo ln -sfn /opt/kata/bin/containerd-shim-kata-v2 "$SHIM_LINK"
+      rm -f "$KATA_TARBALL"
 
       if [ ! -x /opt/kata/bin/containerd-shim-kata-v2 ]; then
         echo "Kata shim installation failed" >&2
         exit 1
       fi
-
-      echo "Kata ${KATA_VERSION} installed."
-      echo "Preserved tarball: $KATA_TARBALL"

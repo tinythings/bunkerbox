@@ -130,6 +130,7 @@ EOF_IMAGE
 cat > "$RUNTIME_CONF" <<EOF_RUNTIME
 oci: ${OCI_FILE}
 image: localhost/bunkerbox-opencode:1.17.18
+network: bridge
 EOF_RUNTIME
 
 ln -sfn "$BUNKERBOX" "$OPENCODE_LINK"

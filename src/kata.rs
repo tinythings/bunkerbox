@@ -1,6 +1,7 @@
-use crate::runtime::RuntimeConfig;
+use crate::runtime::{NetworkMode, RuntimeConfig};
+use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -10,27 +11,151 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str) -> Re
     }
 
     run_command("sudo", &["systemctl", "start", "containerd"])?;
+    if config.network == Some(NetworkMode::Bridge) {
+        ensure_bridge_cni_config()?;
+    }
     import_image(config)?;
     remove_stale_container(container_name)?;
 
-    run_command(
+    let resolv_conf = if config.network.is_some() {
+        Some(write_resolv_conf()?)
+    } else {
+        None
+    };
+    let resolv_conf_mount = resolv_conf.as_ref().map(|path| {
+        format!(
+            "type=bind,src={},dst=/etc/resolv.conf,options=rbind:ro",
+            path.display()
+        )
+    });
+    let workspace_mount = format!(
+        "type=bind,src={},dst=/workspace,options=rbind:rw",
+        workspace.display()
+    );
+    let mut args = Vec::new();
+
+    if config.network == Some(NetworkMode::Bridge) {
+        args.push("env");
+        args.push("CNI_PATH=/usr/lib/cni");
+    }
+
+    args.extend(["ctr", "run", "--runtime", "io.containerd.kata.v2", "--rm", "--tty"]);
+
+    if let Some(mount) = &resolv_conf_mount {
+        args.push("--mount");
+        args.push(mount.as_str());
+    }
+
+    args.push("--mount");
+    args.push(workspace_mount.as_str());
+
+    match config.network {
+        Some(NetworkMode::Bridge) => args.push("--cni"),
+        Some(NetworkMode::Host) => args.push("--net-host"),
+        None => {}
+    }
+
+    args.push(&config.image);
+    args.push(container_name);
+
+    let result = run_command("sudo", &args);
+
+    if let Some(path) = resolv_conf {
+        let _ = fs::remove_file(path);
+    }
+
+    result
+}
+
+fn write_resolv_conf() -> Result<PathBuf, String> {
+    let host = fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut nameserver_count = 0;
+
+    for line in host.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("nameserver ") {
+            let server = trimmed.split_whitespace().nth(1).unwrap_or_default();
+            if server.starts_with("127.") || server == "::1" || server.eq_ignore_ascii_case("localhost") {
+                continue;
+            }
+            nameserver_count += 1;
+            lines.push(trimmed.to_string());
+            continue;
+        }
+
+        if trimmed.starts_with("search ") || trimmed.starts_with("domain ") || trimmed.starts_with("options ") {
+            lines.push(trimmed.to_string());
+        }
+    }
+
+    if nameserver_count == 0 {
+        lines.push("nameserver 1.1.1.1".to_string());
+        lines.push("nameserver 8.8.8.8".to_string());
+    }
+
+    let path = std::env::temp_dir().join(format!("bunkerbox-resolv-{}.conf", std::process::id()));
+    fs::write(&path, format!("{}\n", lines.join("\n")))
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+
+    Ok(path)
+}
+
+fn ensure_bridge_cni_config() -> Result<(), String> {
+    let path = Path::new("/etc/cni/net.d/10-bunkerbox.conflist");
+
+    if let Ok(contents) = fs::read_to_string(path) {
+        if !contents.contains("\"name\": \"bunkerbox\"") {
+            return Err(format!("refusing to overwrite unrelated CNI config: {}", path.display()));
+        }
+    }
+
+    let config = r#"{
+  "cniVersion": "0.4.0",
+  "name": "bunkerbox",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "bunkerbox0",
+      "isGateway": true,
+      "ipMasq": true,
+      "hairpinMode": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [
+          [
+            { "subnet": "10.247.0.0/24" }
+          ]
+        ],
+        "routes": [
+          { "dst": "0.0.0.0/0" }
+        ]
+      }
+    }
+  ]
+}
+"#;
+
+    let temp = std::env::temp_dir().join(format!("bunkerbox-cni-{}.conflist", std::process::id()));
+    fs::write(&temp, config).map_err(|err| format!("failed to write {}: {err}", temp.display()))?;
+
+    let result = run_command(
         "sudo",
         &[
-            "ctr",
-            "run",
-            "--runtime",
-            "io.containerd.kata.v2",
-            "--rm",
-            "--tty",
-            "--mount",
-            &format!(
-                "type=bind,src={},dst=/workspace,options=rbind:rw",
-                workspace.display()
-            ),
-            &config.image,
-            container_name,
+            "install",
+            "-D",
+            "-m",
+            "0644",
+            temp.to_str()
+                .ok_or_else(|| format!("path is not valid UTF-8: {}", temp.display()))?,
+            path.to_str()
+                .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))?,
         ],
-    )
+    );
+
+    let _ = fs::remove_file(&temp);
+    result
 }
 
 fn import_image(config: &RuntimeConfig) -> Result<(), String> {

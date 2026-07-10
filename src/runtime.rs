@@ -9,6 +9,14 @@ pub const DEFAULT_SHARE_DIR: &str = "/usr/share/bunkerbox";
 pub struct RuntimeConfig {
     pub oci: PathBuf,
     pub image: String,
+    pub network: Option<NetworkMode>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkMode {
+    Bridge,
+    Host,
 }
 
 pub fn invoked_name() -> Result<String, String> {

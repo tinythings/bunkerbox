@@ -10,3 +10,4 @@ kata-static-*.tar.zst
 /demo/*/share/
 /demo/*/*-image.conf
 /demo/opencode/opencode
+/demo/netdebug/netdebug

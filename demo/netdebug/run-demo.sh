@@ -72,6 +72,40 @@ image: localhost/bunkerbox-netdebug:0.1.0
 output: ${OCI_FILE}
 overwrite: true
 
+files:
+  - path: debug.sh
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      set -u
+
+      echo "== addresses =="
+      ip addr || true
+      echo
+
+      echo "== routes =="
+      ip route || true
+      echo
+
+      echo "== resolv.conf =="
+      cat /etc/resolv.conf || true
+      echo
+
+      echo "== DNS: qwant.com =="
+      nslookup qwant.com || true
+      echo
+
+      echo "== allowed: https://qwant.com =="
+      curl -I --connect-timeout 10 https://qwant.com || true
+      echo
+
+      echo "== denied: https://google.com =="
+      curl -I --connect-timeout 10 https://google.com || true
+      echo
+
+      echo "Interactive shell."
+      exec /bin/sh
+
 containerfile: |
   FROM docker.io/library/alpine:3.22
 
@@ -85,8 +119,11 @@ containerfile: |
         netcat-openbsd \
         openssl
 
+  COPY debug.sh /usr/local/bin/debug.sh
+  RUN chmod 0755 /usr/local/bin/debug.sh
+
   WORKDIR /workspace
-  ENTRYPOINT ["/bin/sh"]
+  ENTRYPOINT ["/usr/local/bin/debug.sh"]
 EOF_IMAGE
 
 "$BUNKERBOX_IMAGE" "$IMAGE_CONF"
@@ -95,6 +132,8 @@ cat > "$RUNTIME_CONF" <<EOF_RUNTIME
 oci: ${OCI_FILE}
 image: localhost/bunkerbox-netdebug:0.1.0
 network: bridge
+allow:
+  - qwant.com
 EOF_RUNTIME
 
 ln -sfn "$BUNKERBOX" "$NETDEBUG_LINK"
@@ -106,10 +145,8 @@ Now run:
   cd ${SCRIPT_DIR}
   ./netdebug --share ./share
 
-Inside shell, try:
-  ip addr
-  ip route
-  ping -c 3 1.1.1.1
-  nslookup example.com
-  curl -I https://example.com
+debug.sh runs automatically, then drops to a shell.
+It checks:
+  qwant.com works
+  google.com is denied
 EOF_DONE

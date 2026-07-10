@@ -13,7 +13,7 @@ pub fn prepare(reset: bool) -> Result<(), String> {
 
 pub fn resolve(mode: WorkspaceMode) -> Result<PathBuf, String> {
     match mode {
-        WorkspaceMode::Share => project_root(),
+        WorkspaceMode::Share => std::env::current_dir().map_err(|err| format!("failed to get current directory: {err}")),
         WorkspaceMode::Clone => prepare_workspace(false, true),
     }
 }

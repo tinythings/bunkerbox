@@ -7,7 +7,6 @@ SHARE_DIR="${SCRIPT_DIR}/share"
 OCI_DIR="${SHARE_DIR}/oci"
 KATA_DIR="${SHARE_DIR}/kata"
 OCI_FILE="${OCI_DIR}/bunkerbox-opencode-1.17.18.oci"
-IMAGE_CONF="${SCRIPT_DIR}/opencode-image.conf"
 RUNTIME_CONF="${SHARE_DIR}/opencode.conf"
 BUNKERBOX="${PROJECT_ROOT}/target/debug/bunkerbox"
 BUNKERBOX_IMAGE="${PROJECT_ROOT}/target/debug/bunkerbox-image"
@@ -20,8 +19,8 @@ KATA_URL="https://github.com/kata-containers/kata-containers/releases/download/$
 KATA_ARCHIVE_PREFIX="/$(printf '%s/%s' opt kata)"
 KATA_ARCHIVE_PATH=".${KATA_ARCHIVE_PREFIX}"
 
-rm -f "$OPENCODE_LINK" "$IMAGE_CONF"
-rm -rf "$SHARE_DIR"
+rm -f "$OPENCODE_LINK"
+rm -rf "$OCI_DIR" "$KATA_DIR"
 mkdir -p "$OCI_DIR" "$KATA_DIR"
 
 make -C "$PROJECT_ROOT" dev
@@ -66,71 +65,15 @@ EOF_QEMU
   chmod 0755 "$QEMU_BIN"
 fi
 
-BUNKERBOX_KATA_DIR="$KATA_DIR" "$BUNKERBOX" setup
+BUNKERBOX_KATA_DIR="$KATA_DIR" "$BUNKERBOX" --share "$SHARE_DIR" setup
 
-cat > "$IMAGE_CONF" <<EOF_IMAGE
-name: opencode
-image: localhost/bunkerbox-opencode:1.17.18
-output: ${OCI_FILE}
-overwrite: true
-
-build_args:
-  OPENCODE_VERSION: "1.17.18"
-
-files:
-  - path: bunker-entrypoint
-    mode: "0755"
-    content: |
-      #!/bin/sh
-      set -eu
-      exec opencode
-
-containerfile: |
-  FROM docker.io/library/alpine:3.22
-
-  ARG OPENCODE_VERSION
-
-  RUN apk add --no-cache \\
-        bash \\
-        ca-certificates \\
-        curl \\
-        git \\
-        libstdc++ \\
-        openssh-client \\
-        ripgrep \\
-      && curl -fsSL \\
-        "https://github.com/anomalyco/opencode/releases/download/v\${OPENCODE_VERSION}/opencode-linux-x64-baseline-musl.tar.gz" \\
-        -o /tmp/opencode.tar.gz \\
-      && tar -xzf /tmp/opencode.tar.gz -C /usr/local/bin opencode \\
-      && chmod 0755 /usr/local/bin/opencode \\
-      && rm -f /tmp/opencode.tar.gz \\
-      && opencode --version
-
-  RUN addgroup -g 1000 opencode \\
-      && adduser -D -u 1000 -G opencode -s /bin/bash opencode \\
-      && mkdir -p /workspace /home/opencode \\
-      && chown -R opencode:opencode /workspace /home/opencode
-
-  COPY bunker-entrypoint /usr/local/bin/bunker-entrypoint
-  RUN chmod 0755 /usr/local/bin/bunker-entrypoint
-
-  ENV HOME=/home/opencode \\
-      XDG_CONFIG_HOME=/home/opencode/.config \\
-      XDG_DATA_HOME=/home/opencode/.local/share \\
-      XDG_STATE_HOME=/home/opencode/.local/state \\
-      XDG_CACHE_HOME=/home/opencode/.cache
-
-  USER opencode
-  WORKDIR /workspace
-  ENTRYPOINT ["/usr/local/bin/bunker-entrypoint"]
-EOF_IMAGE
-
-"$BUNKERBOX_IMAGE" "$IMAGE_CONF"
+"$BUNKERBOX_IMAGE" "$PROJECT_ROOT/images/opencode.conf" --output "$OCI_FILE"
 
 cat > "$RUNTIME_CONF" <<EOF_RUNTIME
 oci: ${OCI_FILE}
 image: localhost/bunkerbox-opencode:1.17.18
 workspace: share
+home: persist
 network: bridge
 allow:
   - api.deepseek.com

@@ -16,6 +16,7 @@ struct ImageConfig {
     name: String,
     image: String,
     output: PathBuf,
+    command: Vec<String>,
     #[serde(default)]
     overwrite: bool,
     #[serde(default)]
@@ -61,7 +62,10 @@ fn run() -> Result<(), String> {
         return Ok(());
     };
 
-    let config = load_config(Path::new(config_path))?;
+    let mut config = load_config(Path::new(config_path))?;
+    if let Some(output) = matches.get_one::<String>("output") {
+        config.output = PathBuf::from(output);
+    }
     build_image(&config)
 }
 
@@ -75,8 +79,9 @@ fn cli(version: &'static str) -> Command {
     Command::new(APPNAME)
         .version(version)
         .about(format!("{} - {}", APPNAME.bright_magenta().bold(), "build prepared bunker agent OCI images"))
-        .override_usage(format!("{APPNAME} <CONFIG>"))
+        .override_usage(format!("{APPNAME} <CONFIG> [--output PATH]"))
         .arg(Arg::new("config").help("Image YAML config file").required(false).index(1))
+        .arg(Arg::new("output").long("output").value_name("PATH").help("Override OCI archive output path from the image config"))
         .next_help_heading("Other")
         .arg(help_arg())
         .arg(Arg::new("version").short('v').long("version").action(ArgAction::SetTrue).help("Get the current version."))
@@ -104,6 +109,10 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
         return Err("image config name is required".to_string());
     }
 
+    if config.command.is_empty() || config.command.iter().any(|part| part.trim().is_empty()) {
+        return Err("image config command is required".to_string());
+    }
+
     if config.output.exists() {
         if config.overwrite {
             fs::remove_file(&config.output).map_err(|err| format!("failed to remove {}: {err}", config.output.display()))?;
@@ -128,12 +137,61 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
     result
 }
 
+fn build_entrypoint(config: &ImageConfig) -> Result<String, String> {
+    let command = config.command.iter().map(|part| shell_quote(part)).collect::<Vec<_>>().join(" ");
+
+    Ok(format!(
+        r#"#!/bin/sh
+set -eu
+
+run_app() {{
+  exec {command}
+}}
+
+if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
+  local_home="/tmp/bunkerbox-home"
+  mkdir -p "$BUNKERBOX_PERSIST_HOME" "$local_home"
+  cp -R "$BUNKERBOX_PERSIST_HOME/." "$local_home/" 2>/dev/null || true
+
+  export HOME="$local_home"
+  export XDG_CONFIG_HOME="$local_home/.config"
+  export XDG_DATA_HOME="$local_home/.local/share"
+  export XDG_STATE_HOME="$local_home/.local/state"
+  export XDG_CACHE_HOME="$local_home/.cache"
+
+  set +e
+  {command}
+  status=$?
+  set -e
+
+  cp -R "$local_home/." "$BUNKERBOX_PERSIST_HOME/"
+  exit "$status"
+fi
+
+run_app
+"#
+    ))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), String> {
     fs::write(build_dir.join("Containerfile"), &config.containerfile).map_err(|err| format!("failed to write Containerfile: {err}"))?;
+
+    let entrypoint = build_entrypoint(config)?;
+    let entrypoint_path = build_dir.join("bunker-entrypoint");
+    fs::write(&entrypoint_path, entrypoint).map_err(|err| format!("failed to write {}: {err}", entrypoint_path.display()))?;
+    fs::set_permissions(&entrypoint_path, fs::Permissions::from_mode(0o755))
+        .map_err(|err| format!("failed to chmod {}: {err}", entrypoint_path.display()))?;
 
     for file in &config.files {
         if file.path.is_absolute() || file.path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
             return Err(format!("unsafe build file path: {}", file.path.display()));
+        }
+        if file.path == Path::new("bunker-entrypoint") {
+            return Err("image config files must not override generated bunker-entrypoint".to_string());
         }
 
         let full_path = build_dir.join(&file.path);

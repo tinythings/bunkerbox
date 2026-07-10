@@ -6,7 +6,7 @@ mod workspace;
 
 use runtime::WorkspaceMode;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     if let Err(err) = run() {
@@ -20,7 +20,7 @@ fn run() -> Result<(), String> {
     let workspace_override = workspace_mode_from_args()?;
 
     if let Some(config) = runtime::load_for_invoked_name(&share_dir)? {
-        return run_packaged_runtime(config, workspace_override);
+        return run_packaged_runtime(config, workspace_override, &share_dir);
     }
 
     let mut cli = clidef::cli(env!("CARGO_PKG_VERSION"));
@@ -84,10 +84,11 @@ fn run() -> Result<(), String> {
 }
 
 fn share_dir_from_args() -> Result<PathBuf, String> {
-    Ok(match option_from_args("share")? {
+    let path = match option_from_args("share")? {
         Some(value) => PathBuf::from(value),
         None => PathBuf::from(runtime::DEFAULT_SHARE_DIR),
-    })
+    };
+    path.canonicalize().map_err(|err| format!("failed to resolve share directory {}: {err}", path.display()))
 }
 
 fn workspace_mode_from_args() -> Result<Option<WorkspaceMode>, String> {
@@ -120,7 +121,7 @@ fn option_from_args(name: &str) -> Result<Option<OsString>, String> {
     Ok(None)
 }
 
-fn run_packaged_runtime(config: runtime::RuntimeConfig, workspace_override: Option<WorkspaceMode>) -> Result<(), String> {
+fn run_packaged_runtime(config: runtime::RuntimeConfig, workspace_override: Option<WorkspaceMode>, share_dir: &Path) -> Result<(), String> {
     if config.oci.as_os_str().is_empty() {
         return Err("runtime config missing oci".to_string());
     }
@@ -134,7 +135,7 @@ fn run_packaged_runtime(config: runtime::RuntimeConfig, workspace_override: Opti
     let name = runtime::invoked_name()?;
     let container_name = format!("bunkerbox-{name}");
 
-    kata::run(&config, &workspace, &container_name)
+    kata::run(&config, &workspace, &container_name, share_dir, &name)
 }
 
 fn print_subcommand_help(name: &str) -> Result<(), String> {

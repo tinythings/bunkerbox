@@ -1,4 +1,4 @@
-use crate::runtime::{NetworkMode, RuntimeConfig};
+use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
-pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str) -> Result<(), String> {
+pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _share_dir: &Path, app_name: &str) -> Result<(), String> {
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
     }
@@ -26,6 +26,33 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str) -> Re
     }
     let resolv_conf_mount = resolv_conf.as_ref().map(|path| format!("type=bind,src={},dst=/etc/resolv.conf,options=rbind:ro", path.display()));
     let workspace_mount = format!("type=bind,src={},dst=/workspace,options=rbind:rw", workspace.display());
+    let user = current_user_spec()?;
+    let Some((uid, gid)) = user.split_once(':') else {
+        return Err(format!("invalid current user spec: {user}"));
+    };
+    let mut container_env = Vec::new();
+    let home_mount = if config.home == Some(HomeMode::Persist) {
+        let home_path = config.home_path.clone().unwrap_or_else(|| default_home_path(app_name));
+        run_command(
+            "sudo",
+            &[
+                "install",
+                "-d",
+                "-m",
+                "0755",
+                "-o",
+                uid,
+                "-g",
+                gid,
+                home_path.to_str().ok_or_else(|| "home path is not valid UTF-8".to_string())?,
+            ],
+        )?;
+
+        container_env.push("BUNKERBOX_PERSIST_HOME=/bunkerbox-persist-home".to_string());
+        Some(format!("type=bind,src={},dst=/bunkerbox-persist-home,options=rbind:rw", home_path.display()))
+    } else {
+        None
+    };
     let mut args = Vec::new();
 
     if config.network == Some(NetworkMode::Bridge) {
@@ -33,7 +60,12 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str) -> Re
         args.push("CNI_PATH=/usr/lib/cni");
     }
 
-    args.extend(["ctr", "run", "--runtime", "io.containerd.kata.v2", "--rm", "--tty"]);
+    args.extend(["ctr", "run", "--runtime", "io.containerd.kata.v2", "--rm", "--tty", "--user", user.as_str()]);
+
+    for value in &container_env {
+        args.push("--env");
+        args.push(value.as_str());
+    }
 
     if let Some(mount) = &resolv_conf_mount {
         args.push("--mount");
@@ -42,6 +74,11 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str) -> Re
 
     args.push("--mount");
     args.push(workspace_mount.as_str());
+
+    if let Some(mount) = &home_mount {
+        args.push("--mount");
+        args.push(mount.as_str());
+    }
 
     match config.network {
         Some(NetworkMode::Bridge) => args.push("--cni"),
@@ -63,6 +100,22 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str) -> Re
     }
 
     result
+}
+
+fn default_home_path(app_name: &str) -> PathBuf {
+    user_data_dir().join("bunkerbox").join(app_name).join("home")
+}
+
+fn user_data_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home).join(".local").join("share");
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".local").join("share")
 }
 
 fn write_resolv_conf() -> Result<PathBuf, String> {
@@ -329,6 +382,19 @@ fn kill_kata_shim(container_name: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn current_user_spec() -> Result<String, String> {
+    let uid = command_output("id", &["-u"])?;
+    let gid = command_output("id", &["-g"])?;
+    let uid = uid.trim();
+    let gid = gid.trim();
+
+    if uid.is_empty() || gid.is_empty() || !uid.chars().all(|ch| ch.is_ascii_digit()) || !gid.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("failed to determine current uid/gid: {uid}:{gid}"));
+    }
+
+    Ok(format!("{uid}:{gid}"))
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<(), String> {

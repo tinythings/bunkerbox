@@ -12,6 +12,8 @@ pub struct RuntimeConfig {
     pub network: Option<NetworkMode>,
     pub allow: Option<Vec<String>>,
     pub workspace: Option<WorkspaceMode>,
+    pub home: Option<HomeMode>,
+    pub home_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -26,6 +28,13 @@ pub enum NetworkMode {
 pub enum WorkspaceMode {
     Share,
     Clone,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum HomeMode {
+    Persist,
+    Temporary,
 }
 
 pub fn invoked_name() -> Result<String, String> {

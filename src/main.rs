@@ -85,10 +85,7 @@ fn share_dir_from_args() -> Result<PathBuf, String> {
 
     while let Some(arg) = args.next() {
         if arg == "--share" {
-            return args
-                .next()
-                .map(PathBuf::from)
-                .ok_or_else(|| "--share requires a path".to_string());
+            return args.next().map(PathBuf::from).ok_or_else(|| "--share requires a path".to_string());
         }
     }
 

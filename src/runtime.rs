@@ -10,6 +10,7 @@ pub struct RuntimeConfig {
     pub oci: PathBuf,
     pub image: String,
     pub network: Option<NetworkMode>,
+    pub allow: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -20,15 +21,9 @@ pub enum NetworkMode {
 }
 
 pub fn invoked_name() -> Result<String, String> {
-    let arg0 = env::args_os()
-        .next()
-        .ok_or_else(|| "missing argv[0]".to_string())?;
+    let arg0 = env::args_os().next().ok_or_else(|| "missing argv[0]".to_string())?;
 
-    let name = Path::new(&arg0)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "invalid argv[0]".to_string())?
-        .to_string();
+    let name = Path::new(&arg0).file_name().and_then(|name| name.to_str()).ok_or_else(|| "invalid argv[0]".to_string())?.to_string();
 
     Ok(name)
 }
@@ -41,10 +36,8 @@ pub fn load_for_invoked_name(share_dir: &Path) -> Result<Option<RuntimeConfig>, 
     }
 
     let path = share_dir.join(format!("{name}.conf"));
-    let contents = fs::read_to_string(&path)
-        .map_err(|err| format!("failed to read runtime config {}: {err}", path.display()))?;
-    let config = serde_yaml::from_str(&contents)
-        .map_err(|err| format!("failed to parse runtime config {}: {err}", path.display()))?;
+    let contents = fs::read_to_string(&path).map_err(|err| format!("failed to read runtime config {}: {err}", path.display()))?;
+    let config = serde_yaml::from_str(&contents).map_err(|err| format!("failed to parse runtime config {}: {err}", path.display()))?;
 
     Ok(Some(config))
 }

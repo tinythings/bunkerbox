@@ -25,15 +25,13 @@ fn prepare_workspace(reset: bool, reuse_existing: bool) -> Result<PathBuf, Strin
         }
 
         if reset {
-            fs::remove_dir_all(&workspace)
-                .map_err(|err| format!("failed to remove {}: {err}", workspace.display()))?;
+            fs::remove_dir_all(&workspace).map_err(|err| format!("failed to remove {}: {err}", workspace.display()))?;
         } else {
             return Err(format!("workspace already exists: {}", workspace.display()));
         }
     }
 
-    fs::create_dir_all(&bunker_dir)
-        .map_err(|err| format!("failed to create {}: {err}", bunker_dir.display()))?;
+    fs::create_dir_all(&bunker_dir).map_err(|err| format!("failed to create {}: {err}", bunker_dir.display()))?;
 
     if try_git_worktree(&source, &workspace)? {
         return Ok(workspace);
@@ -52,10 +50,7 @@ fn project_root() -> Result<PathBuf, String> {
 }
 
 fn git_root() -> Result<Option<PathBuf>, String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .stderr(Stdio::null())
-        .output();
+    let output = Command::new("git").args(["rev-parse", "--show-toplevel"]).stderr(Stdio::null()).output();
 
     let Ok(output) = output else {
         return Ok(None);
@@ -65,10 +60,7 @@ fn git_root() -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
 
-    let root = String::from_utf8(output.stdout)
-        .map_err(|err| format!("git output is not UTF-8: {err}"))?
-        .trim()
-        .to_string();
+    let root = String::from_utf8(output.stdout).map_err(|err| format!("git output is not UTF-8: {err}"))?.trim().to_string();
 
     if root.is_empty() {
         Ok(None)
@@ -97,8 +89,7 @@ fn try_git_worktree(source: &Path, workspace: &Path) -> Result<bool, String> {
 }
 
 fn copy_workspace(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::create_dir_all(destination)
-        .map_err(|err| format!("failed to create {}: {err}", destination.display()))?;
+    fs::create_dir_all(destination).map_err(|err| format!("failed to create {}: {err}", destination.display()))?;
 
     copy_dir(source, destination)
 }
@@ -114,17 +105,13 @@ fn copy_dir(source: &Path, destination: &Path) -> Result<(), String> {
         }
 
         let target = destination.join(&name);
-        let metadata = entry
-            .metadata()
-            .map_err(|err| format!("failed to stat {}: {err}", path.display()))?;
+        let metadata = entry.metadata().map_err(|err| format!("failed to stat {}: {err}", path.display()))?;
 
         if metadata.is_dir() {
-            fs::create_dir_all(&target)
-                .map_err(|err| format!("failed to create {}: {err}", target.display()))?;
+            fs::create_dir_all(&target).map_err(|err| format!("failed to create {}: {err}", target.display()))?;
             copy_dir(&path, &target)?;
         } else if metadata.is_file() {
-            fs::copy(&path, &target)
-                .map_err(|err| format!("failed to copy {} to {}: {err}", path.display(), target.display()))?;
+            fs::copy(&path, &target).map_err(|err| format!("failed to copy {} to {}: {err}", path.display(), target.display()))?;
             fs::set_permissions(&target, fs::Permissions::from_mode(metadata.permissions().mode()))
                 .map_err(|err| format!("failed to chmod {}: {err}", target.display()))?;
         }
@@ -134,8 +121,5 @@ fn copy_dir(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn should_skip(name: &OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(".bunker") | Some(".git") | Some("target")
-    )
+    matches!(name.to_str(), Some(".bunker") | Some(".git") | Some("target"))
 }

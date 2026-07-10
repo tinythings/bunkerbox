@@ -1,5 +1,5 @@
-use clap::{Arg, ArgAction, Command};
 use clap::builder::styling;
+use clap::{Arg, ArgAction, Command};
 use colored::Colorize;
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
@@ -74,27 +74,12 @@ fn cli(version: &'static str) -> Command {
 
     Command::new(APPNAME)
         .version(version)
-        .about(format!(
-            "{} - {}",
-            APPNAME.bright_magenta().bold(),
-            "build prepared bunker agent OCI images"
-        ))
+        .about(format!("{} - {}", APPNAME.bright_magenta().bold(), "build prepared bunker agent OCI images"))
         .override_usage(format!("{APPNAME} <CONFIG>"))
-        .arg(
-            Arg::new("config")
-                .help("Image YAML config file")
-                .required(false)
-                .index(1),
-        )
+        .arg(Arg::new("config").help("Image YAML config file").required(false).index(1))
         .next_help_heading("Other")
         .arg(help_arg())
-        .arg(
-            Arg::new("version")
-                .short('v')
-                .long("version")
-                .action(ArgAction::SetTrue)
-                .help("Get the current version."),
-        )
+        .arg(Arg::new("version").short('v').long("version").action(ArgAction::SetTrue).help("Get the current version."))
         .disable_help_flag(true)
         .disable_version_flag(true)
         .disable_colored_help(false)
@@ -103,19 +88,13 @@ fn cli(version: &'static str) -> Command {
 }
 
 fn help_arg() -> Arg {
-    Arg::new("help")
-        .short('h')
-        .long("help")
-        .action(ArgAction::SetTrue)
-        .help("Display help")
+    Arg::new("help").short('h').long("help").action(ArgAction::SetTrue).help("Display help")
 }
 
 fn load_config(path: &Path) -> Result<ImageConfig, String> {
-    let contents = fs::read_to_string(path)
-        .map_err(|err| format!("failed to read config {}: {err}", path.display()))?;
+    let contents = fs::read_to_string(path).map_err(|err| format!("failed to read config {}: {err}", path.display()))?;
 
-    serde_yaml::from_str(&contents)
-        .map_err(|err| format!("failed to parse config {}: {err}", path.display()))
+    serde_yaml::from_str(&contents).map_err(|err| format!("failed to parse config {}: {err}", path.display()))
 }
 
 fn build_image(config: &ImageConfig) -> Result<(), String> {
@@ -127,16 +106,14 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
 
     if config.output.exists() {
         if config.overwrite {
-            fs::remove_file(&config.output)
-                .map_err(|err| format!("failed to remove {}: {err}", config.output.display()))?;
+            fs::remove_file(&config.output).map_err(|err| format!("failed to remove {}: {err}", config.output.display()))?;
         } else {
             return Err(format!("output already exists: {}", config.output.display()));
         }
     }
 
     let build_dir = env::temp_dir().join(format!("bunkerbox-image-{}", std::process::id()));
-    fs::create_dir_all(&build_dir)
-        .map_err(|err| format!("failed to create build dir {}: {err}", build_dir.display()))?;
+    fs::create_dir_all(&build_dir).map_err(|err| format!("failed to create build dir {}: {err}", build_dir.display()))?;
 
     let result = (|| {
         write_build_context(config, &build_dir)?;
@@ -152,8 +129,7 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
 }
 
 fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), String> {
-    fs::write(build_dir.join("Containerfile"), &config.containerfile)
-        .map_err(|err| format!("failed to write Containerfile: {err}"))?;
+    fs::write(build_dir.join("Containerfile"), &config.containerfile).map_err(|err| format!("failed to write Containerfile: {err}"))?;
 
     for file in &config.files {
         if file.path.is_absolute() || file.path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
@@ -162,12 +138,10 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
 
         let full_path = build_dir.join(&file.path);
         if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
         }
 
-        fs::write(&full_path, &file.content)
-            .map_err(|err| format!("failed to write {}: {err}", full_path.display()))?;
+        fs::write(&full_path, &file.content).map_err(|err| format!("failed to write {}: {err}", full_path.display()))?;
         fs::set_permissions(&full_path, fs::Permissions::from_mode(file.mode))
             .map_err(|err| format!("failed to chmod {}: {err}", full_path.display()))?;
     }
@@ -176,10 +150,7 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
 }
 
 fn podman_build(config: &ImageConfig, build_dir: &Path) -> Result<(), String> {
-    let mut args = vec![
-        "build".to_string(),
-        "--no-cache".to_string(),
-    ];
+    let mut args = vec!["build".to_string(), "--no-cache".to_string()];
 
     for (name, value) in &config.build_args {
         args.push("--build-arg".to_string());
@@ -223,25 +194,10 @@ fn podman_remove_image(config: &ImageConfig) -> Result<(), String> {
     )?;
 
     for container in containers.lines().filter(|line| !line.trim().is_empty()) {
-        run_command(
-            "podman",
-            &[
-                "rm".to_string(),
-                "-f".to_string(),
-                container.to_string(),
-            ],
-        )?;
+        run_command("podman", &["rm".to_string(), "-f".to_string(), container.to_string()])?;
     }
 
-    run_command(
-        "podman",
-        &[
-            "image".to_string(),
-            "rm".to_string(),
-            "-f".to_string(),
-            config.image.clone(),
-        ],
-    )
+    run_command("podman", &["image".to_string(), "rm".to_string(), "-f".to_string(), config.image.clone()])
 }
 
 fn require_program(name: &str) -> Result<(), String> {
@@ -275,11 +231,7 @@ fn run_command(program: &str, args: &[String]) -> Result<(), String> {
 }
 
 fn command_output(program: &str, args: &[String]) -> Result<String, String> {
-    let output = ProcCommand::new(program)
-        .args(args)
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|err| format!("failed to run {program}: {err}"))?;
+    let output = ProcCommand::new(program).args(args).stderr(Stdio::inherit()).output().map_err(|err| format!("failed to run {program}: {err}"))?;
 
     if !output.status.success() {
         return Err(format!("command failed with status {}: {program}", output.status));

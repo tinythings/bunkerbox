@@ -1,3 +1,4 @@
+use crate::runtime::WorkspaceMode;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -10,8 +11,11 @@ pub fn prepare(reset: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn ensure() -> Result<PathBuf, String> {
-    prepare_workspace(false, true)
+pub fn resolve(mode: WorkspaceMode) -> Result<PathBuf, String> {
+    match mode {
+        WorkspaceMode::Share => project_root(),
+        WorkspaceMode::Clone => prepare_workspace(false, true),
+    }
 }
 
 fn prepare_workspace(reset: bool, reuse_existing: bool) -> Result<PathBuf, String> {

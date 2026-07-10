@@ -17,8 +17,8 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str) -> Re
     if config.network == Some(NetworkMode::Bridge) {
         ensure_bridge_cni_config()?;
     }
-    import_image(config)?;
     remove_stale_container(container_name)?;
+    import_image(config)?;
 
     let resolv_conf = if config.network.is_some() { Some(write_resolv_conf()?) } else { None };
     if bridge_firewall {
@@ -267,11 +267,7 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
 }
 
 fn import_image(config: &RuntimeConfig) -> Result<(), String> {
-    let output = command_output("sudo", &["ctr", "images", "ls", "-q"])?;
-
-    if output.lines().any(|line| line.trim() == config.image) {
-        return Ok(());
-    }
+    run_command_allow_failure("sudo", &["ctr", "images", "rm", &config.image])?;
 
     run_command(
         "sudo",

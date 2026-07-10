@@ -130,6 +130,7 @@ EOF_IMAGE
 cat > "$RUNTIME_CONF" <<EOF_RUNTIME
 oci: ${OCI_FILE}
 image: localhost/bunkerbox-opencode:1.17.18
+workspace: share
 network: bridge
 allow:
   - api.deepseek.com

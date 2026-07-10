@@ -131,6 +131,7 @@ EOF_IMAGE
 cat > "$RUNTIME_CONF" <<EOF_RUNTIME
 oci: ${OCI_FILE}
 image: localhost/bunkerbox-netdebug:0.1.0
+workspace: share
 network: bridge
 allow:
   - qwant.com

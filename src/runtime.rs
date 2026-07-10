@@ -11,13 +11,21 @@ pub struct RuntimeConfig {
     pub image: String,
     pub network: Option<NetworkMode>,
     pub allow: Option<Vec<String>>,
+    pub workspace: Option<WorkspaceMode>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkMode {
     Bridge,
     Host,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceMode {
+    Share,
+    Clone,
 }
 
 pub fn invoked_name() -> Result<String, String> {

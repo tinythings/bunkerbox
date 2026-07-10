@@ -131,6 +131,8 @@ cat > "$RUNTIME_CONF" <<EOF_RUNTIME
 oci: ${OCI_FILE}
 image: localhost/bunkerbox-opencode:1.17.18
 network: bridge
+allow:
+  - api.deepseek.com
 EOF_RUNTIME
 
 ln -sfn "$BUNKERBOX" "$OPENCODE_LINK"

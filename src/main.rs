@@ -43,9 +43,7 @@ fn run() -> Result<(), String> {
                 print_subcommand_help("run")?;
                 return Ok(());
             }
-            let name = submatches
-                .get_one::<String>("name")
-                .ok_or_else(|| "missing sequence name".to_string())?;
+            let name = submatches.get_one::<String>("name").ok_or_else(|| "missing sequence name".to_string())?;
             cmdrun::run_sequence(name)
         }
         Some(("list", submatches)) => {
@@ -66,9 +64,7 @@ fn run() -> Result<(), String> {
 
 fn print_subcommand_help(name: &str) -> Result<(), String> {
     let mut cli = clidef::cli(env!("CARGO_PKG_VERSION"));
-    let subcommand = cli
-        .find_subcommand_mut(name)
-        .ok_or_else(|| format!("unknown command: {name}"))?;
+    let subcommand = cli.find_subcommand_mut(name).ok_or_else(|| format!("unknown command: {name}"))?;
 
     subcommand.print_help().map_err(|err| err.to_string())?;
     println!();

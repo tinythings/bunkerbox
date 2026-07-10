@@ -10,12 +10,10 @@ struct Script {
 }
 
 pub fn run_sequence(name: &str) -> Result<(), String> {
-    let scripts: BTreeMap<String, Script> = serde_yaml::from_str(COMMANDS_YAML)
-        .map_err(|err| format!("failed to parse embedded commands.yaml: {err}"))?;
+    let scripts: BTreeMap<String, Script> =
+        serde_yaml::from_str(COMMANDS_YAML).map_err(|err| format!("failed to parse embedded commands.yaml: {err}"))?;
 
-    let script = scripts
-        .get(name)
-        .ok_or_else(|| format!("unknown sequence: {name}"))?;
+    let script = scripts.get(name).ok_or_else(|| format!("unknown sequence: {name}"))?;
 
     for command in &script.commands {
         run_shell(command)?;
@@ -25,8 +23,8 @@ pub fn run_sequence(name: &str) -> Result<(), String> {
 }
 
 pub fn sequence_names() -> Result<Vec<String>, String> {
-    let scripts: BTreeMap<String, Script> = serde_yaml::from_str(COMMANDS_YAML)
-        .map_err(|err| format!("failed to parse embedded commands.yaml: {err}"))?;
+    let scripts: BTreeMap<String, Script> =
+        serde_yaml::from_str(COMMANDS_YAML).map_err(|err| format!("failed to parse embedded commands.yaml: {err}"))?;
 
     Ok(scripts.keys().cloned().collect())
 }

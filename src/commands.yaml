@@ -1,0 +1,140 @@
+# Build the container image
+image:
+  commands:
+    - |
+      echo "image sequence not implemented yet"
+
+# Setup the environment
+setup:
+  commands:
+    - |
+      set -Eeuo pipefail
+
+      . /etc/os-release
+      if [ "${ID:-}" != "ubuntu" ]; then
+        echo "setup supports Ubuntu only" >&2
+        exit 1
+      fi
+
+      case "${VERSION_ID:-}" in
+        22.04|24.04) ;;
+        *)
+          echo "setup supports Ubuntu 22.04 or 24.04 only" >&2
+          exit 1
+          ;;
+      esac
+
+      if [ "$(uname -m)" != "x86_64" ]; then
+        echo "this demo currently supports x86_64 only" >&2
+        exit 1
+      fi
+
+    - |
+      set -Eeuo pipefail
+
+      sudo apt-get update
+      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        ca-certificates \
+        containerd \
+        containernetworking-plugins \
+        curl \
+        zstd
+      sudo systemctl enable --now containerd
+
+    - |
+      set -Eeuo pipefail
+
+      CNI_PLUGIN_DIR="/opt/cni/bin"
+      CNI_CONFIG="/etc/cni/net.d/00-bunkerbox.conflist"
+
+      sudo install -d -m 0755 "$CNI_PLUGIN_DIR" "$(dirname "$CNI_CONFIG")"
+
+      for plugin in bridge host-local firewall; do
+        source="/usr/lib/cni/${plugin}"
+        target="${CNI_PLUGIN_DIR}/${plugin}"
+
+        if [ ! -x "$source" ]; then
+          echo "CNI plugin missing after package install: $source" >&2
+          exit 1
+        fi
+
+        if [ -e "$target" ] || [ -L "$target" ]; then
+          if [ "$(readlink -f "$target")" != "$source" ]; then
+            echo "refusing to replace existing CNI plugin: $target" >&2
+            exit 1
+          fi
+        else
+          sudo ln -s "$source" "$target"
+        fi
+      done
+
+    - |
+      set -Eeuo pipefail
+
+      CNI_CONFIG="/etc/cni/net.d/00-bunkerbox.conflist"
+      CNI_NETWORK_NAME="bunkerbox"
+      CNI_BRIDGE="bunkerbox0"
+      CNI_SUBNET="${BUNKERBOX_CNI_SUBNET:-10.247.0.0/24}"
+
+      if [ -f "$CNI_CONFIG" ] && ! grep -q '"name": "bunkerbox"' "$CNI_CONFIG"; then
+        echo "refusing to overwrite existing CNI config: $CNI_CONFIG" >&2
+        exit 1
+      fi
+
+      sudo tee "$CNI_CONFIG" >/dev/null <<EOF_CNI
+      {
+        "cniVersion": "1.0.0",
+        "name": "${CNI_NETWORK_NAME}",
+        "plugins": [
+          {
+            "type": "bridge",
+            "bridge": "${CNI_BRIDGE}",
+            "isGateway": true,
+            "ipMasq": true,
+            "hairpinMode": true,
+            "ipam": {
+              "type": "host-local",
+              "ranges": [
+                [
+                  { "subnet": "${CNI_SUBNET}" }
+                ]
+              ],
+              "routes": [
+                { "dst": "0.0.0.0/0" }
+              ]
+            }
+          },
+          {
+            "type": "firewall",
+            "backend": "iptables"
+          }
+        ]
+      }
+      EOF_CNI
+
+    - |
+      set -Eeuo pipefail
+
+      KATA_VERSION="${KATA_VERSION:-3.32.0}"
+      KATA_TARBALL="${PWD}/kata-static-${KATA_VERSION}-amd64.tar.zst"
+      KATA_URL="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/$(basename "$KATA_TARBALL")"
+      SHIM_LINK="/usr/local/bin/containerd-shim-kata-v2"
+
+      if [ -f "$KATA_TARBALL" ]; then
+        echo "Using existing tarball: $KATA_TARBALL"
+      else
+        echo "Downloading Kata ${KATA_VERSION}..."
+        curl -fL "$KATA_URL" -o "$KATA_TARBALL"
+      fi
+
+      sudo rm -rf /opt/kata
+      sudo tar --use-compress-program=unzstd -xf "$KATA_TARBALL" -C /
+      sudo ln -sfn /opt/kata/bin/containerd-shim-kata-v2 "$SHIM_LINK"
+
+      if [ ! -x /opt/kata/bin/containerd-shim-kata-v2 ]; then
+        echo "Kata shim installation failed" >&2
+        exit 1
+      fi
+
+      echo "Kata ${KATA_VERSION} installed."
+      echo "Preserved tarball: $KATA_TARBALL"

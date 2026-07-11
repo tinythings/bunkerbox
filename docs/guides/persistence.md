@@ -1,73 +1,68 @@
 # Persistence
 
-Persistence saves app home data between runs.
+Persistence means the tool keeps its own app home between runs.
 
-Enable it in runtime config:
+This is useful because many developer tools store config, session files, history, indexes, or login state under their home directory. Bunkerbox does not point those tools at your real home. It gives them a separate home and saves that home only when the runtime config asks for it.
+
+Enable persistence in runtime config with:
 
 ```yaml
 home: persist
 ```
 
-## Host path
+## Where data is stored
 
-Default host path:
+By default, persisted home data is stored under the user data directory:
 
 ```text
 $XDG_DATA_HOME/bunkerbox/<app>/home
 ```
 
-If `XDG_DATA_HOME` is not set:
+If `XDG_DATA_HOME` is not set, Bunkerbox uses:
 
 ```text
 ~/.local/share/bunkerbox/<app>/home
 ```
 
-For command `opencode`:
+For a command named `opencode`, that becomes:
 
 ```text
 ~/.local/share/bunkerbox/opencode/home
 ```
 
-## Container path
+## What happens inside the container
 
-The host home store is mounted at:
+The host persistence directory is mounted into the container at:
 
 ```text
 /bunkerbox-persist-home
 ```
 
-The generated entrypoint copies it into:
+The generated entrypoint copies that data into a temporary home:
 
 ```text
 /tmp/bunkerbox-home
 ```
 
-The app runs with:
+The app then runs with:
 
 ```text
 HOME=/tmp/bunkerbox-home
 ```
 
-## Flow
+When the app exits, Bunkerbox copies the temporary home back to the persisted home directory.
 
-```text
-host persisted home
-copy into container temp home
-app writes state
-copy temp home back to host
-```
+In plain words: the app writes to a container-local home while it runs, and Bunkerbox saves that home after the app is done.
 
-## Build image with persistence support
+## Build and import
 
-Persistence support is in the generated entrypoint.
-
-Build any image config:
+Persistence behavior is part of the generated image entrypoint. Build the image first:
 
 ```sh
 make image IMAGE=images/opencode.conf
 ```
 
-Import the resulting OCI archive:
+Then import the produced OCI archive for development use:
 
 ```sh
 make install-image OCI=bunkerbox-opencode-1.17.18.oci

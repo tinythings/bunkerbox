@@ -1,69 +1,80 @@
 # Quickstart
 
-Use only Makefile commands.
+This page shows the normal development flow. Use the Makefile for project tasks.
 
-## Build project
+## Build the project
+
+Start by building the project binaries.
 
 ```sh
 make dev
 ```
 
-This builds the project binaries into `target/debug/`.
+This creates the local development binaries under `target/debug/`.
 
-## Check project
+## Check the project
+
+Before committing changes, run the project checks.
 
 ```sh
 make check
 ```
 
-This formats and lints the project.
+This formats the code and runs lint checks.
 
-## Setup host runtime
+## Setup the host runtime
+
+Bunkerbox uses host runtime pieces such as containerd and Kata. Prepare them with:
 
 ```sh
 make setup
 ```
 
-This prepares host runtime pieces needed for containerd and Kata.
+This is a host setup step. It should be done before trying to run isolated tools locally.
 
-## Build an OCI image
+## Build an image
+
+Images are built from configs in `images/`. For example:
 
 ```sh
 make image IMAGE=images/opencode.conf
 ```
 
-`IMAGE` is the image config path.
-
-The config decides the output file.
-For `images/opencode.conf`, output is:
+The `IMAGE` value is the path to the image config. The config itself decides the output archive name. For the OpenCode config, the output is:
 
 ```text
 bunkerbox-opencode-1.17.18.oci
 ```
 
-## Import an OCI image
+## Import an image
+
+For local development, import the OCI archive into containerd.
 
 ```sh
 make install-image OCI=bunkerbox-opencode-1.17.18.oci
 ```
 
-`OCI` is the OCI archive path.
+The `OCI` value is the archive that should be imported.
 
-## Prepare workspace
+## Prepare a workspace
+
+If you use clone workspace mode, prepare the disposable workspace with:
 
 ```sh
 make prepare
 ```
 
-This creates a disposable workspace when clone workspace mode is used.
+The prepared workspace lives under `.bunker/` and is ignored by the repository.
 
-## Build docs website
+## Build the docs site
+
+The documentation is a static website.
 
 ```sh
 make docs
 ```
 
-This creates the static website in:
+The generated site is written to:
 
 ```text
 target/site-docs/

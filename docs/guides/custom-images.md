@@ -1,48 +1,38 @@
 # Custom images
 
-Create an image config under:
+A custom image config lets you package another tool for Bunkerbox.
 
-```text
-images/
-```
+Start by adding a config file under `images/`. The existing `images/opencode.conf` is the best example to copy from because it shows the expected shape: image name, output archive, command, hooks section, and container recipe.
 
-Use the existing opencode config as the real example:
-
-```text
-images/opencode.conf
-```
-
-## Build a custom image config
+Build a config with:
 
 ```sh
 make image IMAGE=images/opencode.conf
 ```
 
-Replace `images/opencode.conf` with the config file you added.
+For your own tool, replace the path with your new config file.
 
-## Required pieces
+## What the config must do
 
-An image config needs:
+The config must define the command that should run inside the container. It must also provide a container recipe that installs the tool.
 
-- `name`
-- `image`
-- `output`
-- `command`
-- `containerfile`
-
-The `containerfile` must copy the generated entrypoint:
+The container recipe must copy the generated Bunkerbox entrypoint into the image:
 
 ```text
 COPY bunker-entrypoint /usr/local/bin/bunker-entrypoint
 ```
 
-And use it:
+It must then use that generated file as the entrypoint:
 
 ```text
 ENTRYPOINT ["/usr/local/bin/bunker-entrypoint"]
 ```
 
-## Add hooks
+That entrypoint is what makes persistence and hooks work.
+
+## Hooks
+
+If the tool needs setup or cleanup, add hooks to the image config.
 
 ```yaml
 hooks:
@@ -50,18 +40,10 @@ hooks:
     echo "starting app"
 ```
 
-Build again:
+Hooks run inside the container, not on the host.
 
-```sh
-make image IMAGE=images/opencode.conf
-```
+## Packaging the tool
 
-## Package it
+After the image exists, packaging needs a runtime config and an app command. The runtime config tells Bunkerbox where the OCI archive is and how to run it. The app command is usually a symlink to the Bunkerbox binary.
 
-To package a custom image, add:
-
-- OCI archive under `/usr/share/bunkerbox/oci/`
-- runtime config under `/usr/share/bunkerbox/`
-- app command symlink to Bunkerbox binary
-
-See [Packaging](packaging.md).
+Read [Packaging](packaging.md) for the full model.

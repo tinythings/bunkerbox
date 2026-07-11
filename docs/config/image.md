@@ -1,16 +1,18 @@
 # Image config
 
-Image configs describe how to build OCI archives.
+An image config tells Bunkerbox how to build an OCI archive for a tool.
 
-Build any image config with:
+The config contains the image name, output archive name, app command, build arguments, hooks, optional extra files, and the container build recipe. You do not run the image builder directly. Use the Makefile:
 
 ```sh
 make image IMAGE=images/opencode.conf
 ```
 
-`IMAGE` is the config path.
+The `IMAGE` parameter is the path to the image config. You can point it at any config file under `images/`.
 
-## Example config
+## Example
+
+This is the important top part of the OpenCode image config:
 
 ```yaml
 name: opencode
@@ -24,43 +26,31 @@ build_args:
   OPENCODE_VERSION: "1.17.18"
 ```
 
-## Fields
+The `output` field decides the OCI archive name. After building this config, the archive is written as:
 
-| Field | Required | Meaning |
-|---|---:|---|
-| `name` | yes | Short image config name |
-| `image` | yes | Image tag used when building and importing |
-| `output` | yes | OCI archive written by the build |
-| `overwrite` | no | Replace existing OCI archive |
-| `command` | yes | App command executed inside the container |
-| `build_args` | no | Values passed into the Containerfile build |
-| `hooks` | no | Shell snippets added to the generated entrypoint |
-| `files` | no | Extra files added to the build context |
-| `containerfile` | yes | Container build recipe |
+```text
+bunkerbox-opencode-1.17.18.oci
+```
 
-## Generated entrypoint
+## The generated entrypoint
 
-The image build creates a generated file:
+Every Bunkerbox image uses a generated entrypoint called:
 
 ```text
 bunker-entrypoint
 ```
 
-The `containerfile` must copy it into the image:
+Your container recipe must copy it into the image and use it as the entrypoint:
 
 ```text
 COPY bunker-entrypoint /usr/local/bin/bunker-entrypoint
-```
-
-And use it as entrypoint:
-
-```text
 ENTRYPOINT ["/usr/local/bin/bunker-entrypoint"]
 ```
 
-That entrypoint handles:
+This generated entrypoint is important. It handles persistent home loading and saving, runs hooks, starts the app command, and preserves the app exit status.
 
-- persistent home copy in
-- hooks
-- app command
-- persistent home copy out
+## Fields
+
+`name` is a short name for the image config. `image` is the local image tag used while building and importing. `output` is the OCI archive that will be written. `command` is the app command that runs inside the container. `containerfile` is the actual container build recipe.
+
+Optional fields add behavior. `overwrite` allows replacing an existing archive. `build_args` passes values into the container build. `hooks` adds lifecycle shell snippets. `files` adds extra files to the build context.

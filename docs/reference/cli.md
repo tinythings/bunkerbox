@@ -1,5 +1,5 @@
 # Makefile reference
 
-This page moved to:
+The Makefile reference is here:
 
 [Makefile reference](makefile.md)

@@ -1,69 +1,62 @@
 # Makefile reference
 
-Use `make` for all project tasks.
+The Makefile is the public development interface for this repository. Use it instead of calling internal tools directly.
 
-## Targets
+## Build
 
-| Target | What it does |
-|---|---|
-| `make dev` | Builds project binaries into `target/debug/` |
-| `make check` | Formats and lints the project |
-| `make setup` | Sets up host runtime pieces |
-| `make image IMAGE=images/name.conf` | Builds an OCI archive from an image config |
-| `make install-image OCI=path/to/image.oci` | Imports an OCI archive into containerd |
-| `make prepare` | Prepares a disposable workspace |
-| `make docs` | Builds the static documentation website into `target/site-docs/` |
-| `make docs-clean` | Removes generated docs output and docs environment |
-
-## Build binaries
+Use this when you want to compile the project for local development:
 
 ```sh
 make dev
 ```
 
-Use this before other development targets.
+The development binaries are written under `target/debug/`.
 
-## Check code
+## Check
+
+Use this before committing code:
 
 ```sh
 make check
 ```
 
-This runs formatting and lint checks.
+It formats the code and runs lint checks.
 
-## Setup host runtime
+## Setup
+
+Use this to prepare the host runtime pieces needed by Bunkerbox:
 
 ```sh
 make setup
 ```
 
-This prepares host runtime dependencies used by Bunkerbox.
+This is needed before local container runs can work correctly.
 
-## Build image config
+## Build an image
+
+Use this to build an OCI archive from any image config:
 
 ```sh
 make image IMAGE=images/name.conf
 ```
 
-`IMAGE` is required.
-
-Example:
+`IMAGE` is required. It points to the image config file. For example:
 
 ```sh
 make image IMAGE=images/opencode.conf
 ```
 
-The image config decides the output OCI archive path.
+The image config decides the output file name.
 
-## Import OCI archive
+## Import an image
+
+Use this to import an OCI archive into containerd for local development:
 
 ```sh
 make install-image OCI=path/to/image.oci
 ```
 
-`OCI` is required.
-
-Example:
+`OCI` is required. For example:
 
 ```sh
 make install-image OCI=bunkerbox-opencode-1.17.18.oci
@@ -71,20 +64,32 @@ make install-image OCI=bunkerbox-opencode-1.17.18.oci
 
 ## Prepare workspace
 
+Use this when you need the disposable workspace used by clone mode:
+
 ```sh
 make prepare
 ```
 
-This creates the disposable workspace used by clone workspace mode.
+The workspace is created under `.bunker/`.
 
-## Build docs
+## Build documentation
+
+Use this to build the static documentation website:
 
 ```sh
 make docs
 ```
 
-This builds the static website into:
+The output is written to:
 
 ```text
 target/site-docs/
+```
+
+## Clean documentation output
+
+Use this to remove the generated documentation website and local documentation environment:
+
+```sh
+make docs-clean
 ```

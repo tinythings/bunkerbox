@@ -1,20 +1,14 @@
 # Runtime config
 
-Runtime configs describe how a packaged command runs an OCI image.
+A runtime config tells Bunkerbox how to run a prepared image.
 
-Bundled runtime config:
+The image config answers “how do we build the tool image?” The runtime config answers “how should this tool run on this machine?”
 
-```text
-runtime/opencode.conf
-```
+During development, runtime configs live in `runtime/`. In a packaged install, they live under `/usr/share/bunkerbox/`.
 
-Packaged location:
+## Example
 
-```text
-/usr/share/bunkerbox/opencode.conf
-```
-
-## Real bundled config
+The OpenCode runtime config looks like this:
 
 ```yaml
 oci: /usr/share/bunkerbox/oci/bunkerbox-opencode-1.17.18.oci
@@ -26,35 +20,22 @@ allow:
   - api.deepseek.com
 ```
 
-## Fields
+The `oci` field points to the archive in the packaged install. The `image` field is the image tag used by the runtime. The `workspace` field controls how the project is mounted. The `home` field controls whether app state is saved. The `network` and `allow` fields control networking.
 
-| Field | Meaning |
-|---|---|
-| `oci` | Path to packaged OCI archive |
-| `image` | Image tag imported into containerd |
-| `workspace` | Workspace mode |
-| `home` | Home mode |
-| `home_path` | Optional custom persistent home path |
-| `network` | Network mode |
-| `allow` | Allowed network destinations |
+## Workspace
 
-## Workspace modes
+With `workspace: share`, the current project is mounted directly at `/workspace` inside the container. This is simple and fast.
 
-| Mode | Meaning |
-|---|---|
-| `share` | Mount current project directly |
-| `clone` | Use `.bunker/workspace` |
+With `workspace: clone`, Bunkerbox prepares `.bunker/workspace` first. That gives the tool a disposable workspace instead of the original project directory.
 
-## Home modes
+## Home
 
-| Mode | Meaning |
-|---|---|
-| `persist` | Save app home between runs |
-| `temporary` | Do not persist app home |
+With `home: persist`, the tool keeps its app home between runs. This is useful for config, sessions, and tool state.
 
-## Network modes
+With `home: temporary`, the app home is not saved between runs.
 
-| Mode | Meaning |
-|---|---|
-| `bridge` | Use bridge networking |
-| `host` | Use host networking |
+## Network
+
+With `network: bridge`, Bunkerbox uses bridge networking and can apply an allow list. With `network: host`, the tool uses host networking.
+
+Use `allow` when you want bridge mode but only want specific destinations to be reachable.

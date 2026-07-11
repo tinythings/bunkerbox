@@ -1,8 +1,10 @@
 # Config schema
 
-Current YAML fields.
+This page shows the current YAML shapes used by Bunkerbox.
 
 ## Image config
+
+An image config lives under `images/`. It describes how to build one OCI archive.
 
 ```yaml
 name: string
@@ -26,13 +28,15 @@ files:
 containerfile: string
 ```
 
-Build with:
+Build an image config with:
 
 ```sh
 make image IMAGE=images/opencode.conf
 ```
 
 ## Runtime config
+
+A runtime config describes how a packaged command runs an image.
 
 ```yaml
 oci: path
@@ -45,18 +49,22 @@ allow:
   - hostname
 ```
 
-Bundled runtime config:
+During development, runtime configs live in `runtime/`. In a packaged install, they live under:
 
 ```text
-runtime/opencode.conf
+/usr/share/bunkerbox/
 ```
 
-Packaged runtime config path:
+For a command named `opencode`, the packaged runtime config is:
 
 ```text
 /usr/share/bunkerbox/opencode.conf
 ```
 
-## File modes
+## Modes
 
-File modes can be strings or integers.
+`workspace` decides how the project is mounted. Use `share` for direct mounting and `clone` for a disposable workspace.
+
+`home` decides whether app state is saved. Use `persist` to save state and `temporary` to throw it away after the run.
+
+`network` decides how the container gets network access. Use `bridge` for isolated bridge networking and `host` for host networking.

@@ -1,48 +1,34 @@
 # Concepts
 
-## Makefile workflow
-
-Development tasks are Makefile targets.
-
-Use `make` commands.
-
-See [Makefile reference](reference/makefile.md).
+Bunkerbox has a few moving parts. Each part has a simple job.
 
 ## Image config
 
-Image configs live in:
+An image config describes how to build the tool image. Image configs live in `images/`.
 
-```text
-images/
-```
+For example, `images/opencode.conf` describes how to build an OCI archive that contains OpenCode and the generated Bunkerbox entrypoint.
 
-They describe how to build a prepared OCI archive.
-
-Build one with:
+Build an image config with:
 
 ```sh
 make image IMAGE=images/opencode.conf
 ```
 
-`IMAGE` is the image config path.
+The image config decides the output archive name. The Makefile command only tells Bunkerbox which config to use.
 
 ## Runtime config
 
-Runtime configs live in:
+A runtime config describes how an image should run. Runtime configs live in `runtime/` during development.
+
+A runtime config answers questions like: Which OCI archive should be used? Should the project be mounted directly or cloned first? Should app state be saved? Which network mode should be used?
+
+In a packaged install, runtime configs are placed under:
 
 ```text
-runtime/
+/usr/share/bunkerbox/
 ```
 
-They describe how a packaged command should run.
-
-Example source config:
-
-```text
-runtime/opencode.conf
-```
-
-Packaged config path:
+If the command is named `opencode`, Bunkerbox looks for:
 
 ```text
 /usr/share/bunkerbox/opencode.conf
@@ -50,42 +36,28 @@ Packaged config path:
 
 ## Workspace
 
-The project workspace is mounted inside the container at:
+The workspace is the project directory that the tool can work on. Inside the container, the workspace is mounted at:
 
 ```text
 /workspace
 ```
 
-Workspace modes:
+In `share` mode, Bunkerbox mounts the current project directly. In `clone` mode, Bunkerbox prepares a disposable copy under `.bunker/workspace`.
 
-| Mode | Meaning |
-|---|---|
-| `share` | Mount current project directly |
-| `clone` | Use `.bunker/workspace` |
+## App home
 
-## Home persistence
+Many tools save config, cache, history, sessions, or login state in their home directory. Bunkerbox does not use your real home directory for this. Instead, it prepares a separate home for the tool.
 
-When home persistence is enabled, Bunkerbox saves app home data on the host.
+When persistence is enabled, that home is saved between runs. Inside the container, the tool writes to a temporary home. When the tool exits, Bunkerbox copies the data back to the persisted home store.
 
-Inside the container, the app writes to a temporary home.
+## Hooks
 
-See [Persistence](guides/persistence.md).
+Hooks are shell snippets inside an image config. They run inside the container around important lifecycle moments, such as before the app starts or after it exits.
 
-## Image hooks
-
-Hooks are shell snippets in image configs.
-
-They run inside the container before or after app lifecycle steps.
-
-See [Image hooks](config/hooks.md).
+Hooks are useful for small setup and cleanup tasks. For example, a hook can prepare config files, mark `/workspace` as a safe Git directory, or remove cache before state is saved.
 
 ## Packaging
 
-Packaging installs:
+Packaging makes a tool feel like a normal command. The package installs the Bunkerbox binary, an app command symlink, a runtime config, and the OCI archive.
 
-- Bunkerbox binary
-- app command symlink
-- runtime config
-- OCI archive
-
-See [Packaging](guides/packaging.md).
+When the user runs the app command, Bunkerbox uses that command name to find the matching runtime config.

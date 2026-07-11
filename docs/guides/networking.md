@@ -2,58 +2,50 @@
 
 Networking is controlled by runtime config.
 
-Example:
+Some tools need network access. Others should not talk to the network at all. Bunkerbox makes network behavior explicit so the runtime config says what kind of access the tool should get.
+
+## Bridge mode
+
+Bridge mode gives the container its own network path:
 
 ```yaml
 network: bridge
+```
+
+When bridge mode is used, Bunkerbox can also apply an allow list. For example:
+
+```yaml
 allow:
   - api.deepseek.com
 ```
 
-## Bridge mode
-
-```yaml
-network: bridge
-```
-
-Bridge mode uses CNI bridge networking.
+That means the runtime is intended to allow only specific destinations.
 
 ## Host mode
+
+Host mode uses host networking:
 
 ```yaml
 network: host
 ```
 
-Host mode uses host networking.
+This is less isolated than bridge mode, but may be useful for tools that need to behave like they are running directly on the host network.
 
-## Allow list
+## DNS
 
-`allow` limits network destinations in bridge mode.
-
-Example:
-
-```yaml
-allow:
-  - api.deepseek.com
-```
+When networking is enabled, Bunkerbox writes a resolver config for the container based on the host resolver config. Localhost nameservers are skipped because they usually do not work from inside the isolated container.
 
 ## Setup
 
-Prepare host runtime:
+Prepare the host runtime first:
 
 ```sh
 make setup
 ```
 
-Build and import an image:
+Then build and import the image you want to run:
 
 ```sh
 make image IMAGE=images/opencode.conf
 make install-image OCI=bunkerbox-opencode-1.17.18.oci
 ```
-
-## DNS
-
-When networking is enabled, Bunkerbox writes a container resolver config from the host resolver config.
-
-Localhost nameservers are skipped.

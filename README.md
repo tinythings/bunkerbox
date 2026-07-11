@@ -1,19 +1,69 @@
 # Bunkerbox
 
-Run developer agent tools inside isolated Kata containers.
+**Run powerful development agents without handing them your whole machine.**
 
-## Documentation
+Bunkerbox is an isolation layer for coding agents, CLIs, and other developer tools that need to work inside a project directory. Instead of running those tools directly on the host, Bunkerbox runs them inside a Kata-backed container with a controlled workspace, controlled home directory, and explicit runtime configuration.
 
-Docs live in `docs/` and use MkDocs Material.
+It is built for the world where developer tools are becoming more capable, more autonomous, and more deeply integrated into local workflows. Those tools are useful, but they should not automatically inherit your full shell environment, your host home directory, your credentials, and your entire filesystem. Bunkerbox gives them a smaller box to work in.
 
-Build static website:
+## What Bunkerbox gives you
+
+A tool launched through Bunkerbox sees the project workspace it needs, but not the whole host. Its application state can be persisted between runs without exposing the real user home. Its image is built ahead of time from a reproducible config. Its runtime behavior is described separately, so packaging a tool is a matter of pairing an OCI image with a small runtime config.
+
+The result is a workflow where tools still feel like normal commands, but run with a stronger boundary around them.
+
+## How it feels
+
+A packaged tool can be invoked like any other command:
+
+```sh
+opencode
+```
+
+Behind that command, Bunkerbox loads the matching runtime configuration, imports the prepared OCI image when needed, mounts the project workspace, prepares the tool home, applies network settings, and starts the tool inside a Kata container.
+
+For development, the repository exposes the workflow through Makefile targets. Build an image from an image config:
+
+```sh
+make image IMAGE=images/opencode.conf
+```
+
+Import an OCI archive for local development:
+
+```sh
+make install-image OCI=bunkerbox-opencode-1.17.18.oci
+```
+
+Build the documentation website:
 
 ```sh
 make docs
 ```
 
-Output goes to `target/site-docs/`.
+The generated documentation site is written to `target/site-docs/`.
 
-The Makefile creates a local `.venv-docs` environment automatically.
+## Images, runtimes, and packaging
 
-Read the Docs config is in `.readthedocs.yaml`.
+Bunkerbox separates image building from runtime behavior. Image configs live in `images/` and describe how a tool image is built. Runtime configs live in `runtime/` and describe how that image should be executed: workspace mode, home persistence, network mode, and allowed destinations.
+
+In a packaged install, a command such as `opencode` can be a symlink to the Bunkerbox binary. Bunkerbox uses the invoked command name to load the matching config from `/usr/share/bunkerbox`. That makes packaged tools feel ordinary while keeping the isolation behavior centralized.
+
+## Status
+
+Bunkerbox is a proof of concept. It is focused on exploring a safer local execution model for agentic developer tools using OCI images, containerd, and Kata Containers.
+
+## Documentation
+
+The full documentation is built as a static website:
+
+```sh
+make docs
+```
+
+Open the generated site from:
+
+```text
+target/site-docs/
+```
+
+The project also includes Read the Docs configuration for public documentation hosting.

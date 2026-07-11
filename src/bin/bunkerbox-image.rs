@@ -22,8 +22,24 @@ struct ImageConfig {
     #[serde(default)]
     build_args: BTreeMap<String, String>,
     #[serde(default)]
+    hooks: ImageHooks,
+    #[serde(default)]
     files: Vec<BuildFile>,
     containerfile: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ImageHooks {
+    #[serde(default, rename = "before-app")]
+    before_app: String,
+    #[serde(default, rename = "after-app")]
+    after_app: String,
+    #[serde(default, rename = "app-error")]
+    app_error: String,
+    #[serde(default, rename = "before-home-load")]
+    before_home_load: String,
+    #[serde(default, rename = "after-home-save")]
+    after_home_save: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,18 +155,56 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
 
 fn build_entrypoint(config: &ImageConfig) -> Result<String, String> {
     let command = config.command.iter().map(|part| shell_quote(part)).collect::<Vec<_>>().join(" ");
+    let before_app = shell_hook(&config.hooks.before_app);
+    let after_app = shell_hook(&config.hooks.after_app);
+    let app_error = shell_hook(&config.hooks.app_error);
+    let before_home_load = shell_hook(&config.hooks.before_home_load);
+    let after_home_save = shell_hook(&config.hooks.after_home_save);
 
     Ok(format!(
         r#"#!/bin/sh
 set -eu
 
+hook_before_app() {{
+{before_app}
+}}
+
+hook_after_app() {{
+{after_app}
+}}
+
+hook_app_error() {{
+{app_error}
+}}
+
+hook_before_home_load() {{
+{before_home_load}
+}}
+
+hook_after_home_save() {{
+{after_home_save}
+}}
+
 run_app() {{
-  exec {command}
+  hook_before_app
+  set +e
+  {command}
+  status=$?
+  set -e
+
+  export BUNKERBOX_APP_STATUS="$status"
+  hook_after_app
+  if [ "$status" -ne 0 ]; then
+    hook_app_error
+  fi
+
+  return "$status"
 }}
 
 if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
   local_home="/tmp/bunkerbox-home"
   mkdir -p "$BUNKERBOX_PERSIST_HOME" "$local_home"
+  hook_before_home_load
   cp -R "$BUNKERBOX_PERSIST_HOME/." "$local_home/" 2>/dev/null || true
 
   export HOME="$local_home"
@@ -160,17 +214,27 @@ if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
   export XDG_CACHE_HOME="$local_home/.cache"
 
   set +e
-  {command}
+  run_app
   status=$?
   set -e
 
   cp -R "$local_home/." "$BUNKERBOX_PERSIST_HOME/"
+  hook_after_home_save
   exit "$status"
 fi
 
 run_app
 "#
     ))
+}
+
+fn shell_hook(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "  :".to_string()
+    } else {
+        trimmed.lines().map(|line| format!("  {line}")).collect::<Vec<_>>().join("\n")
+    }
 }
 
 fn shell_quote(value: &str) -> String {

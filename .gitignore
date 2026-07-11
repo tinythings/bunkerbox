@@ -2,6 +2,9 @@ target/
 .bunker/
 .PLAN.md
 
+# Documentation
+.venv-docs/
+
 # Generated image archives
 *.oci
 kata-static-*.tar.zst

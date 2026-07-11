@@ -1,0 +1,61 @@
+site_name: Bunkerbox
+site_description: Run agent tools in isolated Kata containers
+repo_url: https://github.com/bunker-project/bunkerbox
+repo_name: bunker-project/bunkerbox
+
+site_dir: target/site-docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.tabs.link
+  palette:
+    - scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Concepts: concepts.md
+  - Configuration:
+      - Runtime config: config/runtime.md
+      - Image config: config/image.md
+      - Image hooks: config/hooks.md
+  - Guides:
+      - Persistence: guides/persistence.md
+      - Networking: guides/networking.md
+      - Custom images: guides/custom-images.md
+      - Packaging: guides/packaging.md
+  - Reference:
+      - Makefile: reference/makefile.md
+      - Config schema: reference/config-schema.md

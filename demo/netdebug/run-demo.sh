@@ -28,7 +28,7 @@ make -C "$PROJECT_ROOT" dev
 
 if [ ! -f "$KATA_TARBALL" ]; then
   echo "Downloading Kata ${KATA_VERSION}..."
-  curl -fsSL "$KATA_URL" -o "$KATA_TARBALL"
+  curl -fL "$KATA_URL" -o "$KATA_TARBALL"
 fi
 
 cp "$KATA_TARBALL" "$KATA_SHARE_TARBALL"

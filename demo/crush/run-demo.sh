@@ -6,11 +6,11 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SHARE_DIR="${SCRIPT_DIR}/share"
 OCI_DIR="${SHARE_DIR}/oci"
 KATA_DIR="${SHARE_DIR}/kata"
-OCI_FILE="${OCI_DIR}/bunkerbox-opencode-1.17.18.oci"
-RUNTIME_CONF="${SHARE_DIR}/opencode.conf"
+OCI_FILE="${OCI_DIR}/bunkerbox-crush-0.84.1.oci"
+RUNTIME_CONF="${SHARE_DIR}/crush.conf"
 BUNKERBOX="${PROJECT_ROOT}/target/debug/bunkerbox"
 BUNKERBOX_IMAGE="${PROJECT_ROOT}/target/debug/bunkerbox-image"
-OPENCODE_LINK="${SCRIPT_DIR}/opencode"
+CRUSH_LINK="${SCRIPT_DIR}/crush"
 KATA_VERSION="${KATA_VERSION:-3.32.0}"
 KATA_TARBALL_NAME="kata-static-${KATA_VERSION}-amd64.tar.zst"
 KATA_TARBALL="${SCRIPT_DIR}/${KATA_TARBALL_NAME}"
@@ -19,7 +19,7 @@ KATA_URL="https://github.com/kata-containers/kata-containers/releases/download/$
 KATA_ARCHIVE_PREFIX="/$(printf '%s/%s' opt kata)"
 KATA_ARCHIVE_PATH=".${KATA_ARCHIVE_PREFIX}"
 
-rm -f "$OPENCODE_LINK"
+rm -f "$CRUSH_LINK"
 rm -rf "$OCI_DIR" "$KATA_DIR"
 mkdir -p "$OCI_DIR" "$KATA_DIR"
 
@@ -67,11 +67,11 @@ fi
 
 BUNKERBOX_KATA_DIR="$KATA_DIR" "$BUNKERBOX" --share "$SHARE_DIR" setup
 
-"$BUNKERBOX_IMAGE" "$PROJECT_ROOT/images/opencode.conf" --output "$OCI_FILE"
+"$BUNKERBOX_IMAGE" "$PROJECT_ROOT/images/crush.conf" --output "$OCI_FILE"
 
 cat > "$RUNTIME_CONF" <<EOF_RUNTIME
 oci: ${OCI_FILE}
-image: localhost/bunkerbox-opencode:1.17.18
+image: localhost/bunkerbox-crush:0.84.1
 workspace: share
 home: persist
 network: bridge
@@ -79,12 +79,12 @@ allow:
   - api.deepseek.com
 EOF_RUNTIME
 
-ln -sfn "$BUNKERBOX" "$OPENCODE_LINK"
+ln -sfn "$BUNKERBOX" "$CRUSH_LINK"
 
 cat <<EOF_DONE
 Demo ready.
 
 Now run:
   cd ${SCRIPT_DIR}
-  ./opencode --share ./share
+  ./crush --share ./share
 EOF_DONE

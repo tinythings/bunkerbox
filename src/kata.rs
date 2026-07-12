@@ -64,6 +64,13 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
         args.push(&term_env);
     }
 
+    let colorterm_env;
+    if let Ok(ct) = std::env::var("COLORTERM") {
+        colorterm_env = format!("COLORTERM={ct}");
+        args.push("--env");
+        args.push(&colorterm_env);
+    }
+
     if let Some(mount) = &resolv_conf_mount {
         args.push("--mount");
         args.push(mount.as_str());

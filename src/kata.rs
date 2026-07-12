@@ -35,17 +35,7 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
         let home_path = config.home_path.clone().unwrap_or_else(|| default_home_path(app_name));
         run_command(
             "sudo",
-            &[
-                "install",
-                "-d",
-                "-m",
-                "0755",
-                "-o",
-                uid,
-                "-g",
-                gid,
-                home_path.to_str().ok_or_else(|| "home path is not valid UTF-8".to_string())?,
-            ],
+            &["install", "-d", "-m", "0755", "-o", uid, "-g", gid, home_path.to_str().ok_or_else(|| "home path is not valid UTF-8".to_string())?],
         )?;
 
         container_env.push("BUNKERBOX_PERSIST_HOME=/bunkerbox-persist-home".to_string());
@@ -65,6 +55,13 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
     for value in &container_env {
         args.push("--env");
         args.push(value.as_str());
+    }
+
+    let term_env;
+    if let Ok(term) = std::env::var("TERM") {
+        term_env = format!("TERM={term}");
+        args.push("--env");
+        args.push(&term_env);
     }
 
     if let Some(mount) = &resolv_conf_mount {

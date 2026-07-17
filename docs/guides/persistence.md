@@ -54,29 +54,28 @@ The loop image lives at `.bunker/session.img` inside the persist home directory 
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ HOST                                                             │
-│                                                                  │
-│ ~/.local/share/bunkerbox/<app>/home/  (raw persist home)         │
-│   .bunker/session.img                 ← ext4 loop image          │
-│   .config/ .local/share/ ...          ← populated from session   │
-│                                      on teardown / recovery      │
-│                                                                  │
-│ sudo mount -o loop session.img                                    │
-│         ▼                                                        │
+│ HOST                                                            │
+│                                                                 │
+│ ~/.local/share/bunkerbox/<app>/home/  (raw persist home)        │
+│   .bunker/session.img                 ← ext4 loop image         │
+│   .config/ .local/share/ ...          ← populated from session  │
+│                                      on teardown / recovery     │
+│                                                                 │
+│ sudo mount -o loop session.img                                  │
+│         ▼                                                       │
 │ /tmp/bunkerbox-session-<name>/  (loop mount, populated at setup)│
-│   └── .config/ .local/share/ .cache/                              │
-│                                                                  │
-│         │  bind mount (virtio-fs)                                 │
-│         ▼                                                        │
+│   └── .config/ .local/share/ .cache/                            │
+│         │  bind mount (virtio-fs)                               │
+│         ▼                                                       │
 └─────────────────────────────────────────────────────────────────┘
-         │
-         ▼
+          │
+          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ GUEST (Kata VM)                                                  │
-│                                                                  │
-│ /bunkerbox-persist-home  (bind mount of the loop mount)          │
-│   └── .config/ .local/share/ .cache/                              │
-│       ↑ app reads/writes here (ext4-backed, journaled via host)   │
+│ GUEST (Kata VM)                                                 │
+│                                                                 │
+│ /bunkerbox-persist-home  (bind mount of the loop mount)         │
+│   └── .config/ .local/share/ .cache/                            │
+│       ↑ app reads/writes here (ext4-backed, journaled via host) │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

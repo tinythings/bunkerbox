@@ -1,6 +1,8 @@
 mod clidef;
 mod cmdrun;
+mod envconf;
 mod kata;
+mod overlay;
 mod runtime;
 mod workspace;
 
@@ -94,8 +96,9 @@ fn share_dir_from_args() -> Result<PathBuf, String> {
 fn workspace_mode_from_args() -> Result<Option<WorkspaceMode>, String> {
     option_from_args("workspace")?
         .map(|value| match value.to_string_lossy().as_ref() {
-            "share" => Ok(WorkspaceMode::Share),
-            "clone" => Ok(WorkspaceMode::Clone),
+            "share" | "cow" => Ok(WorkspaceMode::Cow),
+            "clone" | "isolated" => Ok(WorkspaceMode::Isolated),
+            "direct" => Ok(WorkspaceMode::Direct),
             value => Err(format!("invalid --workspace value: {value}")),
         })
         .transpose()
@@ -130,12 +133,13 @@ fn run_packaged_runtime(config: runtime::RuntimeConfig, workspace_override: Opti
         return Err("runtime config missing image".to_string());
     }
 
-    let workspace_mode = workspace_override.or(config.workspace).unwrap_or(WorkspaceMode::Share);
-    let workspace = workspace::resolve(workspace_mode)?;
+    let workspace_mode = workspace_override.or(config.workspace).unwrap_or_default();
+    let quota = config.workspace_quota_bytes();
     let name = runtime::invoked_name()?;
+    let workspace = workspace::resolve(workspace_mode, quota, &name)?;
     let container_name = format!("bunkerbox-{name}");
 
-    kata::run(&config, &workspace, &container_name, share_dir, &name)
+    kata::run(&config, workspace.path(), &container_name, share_dir, &name)
 }
 
 fn print_subcommand_help(name: &str) -> Result<(), String> {

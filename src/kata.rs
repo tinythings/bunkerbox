@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
+const BRIDGE_SUBNET: &str = "10.247.0.0/24";
+const BRIDGE_NAME: &str = "bunkerbox0";
+
 pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _share_dir: &Path, app_name: &str) -> Result<(), String> {
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
@@ -160,9 +163,11 @@ fn ensure_bridge_egress_firewall(config: &RuntimeConfig, resolv_conf: Option<&Pa
     let allow = config.allow.as_ref().ok_or_else(|| "bridge egress firewall requires allow list".to_string())?;
 
     remove_bridge_egress_firewall()?;
+    run_command("sudo", &["modprobe", "br_netfilter"])?;
+    run_command("sudo", &["sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1"])?;
     run_command_allow_failure("sudo", &["iptables", "-N", "BUNKERBOX-EGRESS"])?;
     run_command("sudo", &["iptables", "-F", "BUNKERBOX-EGRESS"])?;
-    run_command("sudo", &["iptables", "-I", "FORWARD", "1", "-i", "bunkerbox0", "-j", "BUNKERBOX-EGRESS"])?;
+    run_command("sudo", &["iptables", "-I", "FORWARD", "1", "-s", BRIDGE_SUBNET, "-j", "BUNKERBOX-EGRESS"])?;
     run_command("sudo", &["iptables", "-A", "BUNKERBOX-EGRESS", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"])?;
 
     for server in resolv_conf.map(dns_servers).transpose()?.unwrap_or_default() {
@@ -180,7 +185,7 @@ fn ensure_bridge_egress_firewall(config: &RuntimeConfig, resolv_conf: Option<&Pa
 fn remove_bridge_egress_firewall() -> Result<(), String> {
     loop {
         let output = Command::new("sudo")
-            .args(["iptables", "-D", "FORWARD", "-i", "bunkerbox0", "-j", "BUNKERBOX-EGRESS"])
+            .args(["iptables", "-D", "FORWARD", "-s", BRIDGE_SUBNET, "-j", "BUNKERBOX-EGRESS"])
             .stderr(Stdio::null())
             .stdout(Stdio::null())
             .status()
@@ -278,31 +283,35 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
         }
     }
 
-    let config = r#"{
+    let config = format!(
+        r#"{{
   "cniVersion": "0.4.0",
   "name": "bunkerbox",
   "plugins": [
-    {
+    {{
       "type": "bridge",
-      "bridge": "bunkerbox0",
+      "bridge": "{bridge}",
       "isGateway": true,
       "ipMasq": true,
       "hairpinMode": true,
-      "ipam": {
+      "ipam": {{
         "type": "host-local",
         "ranges": [
           [
-            { "subnet": "10.247.0.0/24" }
+            {{ "subnet": "{subnet}" }}
           ]
         ],
         "routes": [
-          { "dst": "0.0.0.0/0" }
+          {{ "dst": "0.0.0.0/0" }}
         ]
-      }
-    }
+      }}
+    }}
   ]
-}
-"#;
+}}
+"#,
+        bridge = BRIDGE_NAME,
+        subnet = BRIDGE_SUBNET,
+    );
 
     let temp = std::env::temp_dir().join(format!("bunkerbox-cni-{}.conflist", std::process::id()));
     fs::write(&temp, config).map_err(|err| format!("failed to write {}: {err}", temp.display()))?;

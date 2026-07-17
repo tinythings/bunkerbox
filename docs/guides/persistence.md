@@ -53,7 +53,7 @@ The loop image lives at `.bunker/session.img` inside the persist home directory 
 │         ▼                                                       │
 │ /bunkerbox-persist-home (virtio-fs mount inside VM)             │
 │         │                                                       │
-│         │  copy on startup / copy back on exit                  │
+│         │  populate on startup / sync back on exit              │
 │         ▼                                                       │
 │ /run/bunkerbox/session (loop mount of session.img)              │
 │   └── .config/ .local/share/ .cache/                            │
@@ -82,7 +82,7 @@ home: persist
 session_mb: 50
 ```
 
-Set `session_mb: 0` to disable the loop image entirely. The app writes directly to the virtio-fs mount. This removes the size cap and crash recovery but avoids the copy overhead on startup and exit.
+Set `session_mb: 0` to disable the loop image entirely. The app writes directly to the virtio-fs mount (`HOME=/tmp/bunkerbox-home`). This removes the size cap and crash recovery but avoids the copy overhead on startup and exit.
 
 ## Encrypting secrets
 

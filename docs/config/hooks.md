@@ -17,17 +17,21 @@ The generated entrypoint runs hooks in this order:
 ```text
 container starts
 before-home-load
-copy persisted home to temp home
+populate session home from persisted home
 before-app
 run app
 after-app
 app-error, only if app failed
-copy temp home to persisted home
+sync session home back to persisted home
 after-home-save
 container exits
 ```
 
-`before-home-load` runs before persistent home data is copied into the container temp home. `before-app` runs right before the app command starts. `after-app` runs after the app exits, whether it succeeded or failed. `app-error` only runs when the app exits with a non-zero status. `after-home-save` runs after the temp home is copied back to persistent storage.
+When `session_mb` is set (the default), the session home is a loop-mounted ext4 image at `/run/bunkerbox/session`. The entrypoint recovers any left-over `session.img` from a previous crash, creates a fresh image, copies the persist home into it, and syncs changes back on exit.
+
+When `session_mb: 0`, the session home is a tmpfs at `/tmp/bunkerbox-home` and the old copy-in/copy-out behaviour applies.
+
+`before-home-load` runs before the session home is populated. `before-app` runs right before the app command starts. `after-app` runs after the app exits, whether it succeeded or failed. `app-error` only runs when the app exits with a non-zero status. `after-home-save` runs after changes are synced back to persistent storage.
 
 ## Example
 
@@ -50,6 +54,19 @@ BUNKERBOX_APP_STATUS
 ```
 
 When persistent home is enabled, hooks can also use these paths:
+
+With `session_mb` (default):
+
+```text
+BUNKERBOX_PERSIST_HOME=/bunkerbox-persist-home
+HOME=/run/bunkerbox/session
+XDG_CONFIG_HOME=/run/bunkerbox/session/.config
+XDG_DATA_HOME=/run/bunkerbox/session/.local/share
+XDG_STATE_HOME=/run/bunkerbox/session/.local/state
+XDG_CACHE_HOME=/run/bunkerbox/session/.cache
+```
+
+With `session_mb: 0`:
 
 ```text
 BUNKERBOX_PERSIST_HOME=/bunkerbox-persist-home

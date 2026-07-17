@@ -66,6 +66,19 @@ With `home: persist`, the tool keeps its app home between runs. This is useful f
 
 With `home: temporary`, the app home is not saved between runs.
 
+When persistence is enabled, `session_mb` controls how the session home is stored:
+
+```yaml
+home: persist
+session_mb: 50     # loop-mounted ext4 image (default 50), crash-safe
+```
+
+The entrypoint creates a loop-mounted ext4 image at `/run/bunkerbox/session` from `.bunker/session.img` inside the persisted home directory. All app writes go through the ext4 journal. If the VM crashes, the image file survives on the host disk and is recovered automatically on the next run.
+
+Set `session_mb: 0` to disable the loop mount. The app writes directly to the virtio-fs bind mount. This removes the size cap and crash recovery but avoids the copy overhead on startup and exit.
+
+For full details, see [Persistence](../guides/persistence.md).
+
 ## Encryption
 
 The `encrypt` field lists file paths (relative to the persisted home directory) that contain secrets. Before the container starts, Bunkerbox prompts for a passphrase. Any `.enc-cipher` files in the persisted home are decrypted in place. When the container exits, files matching the encrypt patterns are encrypted to `.enc-cipher` and the plaintext is removed.

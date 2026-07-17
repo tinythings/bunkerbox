@@ -182,6 +182,30 @@ impl CowWorkspace {
             .map_err(|e| format!("failed to run sudo {program}: {e}"))?;
         Ok(())
     }
+
+    fn has_unsynced_changes(&self) -> bool {
+        fn check(dir: &Path) -> bool {
+            let Ok(entries) = fs::read_dir(dir) else { return false };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                if name.starts_with('.') || name.ends_with(".wh") {
+                    continue;
+                }
+                if path.is_dir() {
+                    if check(&path) {
+                        return true;
+                    }
+                    continue;
+                }
+                if path.is_file() {
+                    return true;
+                }
+            }
+            false
+        }
+        check(&self.loop_mount.join("upper"))
+    }
 }
 
 fn parse_bind_mounts_under(mount_point: &Path) -> Vec<PathBuf> {
@@ -340,7 +364,7 @@ impl Drop for CowWorkspace {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
                 let synced_marker = sessions_dir.join(format!("{}.synced", path.file_stem().unwrap_or_default().to_string_lossy()));
-                if !synced_marker.exists() {
+                if !synced_marker.exists() && self.has_unsynced_changes() {
                     eprintln!("bunkerbox: session ending. Changes not synced. Run 'bunkerbox sync' to save.");
                 }
                 let _ = fs::remove_file(&path);

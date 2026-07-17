@@ -15,6 +15,7 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
         return Err(format!("OCI archive not found: {}", config.oci.display()));
     }
 
+    check_containerd_version()?;
     run_command("sudo", &["systemctl", "start", "containerd"])?;
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
     if config.network == Some(NetworkMode::Bridge) {
@@ -441,6 +442,42 @@ fn run_command_allow_failure(program: &str, args: &[&str]) -> Result<(), String>
         .status()
         .map_err(|err| format!("failed to run {program}: {err}"))?;
 
+    Ok(())
+}
+
+fn check_containerd_version() -> Result<(), String> {
+    if std::env::var("BUNKERBOX_SKIP_CONTAINERD_CHECK").is_ok() {
+        return Ok(());
+    }
+
+    let output = Command::new("containerd")
+        .arg("--version")
+        .output()
+        .map_err(|err| format!("failed to run containerd --version: {err}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for token in stdout.split_whitespace() {
+        let stripped = token.strip_prefix('v').unwrap_or(token);
+        let parts: Vec<&str> = stripped.split('.').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let Ok(major): Result<u32, _> = parts[0].parse() else { continue; };
+        let Ok(minor): Result<u32, _> = parts[1].parse() else { continue; };
+        let Ok(patch): Result<u32, _> = parts[2].parse() else { continue; };
+
+        if (major, minor, patch) < (2, 2, 5) {
+            return Err(format!(
+                "containerd {major}.{minor}.{patch} is too old. Version >= 2.2.5 required for Kata networking.\n\
+                 Install from: https://github.com/containerd/containerd/releases\n\
+                 To skip: export BUNKERBOX_SKIP_CONTAINERD_CHECK=1",
+            ));
+        }
+        return Ok(());
+    }
+
+    eprintln!("WARNING: could not parse containerd version. Proceeding anyway.");
     Ok(())
 }
 

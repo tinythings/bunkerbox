@@ -1,4 +1,10 @@
 use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::aead::Aead;
+use aes_gcm::aead::consts::U12;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use rand::Rng;
+use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -16,6 +22,32 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
     }
 
     check_containerd_version()?;
+
+    let home_path: Option<PathBuf> = if config.home == Some(HomeMode::Persist) {
+        Some(config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)))
+    } else {
+        None
+    };
+
+    let encrypt_patterns: &[String] = config.encrypt.as_deref().unwrap_or(&[]);
+    let passphrase = if !encrypt_patterns.is_empty() {
+        if let Ok(key) = std::env::var("BUNKERBOX_ENCRYPT_KEY") {
+            key
+        } else {
+            read_passphrase()?
+        }
+    } else {
+        String::new()
+    };
+
+    if !passphrase.is_empty() {
+        if let Some(ref hp) = home_path {
+            if hp.is_dir() {
+                unseal_home(hp, &passphrase)?;
+            }
+        }
+    }
+
     run_command("sudo", &["systemctl", "start", "containerd"])?;
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
     if config.network == Some(NetworkMode::Bridge) {
@@ -35,15 +67,14 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
         return Err(format!("invalid current user spec: {user}"));
     };
     let mut container_env = Vec::new();
-    let home_mount = if config.home == Some(HomeMode::Persist) {
-        let home_path = config.home_path.clone().unwrap_or_else(|| default_home_path(app_name));
+    let home_mount = if let Some(ref hp) = home_path {
         run_command(
             "sudo",
-            &["install", "-d", "-m", "0755", "-o", uid, "-g", gid, home_path.to_str().ok_or_else(|| "home path is not valid UTF-8".to_string())?],
+            &["install", "-d", "-m", "0755", "-o", uid, "-g", gid, hp.to_str().ok_or_else(|| "home path is not valid UTF-8".to_string())?],
         )?;
 
         container_env.push("BUNKERBOX_PERSIST_HOME=/bunkerbox-persist-home".to_string());
-        Some(format!("type=bind,src={},dst=/bunkerbox-persist-home,options=rbind:rw", home_path.display()))
+        Some(format!("type=bind,src={},dst=/bunkerbox-persist-home,options=rbind:rw", hp.display()))
     } else {
         None
     };
@@ -105,6 +136,14 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
 
     if let Some(path) = resolv_conf {
         let _ = fs::remove_file(path);
+    }
+
+    if !passphrase.is_empty() {
+        if let Some(ref hp) = home_path {
+            if hp.is_dir() {
+                seal_home(hp, encrypt_patterns, &passphrase)?;
+            }
+        }
     }
 
     result
@@ -443,6 +482,143 @@ fn run_command_allow_failure(program: &str, args: &[&str]) -> Result<(), String>
         .map_err(|err| format!("failed to run {program}: {err}"))?;
 
     Ok(())
+}
+
+fn confirm(prompt: &str) -> bool {
+    use std::io::{self, Read, Write};
+    let mut stdout = io::stdout();
+    let _ = write!(stdout, "{prompt} [y/N] ");
+    let _ = stdout.flush();
+
+    let mut buf = [0u8; 1];
+    if io::stdin().read_exact(&mut buf).is_err() {
+        return false;
+    }
+
+    buf[0] == b'y' || buf[0] == b'Y'
+}
+
+fn read_passphrase() -> Result<String, String> {
+    rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))
+}
+
+fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, 100_000, &mut key);
+    key
+}
+
+fn encrypt_to_vec(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let mut rng = rand::thread_rng();
+    let mut salt = [0u8; 16];
+    rng.fill(&mut salt);
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes);
+
+    let key = derive_key(passphrase, &salt);
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("cipher init: {e}"))?;
+    let nonce = Nonce::<U12>::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|_| "encryption failed".to_string())?;
+
+    let mut result = Vec::with_capacity(28 + ciphertext.len());
+    result.extend_from_slice(&salt);
+    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&ciphertext);
+
+    Ok(BASE64.encode(&result).into_bytes())
+}
+
+fn decrypt_from_slice(passphrase: &str, encoded: &[u8]) -> Result<Vec<u8>, String> {
+    let data = BASE64.decode(encoded).map_err(|_| "base64 decode failed".to_string())?;
+
+    if data.len() < 28 {
+        return Err("encrypted data too short".to_string());
+    }
+
+    let salt = &data[..16];
+    let nonce_bytes = &data[16..28];
+    let ciphertext = &data[28..];
+
+    let key = derive_key(passphrase, salt);
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("cipher init: {e}"))?;
+    let nonce = Nonce::<U12>::from_slice(nonce_bytes);
+
+    cipher.decrypt(nonce, ciphertext).map_err(|_| "Failed to open credentials vault".to_string())
+}
+
+fn walk_files(base: &Path, dir: &Path, f: &mut dyn FnMut(&Path, &Path) -> Result<(), String>) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            walk_files(base, &path, f)?;
+        } else if path.is_file() {
+            let rel = path.strip_prefix(base).unwrap_or(&path);
+            f(&path, rel)?;
+        }
+    }
+    Ok(())
+}
+
+fn unseal_home(home: &Path, passphrase: &str) -> Result<(), String> {
+    walk_files(home, home, &mut |path, _rel| {
+        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+            return Ok(());
+        };
+        if !filename.ends_with(".enc-cipher") {
+            return Ok(());
+        }
+
+        let encrypted = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let plaintext = match decrypt_from_slice(passphrase, &encrypted) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                if confirm("Reset current authentication to default?") {
+                    fs::remove_file(path).map_err(|err| format!("remove {}: {err}", path.display()))?;
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
+
+        let path_str = path.to_string_lossy();
+        let target = PathBuf::from(path_str.strip_suffix(".enc-cipher").unwrap_or(&path_str));
+
+        fs::write(&target, &plaintext).map_err(|e| format!("write {}: {e}", target.display()))?;
+        fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+
+        Ok(())
+    })
+}
+
+fn seal_home(home: &Path, patterns: &[String], passphrase: &str) -> Result<(), String> {
+    let compiled: Vec<glob::Pattern> =
+        patterns.iter().map(|p| glob::Pattern::new(p)).collect::<Result<Vec<_>, _>>().map_err(|e| format!("invalid glob pattern: {e}"))?;
+
+    walk_files(home, home, &mut |path, rel| {
+        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+            return Ok(());
+        };
+        if filename.ends_with(".enc-cipher") {
+            return Ok(());
+        }
+
+        let rel_str = rel.to_string_lossy();
+        if !compiled.iter().any(|p| p.matches(&rel_str)) {
+            return Ok(());
+        }
+
+        let plaintext = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let encrypted = encrypt_to_vec(passphrase, &plaintext)?;
+
+        let enc_path = PathBuf::from(format!("{}.enc-cipher", path.display()));
+        fs::write(&enc_path, &encrypted).map_err(|e| format!("write {}: {e}", enc_path.display()))?;
+        fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+
+        Ok(())
+    })
 }
 
 fn check_containerd_version() -> Result<(), String> {

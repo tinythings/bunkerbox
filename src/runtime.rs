@@ -16,6 +16,8 @@ pub struct RuntimeConfig {
     pub workspace_exclude: Option<Vec<String>>,
     pub home: Option<HomeMode>,
     pub home_path: Option<PathBuf>,
+    #[serde(default)]
+    pub encrypt: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]

@@ -69,15 +69,7 @@ BUNKERBOX_KATA_DIR="$KATA_DIR" "$BUNKERBOX" --share "$SHARE_DIR" setup
 
 "$BUNKERBOX_IMAGE" "$PROJECT_ROOT/images/kilocode.conf" --output "$OCI_FILE"
 
-cat > "$RUNTIME_CONF" <<EOF_RUNTIME
-oci: ${OCI_FILE}
-image: localhost/bunkerbox-kilocode:7.4.11
-workspace: share
-home: persist
-network: bridge
-allow:
-  - api.deepseek.com
-EOF_RUNTIME
+cp "${OCI_DIR}/kilo.conf" "$RUNTIME_CONF"
 
 ln -sfn "$BUNKERBOX" "$KILOCODE_LINK"
 

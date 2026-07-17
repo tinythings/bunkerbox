@@ -66,6 +66,33 @@ With `home: persist`, the tool keeps its app home between runs. This is useful f
 
 With `home: temporary`, the app home is not saved between runs.
 
+## Encryption
+
+The `encrypt` field lists file paths (relative to the persisted home directory) that contain secrets. Before the container starts, Bunkerbox prompts for a passphrase. Any `.enc-cipher` files in the persisted home are decrypted in place. When the container exits, files matching the encrypt patterns are encrypted to `.enc-cipher` and the plaintext is removed.
+
+```yaml
+encrypt:
+  - ".local/share/opencode/auth.json"
+  - ".local/share/opencode/account.json"
+```
+
+Passphrase can be supplied via environment variable to skip the prompt:
+
+```sh
+export BUNKERBOX_ENCRYPT_KEY="my-passphrase"
+```
+
+Files are encrypted with AES-256-GCM. The key is derived from the passphrase using PBKDF2-HMAC-SHA256 (100,000 iterations) with a random salt per file.
+
+If the passphrase is wrong at startup, Bunkerbox prompts per-file:
+
+```
+decryption failed — wrong passphrase?: .local/share/opencode/auth.json.enc-cipher
+Remove it? [y/N]
+```
+
+Answer `y` to delete the undecryptable file (the app will recreate it fresh) or `n` to abort.
+
 ## Network
 
 With `network: bridge`, Bunkerbox uses bridge networking and can apply an allow list. With `network: host`, the tool uses host networking.

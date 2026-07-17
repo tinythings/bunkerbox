@@ -231,80 +231,25 @@ run_app() {{
 }}
 
 if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
-  session_mb="${{BUNKERBOX_SESSION_MB:-0}}"
-
-  if [ "$session_mb" -gt 0 ] 2>/dev/null; then
-    bunker_dir="$BUNKERBOX_PERSIST_HOME/.bunker"
-    session_img="$bunker_dir/session.img"
-    local_home="/run/bunkerbox/session"
-
-    if [ -f "$session_img" ]; then
-      echo "bunkerbox: found leftover session.img, recovering..."
-      recovery_mnt="/run/bunkerbox/recovery"
-      mkdir -p "$recovery_mnt"
-
-      e2fsck -p "$session_img" 2>/dev/null || true
-      if mount -o loop "$session_img" "$recovery_mnt" 2>/dev/null; then
-        cp -Rup "$recovery_mnt/." "$BUNKERBOX_PERSIST_HOME/" 2>/dev/null || true
-        umount "$recovery_mnt"
-      else
-        echo "bunkerbox: warning: could not mount leftover session.img, discarding"
-      fi
-
-      rm -rf "$recovery_mnt"
-      rm -f "$session_img"
-    fi
-
-    mkdir -p "$bunker_dir" "$local_home"
-
-    dd if=/dev/zero of="$session_img" bs=1M count="$session_mb" 2>/dev/null
-    mke2fs -F -t ext4 "$session_img" 2>/dev/null
-    mount -o loop "$session_img" "$local_home"
-
-    hook_before_home_load
-    cp -R "$BUNKERBOX_PERSIST_HOME/." "$local_home/" 2>/dev/null || true
-
-    export HOME="$local_home"
-    export XDG_CONFIG_HOME="$local_home/.config"
-    export XDG_DATA_HOME="$local_home/.local/share"
-    export XDG_STATE_HOME="$local_home/.local/state"
-    export XDG_CACHE_HOME="$local_home/.cache"
-
-    set +e
-    run_app
-    status=$?
-    set -e
-
-    cp -Rup "$local_home/." "$BUNKERBOX_PERSIST_HOME/" 2>/dev/null || true
-    hook_after_home_save
-    umount "$local_home"
-    rm -f "$session_img"
-
-    exit "$status"
-  fi
-
-  local_home="/tmp/bunkerbox-home"
-  mkdir -p "$BUNKERBOX_PERSIST_HOME" "$local_home"
   hook_before_home_load
-  cp -R "$BUNKERBOX_PERSIST_HOME/." "$local_home/" 2>/dev/null || true
 
-  export HOME="$local_home"
-  export XDG_CONFIG_HOME="$local_home/.config"
-  export XDG_DATA_HOME="$local_home/.local/share"
-  export XDG_STATE_HOME="$local_home/.local/state"
-  export XDG_CACHE_HOME="$local_home/.cache"
-
-  set +e
-  run_app
-  status=$?
-  set -e
-
-  cp -R "$local_home/." "$BUNKERBOX_PERSIST_HOME/"
-  hook_after_home_save
-  exit "$status"
+  export HOME="$BUNKERBOX_PERSIST_HOME"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export XDG_DATA_HOME="$HOME/.local/share"
+  export XDG_STATE_HOME="$HOME/.local/state"
+  export XDG_CACHE_HOME="$HOME/.cache"
 fi
 
+set +e
 run_app
+status=$?
+set -e
+
+if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
+  hook_after_home_save
+fi
+
+exit "$status"
 "#
     ))
 }

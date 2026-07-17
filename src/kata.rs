@@ -48,6 +48,22 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
         }
     }
 
+    let user = current_user_spec()?;
+    let Some((uid, gid)) = user.split_once(':') else {
+        return Err(format!("invalid current user spec: {user}"));
+    };
+
+    let session_mb = config.session_mb();
+    let session_dir: Option<PathBuf> = if session_mb > 0 {
+        if let Some(ref hp) = home_path {
+            Some(setup_session(hp, session_mb, container_name, uid, gid)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     run_command("sudo", &["systemctl", "start", "containerd"])?;
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
     if config.network == Some(NetworkMode::Bridge) {
@@ -62,20 +78,20 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
     }
     let resolv_conf_mount = resolv_conf.as_ref().map(|path| format!("type=bind,src={},dst=/etc/resolv.conf,options=rbind:ro", path.display()));
     let workspace_mount = format!("type=bind,src={},dst=/workspace,options=rbind:rw", workspace.display());
-    let user = current_user_spec()?;
-    let Some((uid, gid)) = user.split_once(':') else {
-        return Err(format!("invalid current user spec: {user}"));
-    };
     let mut container_env = Vec::new();
     let home_mount = if let Some(ref hp) = home_path {
-        run_command(
-            "sudo",
-            &["install", "-d", "-m", "0755", "-o", uid, "-g", gid, hp.to_str().ok_or_else(|| "home path is not valid UTF-8".to_string())?],
-        )?;
+        let src = if let Some(ref sd) = session_dir {
+            sd.display().to_string()
+        } else {
+            run_command(
+                "sudo",
+                &["install", "-d", "-m", "0755", "-o", uid, "-g", gid, hp.to_str().ok_or_else(|| "home path is not valid UTF-8".to_string())?],
+            )?;
+            hp.display().to_string()
+        };
 
         container_env.push("BUNKERBOX_PERSIST_HOME=/bunkerbox-persist-home".to_string());
-        container_env.push(format!("BUNKERBOX_SESSION_MB={}", config.session_mb()));
-        Some(format!("type=bind,src={},dst=/bunkerbox-persist-home,options=rbind:rw", hp.display()))
+        Some(format!("type=bind,src={},dst=/bunkerbox-persist-home,options=rbind:rw", src))
     } else {
         None
     };
@@ -137,6 +153,12 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
 
     if let Some(path) = resolv_conf {
         let _ = fs::remove_file(path);
+    }
+
+    if let Some(ref sd) = session_dir {
+        if let Some(ref hp) = home_path {
+            teardown_session(hp, sd);
+        }
     }
 
     if !passphrase.is_empty() {
@@ -383,58 +405,13 @@ fn import_image(config: &RuntimeConfig) -> Result<(), String> {
 }
 
 fn remove_stale_container(container_name: &str) -> Result<(), String> {
-    run_command_allow_failure("sudo", &["ctr", "tasks", "kill", "--signal", "SIGKILL", container_name])?;
-    kill_task_pid(container_name)?;
-    kill_kata_shim(container_name)?;
-    run_command_allow_failure("sudo", &["systemctl", "restart", "containerd"])?;
-
-    let commands: &[&[&str]] = &[
-        &["ctr", "tasks", "delete", "--force", container_name],
-        &["ctr", "tasks", "rm", "--force", container_name],
-        &["ctr", "containers", "rm", container_name],
-        &["ctr", "snapshots", "rm", container_name],
-    ];
-
-    for args in commands {
-        run_command_allow_failure("sudo", args)?;
-    }
-
-    Ok(())
-}
-
-fn kill_task_pid(container_name: &str) -> Result<(), String> {
-    let output = command_output("sudo", &["ctr", "tasks", "ls"])?;
-
-    for line in output.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let Some(name) = fields.next() else {
-            continue;
-        };
-        let Some(pid) = fields.next() else {
-            continue;
-        };
-
-        if name == container_name && pid.chars().all(|ch| ch.is_ascii_digit()) {
-            run_command_allow_failure("sudo", &["kill", "-9", pid])?;
-        }
-    }
-
-    Ok(())
-}
-
-fn kill_kata_shim(container_name: &str) -> Result<(), String> {
-    let output = command_output("ps", &["-eo", "pid=,args="])?;
-
-    for line in output.lines() {
-        if line.contains("containerd-shim-kata-v2") && line.contains("-id") && line.contains(container_name) {
-            if let Some(pid) = line.split_whitespace().next() {
-                if pid.chars().all(|ch| ch.is_ascii_digit()) {
-                    run_command_allow_failure("sudo", &["kill", "-9", pid])?;
-                }
-            }
-        }
-    }
-
+    let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "kill", "--signal", "SIGKILL", container_name]);
+    let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "delete", "--force", container_name]);
+    let _ = run_command_allow_failure("sudo", &["ctr", "containers", "rm", container_name]);
+    let _ = run_command_allow_failure(
+        "sudo",
+        &["rm", "-f", &format!("/var/lib/cni/networks/{BRIDGE_NAME}/{container_name}")],
+    );
     Ok(())
 }
 
@@ -620,6 +597,52 @@ fn seal_home(home: &Path, patterns: &[String], passphrase: &str) -> Result<(), S
 
         Ok(())
     })
+}
+
+fn setup_session(home_path: &Path, session_mb: u32, container_name: &str, uid: &str, gid: &str) -> Result<PathBuf, String> {
+    let bunker_dir = home_path.join(".bunker");
+    let session_img = bunker_dir.join("session.img");
+    let session_dir = PathBuf::from(format!("/tmp/bunkerbox-session-{}", container_name));
+
+    if session_img.exists() {
+        eprintln!("bunkerbox: found leftover session.img, recovering...");
+        let _ = run_command_allow_failure("sudo", &["mkdir", "-p", session_dir.to_str().unwrap()]);
+
+        let _ = run_command("sudo", &["e2fsck", "-p", &format!("{}", session_img.display())]);
+
+        if run_command("sudo", &["mount", "-o", "loop", &format!("{}", session_img.display()), &format!("{}", session_dir.display())]).is_ok() {
+            let _ = run_command_allow_failure("sudo", &["chown", &format!("{}:{}", uid, gid), &format!("{}", session_dir.display())]);
+            let _ = run_command("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
+            let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
+        } else {
+            eprintln!("bunkerbox: warning: could not mount leftover session.img, discarding");
+        }
+
+        let _ = run_command_allow_failure("sudo", &["rm", "-rf", &format!("{}", session_dir.display())]);
+        let _ = run_command_allow_failure("rm", &["-f", &format!("{}", session_img.display())]);
+    }
+
+    run_command_allow_failure("mkdir", &["-p", &format!("{}", bunker_dir.display())])?;
+    run_command("dd", &["if=/dev/zero", &format!("of={}", session_img.display()), "bs=1M", &format!("count={}", session_mb)])?;
+    run_command("mke2fs", &["-F", "-t", "ext4", &format!("{}", session_img.display())])?;
+    run_command_allow_failure("sudo", &["mkdir", "-p", &format!("{}", session_dir.display())])?;
+    run_command("sudo", &["mount", "-o", "loop", &format!("{}", session_img.display()), &format!("{}", session_dir.display())])?;
+    run_command("sudo", &["chown", &format!("{}:{}", uid, gid), &format!("{}", session_dir.display())])?;
+    let _ = run_command("sudo", &["rm", "-rf", &format!("{}/lost+found", session_dir.display())]);
+
+    let _ = run_command("cp", &["-a", &format!("{}/.", home_path.display()), &format!("{}/", session_dir.display())]);
+
+    Ok(session_dir)
+}
+
+fn teardown_session(home_path: &Path, session_dir: &Path) {
+    let _ = run_command("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
+
+    let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
+
+    let session_img = home_path.join(".bunker").join("session.img");
+    let _ = run_command_allow_failure("rm", &["-f", &format!("{}", session_img.display())]);
+    let _ = run_command_allow_failure("sudo", &["rmdir", &format!("{}", session_dir.display())]);
 }
 
 fn check_containerd_version() -> Result<(), String> {

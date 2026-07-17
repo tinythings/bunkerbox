@@ -73,9 +73,9 @@ home: persist
 session_mb: 50     # loop-mounted ext4 image (default 50), crash-safe
 ```
 
-The entrypoint creates a loop-mounted ext4 image at `/run/bunkerbox/session` from `.bunker/session.img` inside the persisted home directory. All app writes go through the ext4 journal. If the VM crashes, the image file survives on the host disk and is recovered automatically on the next run.
+Before the VM starts, Bunkerbox creates a loop-mounted ext4 image from `.bunker/session.img` inside the persisted home directory on the host. The loop mount is then bind-mounted into the VM at `/bunkerbox-persist-home`. All app writes go through the ext4 journal. If the VM crashes, the image file survives on the host disk and is recovered automatically on the next run.
 
-Set `session_mb: 0` to disable the loop mount. The app writes directly to the virtio-fs bind mount. This removes the size cap and crash recovery but avoids the copy overhead on startup and exit.
+Set `session_mb: 0` to disable the loop image. The raw persist home is bind-mounted directly into the VM. No size cap, no crash recovery.
 
 For full details, see [Persistence](../guides/persistence.md).
 

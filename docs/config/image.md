@@ -47,7 +47,7 @@ COPY bunker-entrypoint /usr/local/bin/bunker-entrypoint
 ENTRYPOINT ["/usr/local/bin/bunker-entrypoint"]
 ```
 
-This generated entrypoint is important. It handles the session home lifecycle (creating a loop-mounted `session.img`, populating it from the persisted home, recovering from crashes), runs hooks, starts the app command, and preserves the app exit status.
+This generated entrypoint is important. It sets up the app home directory, runs hooks, starts the app command, and preserves the app exit status. All session management (loop mount, recovery, sync) happens on the host — the entrypoint itself is a thin wrapper.
 
 ## Fields
 

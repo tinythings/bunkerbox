@@ -47,7 +47,7 @@ workspace_exclude:          # fallback exclude pattern list
   - target/
 home: persist | temporary
 home_path: path
-session_mb: int             # session image size in MB, default 50, 0 to disable
+session_mb: int             # session image size in MB, default 50, 0 to disable (host-side loop mount)
 network: bridge | host
 allow:
   - hostname
@@ -97,6 +97,6 @@ For a command named `opencode`, the packaged runtime config is:
 
 `workspace` decides how the project is mounted. Use `cow` (or the old alias `share`) for copy-on-write with a capped loopback, `direct` for direct mounting, and `isolated` (or the old alias `clone`) for a disposable workspace.
 
-`home` decides whether app state is saved. Use `persist` to save state and `temporary` to throw it away after the run. When persistence is enabled, `session_mb` sets the loop-mounted ext4 image size in MB (default 50, set 0 to write directly to the bind mount).
+`home` decides whether app state is saved. Use `persist` to save state and `temporary` to throw it away after the run. When persistence is enabled, `session_mb` sets the host-side loop-mounted ext4 image size in MB (default 50, set 0 to bind-mount the raw persist home directly).
 
 `network` decides how the container gets network access. Use `bridge` for isolated bridge networking and `host` for host networking.

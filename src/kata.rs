@@ -74,6 +74,7 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
         )?;
 
         container_env.push("BUNKERBOX_PERSIST_HOME=/bunkerbox-persist-home".to_string());
+        container_env.push(format!("BUNKERBOX_SESSION_MB={}", config.session_mb()));
         Some(format!("type=bind,src={},dst=/bunkerbox-persist-home,options=rbind:rw", hp.display()))
     } else {
         None

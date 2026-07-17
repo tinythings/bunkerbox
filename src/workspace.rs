@@ -1,3 +1,5 @@
+use crate::envconf::EnvConfig;
+use crate::overlay::CowWorkspace;
 use crate::runtime::WorkspaceMode;
 use std::ffi::OsStr;
 use std::fs;
@@ -11,10 +13,34 @@ pub fn prepare(reset: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn resolve(mode: WorkspaceMode) -> Result<PathBuf, String> {
+pub enum WorkspaceHandle {
+    Cow { inner: CowWorkspace },
+    Direct { path: PathBuf },
+    Isolated { path: PathBuf },
+}
+
+impl WorkspaceHandle {
+    pub fn path(&self) -> &Path {
+        match self {
+            WorkspaceHandle::Cow { inner } => &inner.mount_point,
+            WorkspaceHandle::Direct { path } => path,
+            WorkspaceHandle::Isolated { path } => path,
+        }
+    }
+}
+
+pub fn resolve(mode: WorkspaceMode, quota_bytes: u64, runtime_exclude: Option<&[String]>, app_name: &str) -> Result<WorkspaceHandle, String> {
     match mode {
-        WorkspaceMode::Share => std::env::current_dir().map_err(|err| format!("failed to get current directory: {err}")),
-        WorkspaceMode::Clone => prepare_workspace(false, true),
+        WorkspaceMode::Cow => {
+            let repo_root = project_root()?;
+            let env = EnvConfig::load_or_create(&repo_root)?;
+            let cow = CowWorkspace::setup(&repo_root, &env, quota_bytes, runtime_exclude, app_name)?;
+            Ok(WorkspaceHandle::Cow { inner: cow })
+        }
+        WorkspaceMode::Direct => {
+            Ok(WorkspaceHandle::Direct { path: std::env::current_dir().map_err(|e| format!("failed to get current directory: {e}"))? })
+        }
+        WorkspaceMode::Isolated => Ok(WorkspaceHandle::Isolated { path: prepare_workspace(false, true)? }),
     }
 }
 
@@ -45,7 +71,7 @@ fn prepare_workspace(reset: bool, reuse_existing: bool) -> Result<PathBuf, Strin
     Ok(workspace)
 }
 
-fn project_root() -> Result<PathBuf, String> {
+pub fn project_root() -> Result<PathBuf, String> {
     if let Some(root) = git_root()? {
         return Ok(root);
     }
@@ -125,5 +151,5 @@ fn copy_dir(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn should_skip(name: &OsStr) -> bool {
-    matches!(name.to_str(), Some(".bunker") | Some(".git") | Some("target"))
+    matches!(name.to_str(), Some(".bunker") | Some(".bunkerbox") | Some(".git") | Some("target"))
 }

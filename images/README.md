@@ -35,4 +35,5 @@ make install-image OCI=path/to/image.oci
 | Config | Tool | Output archive |
 |--------|------|---------------|
 | `opencode.conf` | [OpenCode](https://github.com/anomalyco/opencode) | `bunkerbox-opencode-1.17.18.oci` |
+| `kilocode.conf` | [KiloCode](https://github.com/Kilo-Org/kilocode) | `bunkerbox-kilocode-7.4.11.oci` |
 | `crush.conf` | [Crush](https://github.com/charmbracelet/crush) | `bunkerbox-crush-0.84.1.oci` |

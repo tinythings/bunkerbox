@@ -12,6 +12,8 @@ pub struct RuntimeConfig {
     pub network: Option<NetworkMode>,
     pub allow: Option<Vec<String>>,
     pub workspace: Option<WorkspaceMode>,
+    pub workspace_quota: Option<String>,
+    pub workspace_exclude: Option<Vec<String>>,
     pub home: Option<HomeMode>,
     pub home_path: Option<PathBuf>,
 }
@@ -25,9 +27,14 @@ pub enum NetworkMode {
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum WorkspaceMode {
-    Share,
-    Clone,
+    #[serde(alias = "share")]
+    #[default]
+    Cow,
+    Direct,
+    #[serde(alias = "clone")]
+    Isolated,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -57,4 +64,28 @@ pub fn load_for_invoked_name(share_dir: &Path) -> Result<Option<RuntimeConfig>, 
     let config = serde_yaml::from_str(&contents).map_err(|err| format!("failed to parse runtime config {}: {err}", path.display()))?;
 
     Ok(Some(config))
+}
+
+impl RuntimeConfig {
+    pub fn workspace_quota_bytes(&self) -> u64 {
+        let default = 10 * 1024 * 1024 * 1024;
+        let raw = match &self.workspace_quota {
+            Some(s) => s.as_str(),
+            None => return default,
+        };
+        parse_size(raw).unwrap_or(default)
+    }
+}
+
+pub(crate) fn parse_size(raw: &str) -> Option<u64> {
+    let raw = raw.trim().to_uppercase();
+    let (num_str, unit) = raw.split_at(raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len()));
+    let num: u64 = num_str.parse().ok()?;
+    match unit {
+        "" | "B" => Some(num),
+        "K" | "KB" => Some(num * 1024),
+        "M" | "MB" => Some(num * 1024 * 1024),
+        "G" | "GB" => Some(num * 1024 * 1024 * 1024),
+        _ => None,
+    }
 }

@@ -21,6 +21,19 @@ allow:
 
 That means the runtime is intended to allow only specific destinations.
 
+### Egress firewall
+
+When both `network: bridge` and `allow` are set, Bunkerbox deploys iptables rules to enforce the allow list. The firewall:
+
+1. Loads the `br_netfilter` kernel module and enables `net.bridge.bridge-nf-call-iptables` so bridged traffic passes through iptables.
+2. Creates a chain `BUNKERBOX-EGRESS` and hooks it from the `FORWARD` chain by matching the bridge subnet.
+3. Permits established and related return traffic.
+4. Permits DNS to the host's configured resolvers (UDP and TCP port 53).
+5. Resolves each hostname in the allow list to IPv4 addresses and permits traffic to those destinations.
+6. Rejects all other egress.
+
+The bridge subnet is `10.247.0.0/24`. Firewall rules are torn down when the container exits.
+
 ## Host mode
 
 Host mode uses host networking:

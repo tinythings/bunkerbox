@@ -13,7 +13,6 @@ pub struct RuntimeConfig {
     pub allow: Option<Vec<String>>,
     pub workspace: Option<WorkspaceMode>,
     pub workspace_quota: Option<String>,
-    pub workspace_exclude: Option<Vec<String>>,
     pub home: Option<HomeMode>,
     pub home_path: Option<PathBuf>,
 }
@@ -27,18 +26,14 @@ pub enum NetworkMode {
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum WorkspaceMode {
     #[serde(alias = "share")]
+    #[default]
     Cow,
     Direct,
     #[serde(alias = "clone")]
     Isolated,
-}
-
-impl Default for WorkspaceMode {
-    fn default() -> Self {
-        WorkspaceMode::Cow
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]

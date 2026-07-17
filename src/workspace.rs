@@ -29,11 +29,7 @@ impl WorkspaceHandle {
     }
 }
 
-pub fn resolve(
-    mode: WorkspaceMode,
-    quota_bytes: u64,
-    app_name: &str,
-) -> Result<WorkspaceHandle, String> {
+pub fn resolve(mode: WorkspaceMode, quota_bytes: u64, app_name: &str) -> Result<WorkspaceHandle, String> {
     match mode {
         WorkspaceMode::Cow => {
             let repo_root = project_root()?;
@@ -42,16 +38,9 @@ pub fn resolve(
             Ok(WorkspaceHandle::Cow { inner: cow })
         }
         WorkspaceMode::Direct => {
-            Ok(WorkspaceHandle::Direct {
-                path: std::env::current_dir()
-                    .map_err(|e| format!("failed to get current directory: {e}"))?,
-            })
+            Ok(WorkspaceHandle::Direct { path: std::env::current_dir().map_err(|e| format!("failed to get current directory: {e}"))? })
         }
-        WorkspaceMode::Isolated => {
-            Ok(WorkspaceHandle::Isolated {
-                path: prepare_workspace(false, true)?,
-            })
-        }
+        WorkspaceMode::Isolated => Ok(WorkspaceHandle::Isolated { path: prepare_workspace(false, true)? }),
     }
 }
 
@@ -82,7 +71,7 @@ fn prepare_workspace(reset: bool, reuse_existing: bool) -> Result<PathBuf, Strin
     Ok(workspace)
 }
 
-fn project_root() -> Result<PathBuf, String> {
+pub fn project_root() -> Result<PathBuf, String> {
     if let Some(root) = git_root()? {
         return Ok(root);
     }

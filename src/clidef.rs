@@ -36,6 +36,13 @@ pub fn cli(version: &'static str) -> Command {
                 .arg(help_arg()),
         )
         .subcommand(Command::new("list").about("List embedded YAML sequences").styles(styles.clone()).disable_help_flag(true).arg(help_arg()))
+        .subcommand(
+            Command::new("sync")
+                .about("Copy overlay changes back to the real repository")
+                .styles(styles.clone())
+                .disable_help_flag(true)
+                .arg(help_arg()),
+        )
         .next_help_heading("Other")
         .arg(Arg::new("share").long("share").help("Override bunkerbox share directory"))
         .arg(Arg::new("workspace").long("workspace").value_parser(["share", "clone"]).help("Override workspace mode: share or clone"))

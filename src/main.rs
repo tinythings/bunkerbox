@@ -76,6 +76,14 @@ fn run() -> Result<(), String> {
             }
             list_sequences()
         }
+        Some(("sync", submatches)) => {
+            if submatches.get_flag("help") {
+                print_subcommand_help("sync")?;
+                return Ok(());
+            }
+            let repo_root = workspace::project_root()?;
+            overlay::sync_sessions(&repo_root, None)
+        }
         Some((name, _)) => Err(format!("unknown command: {name}")),
         None => {
             cli.print_help().map_err(|err| err.to_string())?;

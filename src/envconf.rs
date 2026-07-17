@@ -31,14 +31,11 @@ impl EnvConfig {
     pub fn load_or_create(repo_root: &Path) -> Result<Self, String> {
         let env_path = repo_root.join(Self::PATH);
         if env_path.exists() {
-            let contents = fs::read_to_string(&env_path)
-                .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
-            serde_yaml::from_str(&contents)
-                .map_err(|e| format!("failed to parse {}: {e}", env_path.display()))
+            let contents = fs::read_to_string(&env_path).map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
+            serde_yaml::from_str(&contents).map_err(|e| format!("failed to parse {}: {e}", env_path.display()))
         } else {
             let bunkerbox_dir = env_path.parent().unwrap();
-            fs::create_dir_all(bunkerbox_dir)
-                .map_err(|e| format!("failed to create {}: {e}", bunkerbox_dir.display()))?;
+            fs::create_dir_all(bunkerbox_dir).map_err(|e| format!("failed to create {}: {e}", bunkerbox_dir.display()))?;
 
             let mut yaml = String::from(
                 "# Bunkerbox workspace configuration\n\
@@ -54,22 +51,17 @@ impl EnvConfig {
                 yaml.push_str(&format!("  - {pat}\n"));
             }
 
-            fs::write(&env_path, &yaml)
-                .map_err(|e| format!("failed to write {}: {e}", env_path.display()))?;
+            fs::write(&env_path, &yaml).map_err(|e| format!("failed to write {}: {e}", env_path.display()))?;
 
-            Ok(EnvConfig {
-                quota: Some("auto".to_string()),
-                exclude: Vec::new(),
-            })
+            Ok(EnvConfig { quota: Some("auto".to_string()), exclude: Vec::new() })
         }
     }
 
-    pub fn quota_bytes(&self, runtime_default: u64, repo_root: &Path) -> Result<u64, String> {
+    pub fn quota_bytes(&self, _runtime_default: u64, repo_root: &Path) -> Result<u64, String> {
         match &self.quota {
             None => compute_auto_quota(repo_root, &self.effective_exclude()),
             Some(s) if s == "auto" => compute_auto_quota(repo_root, &self.effective_exclude()),
-            Some(s) => crate::runtime::parse_size(s)
-                .ok_or_else(|| format!("invalid quota: {s}")),
+            Some(s) => crate::runtime::parse_size(s).ok_or_else(|| format!("invalid quota: {s}")),
         }
     }
 
@@ -90,9 +82,7 @@ fn compute_auto_quota(repo_root: &Path, exclude: &[String]) -> Result<u64, Strin
 
 fn walk_repo_size(dir: &Path, exclude: &[String]) -> Result<u64, String> {
     let mut total: u64 = 0;
-    for entry in fs::read_dir(dir)
-        .map_err(|e| format!("failed to read {}: {e}", dir.display()))?
-    {
+    for entry in fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))? {
         let Ok(entry) = entry else {
             continue;
         };

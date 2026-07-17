@@ -2,9 +2,7 @@
 
 A runtime config tells Bunkerbox how to run a prepared image.
 
-The image config answers "how do we build the tool image?" The runtime config answers "how should this tool run on this machine?"
-
-During development, runtime configs live in `runtime/`. In a packaged install, they live under `/usr/share/bunkerbox/`.
+The image config answers "how do we build the tool image?" The runtime config answers "how should this tool run on this machine?" In a packaged install, runtime configs live under `/usr/share/bunkerbox/`.
 
 ## Example
 
@@ -15,13 +13,15 @@ oci: /usr/share/bunkerbox/oci/bunkerbox-opencode-1.17.18.oci
 image: localhost/bunkerbox-opencode:1.17.18
 workspace: cow
 workspace_quota: 10G
+workspace_exclude:
+  - demo/
 home: persist
 network: bridge
 allow:
   - api.deepseek.com
 ```
 
-The `oci` field points to the archive in the packaged install. The `image` field is the image tag used by the runtime. The `workspace` field controls how the project is mounted (see below). The `workspace_quota` field caps the upper layer size for copy-on-write mode. The `home` field controls whether app state is saved. The `network` and `allow` fields control networking.
+The `oci` field points to the archive in the packaged install. The `image` field is the image tag used by the runtime. The `workspace` field controls how the project is mounted (see below). The `workspace_quota` field caps the upper layer size. The `workspace_exclude` field lists directory patterns to exclude from the overlay walk — these go through uncapped bind-mounts instead. The `home` field controls whether app state is saved. The `network` and `allow` fields control networking.
 
 ## Workspace
 

@@ -38,21 +38,51 @@ The host persistence directory is mounted into the container at:
 /bunkerbox-persist-home
 ```
 
-The generated entrypoint copies that data into a temporary home:
+The generated entrypoint uses a loop-mounted ext4 image file inside the guest for the app home. This provides crash-safe persistence: even if the VM is killed, data written before the crash survives in the image file and is recovered automatically on the next run.
 
-```text
-/tmp/bunkerbox-home
+The loop image lives at `.bunker/session.img` inside the persist home directory on the host.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ HOST FILESYSTEM                                                 │
+│ ~/.local/share/bunkerbox/<app>/home/                            │
+│   .bunker/session.img  ← ext4 loop image (written via virtio-fs)│
+│   ...                                                           │
+│                                                                 │
+│     virtio-fs bind mount                                        │
+│         ▼                                                       │
+│ /bunkerbox-persist-home (virtio-fs mount inside VM)             │
+│         │                                                       │
+│         │  copy on startup / copy back on exit                  │
+│         ▼                                                       │
+│ /run/bunkerbox/session (loop mount of session.img)              │
+│   └── .config/ .local/share/ .cache/                            │
+│       ↑ app reads/writes here (ext4, journaled)                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-The app then runs with:
+On startup:
+1. If a leftover `.bunker/session.img` exists from a crash, it is fsck'd, mounted, and any newer files are copied back to the persist home
+2. A fresh `session.img` is created with a size limit
+3. The persist home is copied into the mounted image
+4. The app runs with `HOME=/run/bunkerbox/session`
 
-```text
-HOME=/tmp/bunkerbox-home
+On exit:
+1. New and modified files are copied back to the persist home
+2. The image is unmounted and deleted
+
+On crash: `session.img` remains on the host disk. The next run recovers it.
+
+## Session size limit
+
+Set `session_mb` to cap the amount of data the app can write (default 50 MB):
+
+```yaml
+home: persist
+session_mb: 50
 ```
 
-When the app exits, Bunkerbox copies the temporary home back to the persisted home directory.
-
-In plain words: the app writes to a container-local home while it runs, and Bunkerbox saves that home after the app is done.
+Set `session_mb: 0` to disable the loop image entirely. The app writes directly to the virtio-fs mount. This removes the size cap and crash recovery but avoids the copy overhead on startup and exit.
 
 ## Encrypting secrets
 

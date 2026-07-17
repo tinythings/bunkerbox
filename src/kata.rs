@@ -462,6 +462,28 @@ fn run_command_allow_failure(program: &str, args: &[&str]) -> Result<(), String>
     Ok(())
 }
 
+fn run_command_quiet(program: &str, args: &[&str]) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run {program}: {err}"))?;
+
+    let stderr = child.stderr.take().ok_or_else(|| format!("failed to capture stderr for {program}"))?;
+    let stderr_thread = thread::spawn(move || filter_stderr(stderr));
+
+    let status = child.wait().map_err(|err| format!("failed to wait for {program}: {err}"))?;
+    stderr_thread.join().map_err(|_| format!("stderr filter thread panicked for {program}"))??;
+
+    if !status.success() {
+        return Err(format!("command failed with status {status}: {program}"));
+    }
+
+    Ok(())
+}
+
 fn confirm(prompt: &str) -> bool {
     use std::io::{self, Read, Write};
     let mut stdout = io::stdout();
@@ -608,11 +630,11 @@ fn setup_session(home_path: &Path, session_mb: u32, container_name: &str, uid: &
         eprintln!("bunkerbox: found leftover session.img, recovering...");
         let _ = run_command_allow_failure("sudo", &["mkdir", "-p", session_dir.to_str().unwrap()]);
 
-        let _ = run_command("sudo", &["e2fsck", "-p", &format!("{}", session_img.display())]);
+        let _ = run_command_quiet("sudo", &["e2fsck", "-p", &format!("{}", session_img.display())]);
 
-        if run_command("sudo", &["mount", "-o", "loop", &format!("{}", session_img.display()), &format!("{}", session_dir.display())]).is_ok() {
+        if run_command_quiet("sudo", &["mount", "-o", "loop", &format!("{}", session_img.display()), &format!("{}", session_dir.display())]).is_ok() {
             let _ = run_command_allow_failure("sudo", &["chown", &format!("{}:{}", uid, gid), &format!("{}", session_dir.display())]);
-            let _ = run_command("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
+            let _ = run_command_quiet("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
             let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
         } else {
             eprintln!("bunkerbox: warning: could not mount leftover session.img, discarding");
@@ -622,21 +644,23 @@ fn setup_session(home_path: &Path, session_mb: u32, container_name: &str, uid: &
         let _ = run_command_allow_failure("rm", &["-f", &format!("{}", session_img.display())]);
     }
 
-    run_command_allow_failure("mkdir", &["-p", &format!("{}", bunker_dir.display())])?;
-    run_command("dd", &["if=/dev/zero", &format!("of={}", session_img.display()), "bs=1M", &format!("count={}", session_mb)])?;
-    run_command("mke2fs", &["-F", "-t", "ext4", &format!("{}", session_img.display())])?;
-    run_command_allow_failure("sudo", &["mkdir", "-p", &format!("{}", session_dir.display())])?;
-    run_command("sudo", &["mount", "-o", "loop", &format!("{}", session_img.display()), &format!("{}", session_dir.display())])?;
-    run_command("sudo", &["chown", &format!("{}:{}", uid, gid), &format!("{}", session_dir.display())])?;
-    let _ = run_command("sudo", &["rm", "-rf", &format!("{}/lost+found", session_dir.display())]);
+    eprintln!("bunkerbox: setting up session...");
 
-    let _ = run_command("cp", &["-a", &format!("{}/.", home_path.display()), &format!("{}/", session_dir.display())]);
+    run_command_allow_failure("mkdir", &["-p", &format!("{}", bunker_dir.display())])?;
+    run_command_quiet("dd", &["if=/dev/zero", &format!("of={}", session_img.display()), "bs=1M", &format!("count={}", session_mb)])?;
+    run_command_quiet("mke2fs", &["-F", "-t", "ext4", &format!("{}", session_img.display())])?;
+    run_command_allow_failure("sudo", &["mkdir", "-p", &format!("{}", session_dir.display())])?;
+    run_command_quiet("sudo", &["mount", "-o", "loop", &format!("{}", session_img.display()), &format!("{}", session_dir.display())])?;
+    run_command_quiet("sudo", &["chown", &format!("{}:{}", uid, gid), &format!("{}", session_dir.display())])?;
+    let _ = run_command_quiet("sudo", &["rm", "-rf", &format!("{}/lost+found", session_dir.display())]);
+
+    let _ = run_command_quiet("cp", &["-a", &format!("{}/.", home_path.display()), &format!("{}/", session_dir.display())]);
 
     Ok(session_dir)
 }
 
 fn teardown_session(home_path: &Path, session_dir: &Path) {
-    let _ = run_command("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
+    let _ = run_command_quiet("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
 
     let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
 

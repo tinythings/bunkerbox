@@ -1,6 +1,6 @@
 target/
 .bunker/
-.PLAN.md
+.*
 
 # Documentation
 .venv-docs/

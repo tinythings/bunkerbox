@@ -12,5 +12,7 @@ kata-static-*.tar.zst
 # Demo-generated runtime files
 /demo/*/share/
 /demo/*/*-image.conf
-/demo/opencode/opencode
+/demo/kilocode/kilo
 /demo/netdebug/netdebug
+/demo/opencode/opencode
+.bunkerbox/

@@ -57,20 +57,31 @@ impl EnvConfig {
         }
     }
 
-    pub fn quota_bytes(&self, _runtime_default: u64, repo_root: &Path) -> Result<u64, String> {
+    pub fn quota_bytes(&self, _runtime_default: u64, repo_root: &Path, runtime_exclude: Option<&[String]>) -> Result<u64, String> {
         match &self.quota {
-            None => compute_auto_quota(repo_root, &self.effective_exclude()),
-            Some(s) if s == "auto" => compute_auto_quota(repo_root, &self.effective_exclude()),
+            None => compute_auto_quota(repo_root, &self.effective_exclude(runtime_exclude)),
+            Some(s) if s == "auto" => compute_auto_quota(repo_root, &self.effective_exclude(runtime_exclude)),
             Some(s) => crate::runtime::parse_size(s).ok_or_else(|| format!("invalid quota: {s}")),
         }
     }
 
-    pub fn effective_exclude(&self) -> Vec<String> {
-        if self.exclude.is_empty() {
-            DEFAULT_EXCLUDE.iter().map(|s| s.to_string()).collect()
-        } else {
-            self.exclude.clone()
+    pub fn effective_exclude(&self, runtime_exclude: Option<&[String]>) -> Vec<String> {
+        let mut exclude: Vec<String> = DEFAULT_EXCLUDE.iter().map(|s| s.to_string()).collect();
+        for pat in &self.exclude {
+            let p = pat.trim_end_matches('/');
+            if !exclude.iter().any(|e| e.trim_end_matches('/') == p) {
+                exclude.push(pat.clone());
+            }
         }
+        if let Some(runtime) = runtime_exclude {
+            for pat in runtime {
+                let p = pat.trim_end_matches('/');
+                if !exclude.iter().any(|e| e.trim_end_matches('/') == p) {
+                    exclude.push(pat.clone());
+                }
+            }
+        }
+        exclude
     }
 }
 

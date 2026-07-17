@@ -16,11 +16,14 @@ pub struct CowWorkspace {
 struct SessionState {
     app_name: String,
     mount_point: String,
+    upper_dir: String,
     repo_root: String,
 }
 
 impl CowWorkspace {
-    pub fn setup(repo_root: &Path, env_config: &EnvConfig, runtime_quota: u64, app_name: &str) -> Result<Self, String> {
+    pub fn setup(
+        repo_root: &Path, env_config: &EnvConfig, runtime_quota: u64, runtime_exclude: Option<&[String]>, app_name: &str,
+    ) -> Result<Self, String> {
         let overlay_dir = repo_root.join(".bunkerbox");
         let loopback = overlay_dir.join("upper.img");
         let loop_mount = overlay_dir.join("upper-mount");
@@ -34,7 +37,7 @@ impl CowWorkspace {
 
         Self::ensure_gitignore(repo_root)?;
 
-        let quota_bytes = env_config.quota_bytes(runtime_quota, repo_root)?;
+        let quota_bytes = env_config.quota_bytes(runtime_quota, repo_root, runtime_exclude)?;
 
         let size_mb = quota_bytes / (1024 * 1024);
         if size_mb == 0 {
@@ -65,7 +68,7 @@ impl CowWorkspace {
 
         let mut bind_mounts: Vec<PathBuf> = Vec::new();
         let build_workspace = overlay_dir.join("build-workspace");
-        for pattern in env_config.effective_exclude() {
+        for pattern in env_config.effective_exclude(runtime_exclude) {
             let src_path = repo_root.join(&pattern);
 
             if src_path.exists() {
@@ -93,6 +96,7 @@ impl CowWorkspace {
         let state = SessionState {
             app_name: app_name.to_string(),
             mount_point: mount_point.to_string_lossy().to_string(),
+            upper_dir: upper_dir.to_string_lossy().to_string(),
             repo_root: repo_root.to_string_lossy().to_string(),
         };
         let state_json = serde_json::to_string(&state).map_err(|e| format!("failed to serialize session state: {e}"))?;
@@ -255,6 +259,7 @@ fn sync_session(sessions_dir: &Path, name: &str, state_path: &Path) -> Result<()
     let state: SessionState = serde_json::from_str(&contents).map_err(|e| format!("failed to parse session state: {e}"))?;
 
     let mount_point = Path::new(&state.mount_point);
+    let upper_dir = Path::new(&state.upper_dir);
     let repo_root = Path::new(&state.repo_root);
 
     if !is_mounted(mount_point) {
@@ -263,12 +268,12 @@ fn sync_session(sessions_dir: &Path, name: &str, state_path: &Path) -> Result<()
         return Ok(());
     }
 
-    let (changed, created) = sync_files(mount_point, repo_root)?;
+    let count = sync_upper(upper_dir, repo_root)?;
 
-    if changed == 0 && created == 0 {
+    if count == 0 {
         println!("{name}: no changes");
     } else {
-        println!("{name}: {changed} files changed, {created} new");
+        println!("{name}: {count} files synced");
         let synced_path = sessions_dir.join(format!("{name}.synced"));
         fs::write(&synced_path, "1").map_err(|e| format!("failed to write sync marker: {e}"))?;
     }
@@ -290,51 +295,37 @@ fn is_mounted(path: &Path) -> bool {
     false
 }
 
-fn sync_files(mount_point: &Path, repo_root: &Path) -> Result<(usize, usize), String> {
-    let mut changed = 0;
-    let mut created = 0;
-    sync_dir(mount_point, repo_root, mount_point, &mut changed, &mut created)?;
-    Ok((changed, created))
+fn sync_upper(upper_dir: &Path, repo_root: &Path) -> Result<usize, String> {
+    let mut count = 0;
+    sync_upper_dir(upper_dir, upper_dir, repo_root, &mut count)?;
+    Ok(count)
 }
 
-fn sync_dir(base: &Path, repo_root: &Path, current: &Path, changed: &mut usize, created: &mut usize) -> Result<(), String> {
+fn sync_upper_dir(base: &Path, current: &Path, repo_root: &Path, count: &mut usize) -> Result<(), String> {
     for entry in fs::read_dir(current).map_err(|e| format!("failed to read {}: {e}", current.display()))? {
         let entry = entry.map_err(|e| format!("failed to read entry: {e}"))?;
         let path = entry.path();
         let metadata = entry.metadata().map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
 
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(_name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
 
-        if name == ".bunkerbox" || name == ".git" || name == ".bunker" {
+        if metadata.file_type().is_symlink() {
             continue;
         }
 
         let rel = path.strip_prefix(base).map_err(|e| format!("failed to compute relative path: {e}"))?;
         let dest = repo_root.join(rel);
 
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-
         if metadata.is_dir() {
-            fs::create_dir_all(&dest).map_err(|e| format!("failed to create {}: {e}", dest.display()))?;
-            sync_dir(base, repo_root, &path, changed, created)?;
+            sync_upper_dir(base, &path, repo_root, count)?;
         } else if metadata.is_file() {
-            let copy = match fs::metadata(&dest) {
-                Ok(dest_meta) => dest_meta.len() != metadata.len() || dest_meta.modified().ok() != metadata.modified().ok(),
-                Err(_) => true,
-            };
-
-            if copy {
-                if dest.exists() {
-                    *changed += 1;
-                } else {
-                    *created += 1;
-                }
-                fs::copy(&path, &dest).map_err(|e| format!("failed to copy {} to {}: {e}", path.display(), dest.display()))?;
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
             }
+            fs::copy(&path, &dest).map_err(|e| format!("failed to copy {} to {}: {e}", path.display(), dest.display()))?;
+            *count += 1;
         }
     }
     Ok(())

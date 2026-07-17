@@ -29,12 +29,12 @@ impl WorkspaceHandle {
     }
 }
 
-pub fn resolve(mode: WorkspaceMode, quota_bytes: u64, app_name: &str) -> Result<WorkspaceHandle, String> {
+pub fn resolve(mode: WorkspaceMode, quota_bytes: u64, runtime_exclude: Option<&[String]>, app_name: &str) -> Result<WorkspaceHandle, String> {
     match mode {
         WorkspaceMode::Cow => {
             let repo_root = project_root()?;
             let env = EnvConfig::load_or_create(&repo_root)?;
-            let cow = CowWorkspace::setup(&repo_root, &env, quota_bytes, app_name)?;
+            let cow = CowWorkspace::setup(&repo_root, &env, quota_bytes, runtime_exclude, app_name)?;
             Ok(WorkspaceHandle::Cow { inner: cow })
         }
         WorkspaceMode::Direct => {

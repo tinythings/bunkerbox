@@ -13,6 +13,7 @@ pub struct RuntimeConfig {
     pub allow: Option<Vec<String>>,
     pub workspace: Option<WorkspaceMode>,
     pub workspace_quota: Option<String>,
+    pub workspace_exclude: Option<Vec<String>>,
     pub home: Option<HomeMode>,
     pub home_path: Option<PathBuf>,
 }

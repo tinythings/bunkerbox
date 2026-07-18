@@ -24,7 +24,7 @@ const DEFAULT_EXCLUDE: &[&str] = &[
 const MIN_QUOTA: u64 = 1024 * 1024 * 1024;
 
 /// Persistent per-repository configuration stored in `.bunkerbox/env.conf`.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct EnvConfig {
     #[serde(default)]
     pub quota: Option<String>,
@@ -43,25 +43,10 @@ impl EnvConfig {
         if env_path.exists() {
             serde_yaml::from_str(&fs::read_to_string(&env_path).map_err(|e| format!("failed to read {}: {e}", env_path.display()))?).map_err(|e| format!("failed to parse {}: {e}", env_path.display()))
         } else {
+            let default_config = EnvConfig { quota: Some("auto".to_string()), exclude: Vec::new() };
             fs::create_dir_all(env_path.parent().unwrap()).map_err(|e| format!("failed to create {}: {e}", env_path.parent().unwrap().display()))?;
-
-            let mut yaml = String::from(
-                "# Bunkerbox workspace configuration\n\
-                 # Edit this file to customize behavior.\n\n\
-                 # Quota for copy-on-write workspace. \"auto\" = walk repo (skipping excluded dirs), +10%, floor 1G.\n\
-                 # Use \"10G\", \"500M\", etc. for an explicit size.\n\
-                 quota: auto\n\n\
-                 # Directories excluded from copy-on-write (stored on host disk instead of in the capped loopback).\n\
-                 # Patterns match directory names relative to the repository root.\n\
-                 exclude:\n",
-            );
-            for pat in DEFAULT_EXCLUDE {
-                yaml.push_str(&format!("  - {pat}\n"));
-            }
-
-            fs::write(&env_path, &yaml).map_err(|e| format!("failed to write {}: {e}", env_path.display()))?;
-
-            Ok(EnvConfig { quota: Some("auto".to_string()), exclude: Vec::new() })
+            fs::write(&env_path, serde_yaml::to_string(&default_config).map_err(|e| format!("failed to serialize default config: {e}"))?).map_err(|e| format!("failed to write {}: {e}", env_path.display()))?;
+            Ok(default_config)
         }
     }
 

@@ -42,8 +42,7 @@ fn load_or_create_when_no_config_creates_default() {
 
     let contents = fs::read_to_string(&path).unwrap();
     assert!(contents.contains("quota: auto"));
-    assert!(contents.contains("target/"));
-    assert!(contents.contains("node_modules/"));
+    assert!(contents.contains("exclude"));
 }
 
 #[test]

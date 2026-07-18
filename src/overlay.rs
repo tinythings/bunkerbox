@@ -362,7 +362,6 @@ fn sync_upper_dir(base: &Path, current: &Path, repo_root: &Path, count: &mut usi
                 }
                 fs::copy(&path, &dest).map_err(|e| format!("failed to copy {} to {}: {e}", path.display(), dest.display()))?;
                 *count += 1;
-                let _ = fs::remove_file(&path);
             }
         }
     }

@@ -17,6 +17,14 @@ use std::thread;
 const BRIDGE_SUBNET: &str = "10.247.0.0/24";
 const BRIDGE_NAME: &str = "bunkerbox0";
 
+/// Runs the Kata container with the given runtime configuration.
+///
+/// Sets up containerd, workspace, optional bridge networking,
+/// home directory encryption, session storage, and launches the container
+/// via `sudo ctr run` with the Kata runtime.
+///
+/// # Returns
+/// `Ok(())` on successful container execution, `Err(String)` on failure.
 pub fn run(
     config: &RuntimeConfig,
     workspace_mode: WorkspaceMode,
@@ -32,23 +40,18 @@ pub fn run(
 
     check_containerd_version()?;
 
-    let home_path: Option<PathBuf> = if config.home == Some(HomeMode::Persist) {
-        Some(config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)))
-    } else {
-        None
-    };
+    let home_path = (config.home == Some(HomeMode::Persist))
+        .then(|| config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)));
 
     let needs_bridge = config.network == Some(NetworkMode::Bridge);
     let ctr_name = container_name.to_string();
     let oci_path = config.oci.to_string_lossy().into_owned();
     let image_tag = config.image.clone();
-    let wm = workspace_mode;
-    let wm_quota = quota;
     let wm_name = app_name.to_string();
     let wm_exclude = runtime_exclude.map(|v| v.to_vec());
 
     let setup_handle = std::thread::spawn(move || -> Result<WorkspaceHandle, String> {
-        let workspace = workspace::resolve(wm, wm_quota, wm_exclude.as_deref(), &wm_name)?;
+        let workspace = workspace::resolve(workspace_mode, quota, wm_exclude.as_deref(), &wm_name)?;
 
         let active = Command::new("sudo")
             .args(["systemctl", "is-active", "containerd"])
@@ -527,9 +530,7 @@ fn confirm(prompt: &str) -> bool {
 }
 
 fn read_passphrase() -> Result<String, String> {
-    let pass = rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))?;
-    eprintln!();
-    Ok(pass)
+    Ok(rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))?)
 }
 
 fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {

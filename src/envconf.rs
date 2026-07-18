@@ -1,6 +1,10 @@
 use std::fs;
 use std::path::Path;
 
+#[cfg(test)]
+#[path = "envconf_ut.rs"]
+mod envconf_tests;
+
 const DEFAULT_EXCLUDE: &[&str] = &[
     "target/",
     "node_modules/",

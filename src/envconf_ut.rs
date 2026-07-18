@@ -176,6 +176,30 @@ fn quota_bytes_with_extra_exclude_patterns() {
 }
 
 #[test]
+fn strict_cow_quota_bytes_counts_default_excluded_dirs_too() {
+    let root = TempDir::new().unwrap();
+    mkfile(root.path(), "src/main.rs", 600_000_000);
+    mkfile(root.path(), "target/debug/huge.o", 600_000_000);
+
+    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec![] };
+    let bytes = cfg.strict_cow_quota_bytes(root.path()).unwrap();
+
+    assert_eq!(bytes, 1_320_000_000);
+}
+
+#[test]
+fn strict_cow_quota_bytes_ignores_config_and_runtime_excludes() {
+    let root = TempDir::new().unwrap();
+    mkfile(root.path(), "src/main.rs", 700_000_000);
+    mkfile(root.path(), "vendor/blob.bin", 500_000_000);
+
+    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec!["vendor/".into()] };
+    let bytes = cfg.strict_cow_quota_bytes(root.path()).unwrap();
+
+    assert_eq!(bytes, 1_320_000_000);
+}
+
+#[test]
 fn effective_exclude_includes_defaults() {
     let cfg = EnvConfig { quota: None, exclude: vec![] };
     let exclude = cfg.effective_exclude(None);

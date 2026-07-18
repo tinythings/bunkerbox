@@ -5,6 +5,7 @@ use std::path::Path;
 #[path = "envconf_ut.rs"]
 mod envconf_tests;
 
+/// Default directories excluded from copy-on-write workspace snapshots.
 const DEFAULT_EXCLUDE: &[&str] = &[
     "target/",
     "node_modules/",
@@ -19,8 +20,10 @@ const DEFAULT_EXCLUDE: &[&str] = &[
     "cmake-build-release/",
 ];
 
+/// Minimum quota floor (1 GiB) used when computing auto quota.
 const MIN_QUOTA: u64 = 1024 * 1024 * 1024;
 
+/// Persistent per-repository configuration stored in `.bunkerbox/env.conf`.
 #[derive(Debug, serde::Deserialize)]
 pub struct EnvConfig {
     #[serde(default)]
@@ -30,16 +33,17 @@ pub struct EnvConfig {
 }
 
 impl EnvConfig {
+    /// Relative filesystem path to the environment config file.
     pub const PATH: &str = ".bunkerbox/env.conf";
 
+    /// Loads the environment config from `.bunkerbox/env.conf`, or creates a
+    /// default config file and returns `auto`-quota defaults if it does not exist.
     pub fn load_or_create(repo_root: &Path) -> Result<Self, String> {
         let env_path = repo_root.join(Self::PATH);
         if env_path.exists() {
-            let contents = fs::read_to_string(&env_path).map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
-            serde_yaml::from_str(&contents).map_err(|e| format!("failed to parse {}: {e}", env_path.display()))
+            serde_yaml::from_str(&fs::read_to_string(&env_path).map_err(|e| format!("failed to read {}: {e}", env_path.display()))?).map_err(|e| format!("failed to parse {}: {e}", env_path.display()))
         } else {
-            let bunkerbox_dir = env_path.parent().unwrap();
-            fs::create_dir_all(bunkerbox_dir).map_err(|e| format!("failed to create {}: {e}", bunkerbox_dir.display()))?;
+            fs::create_dir_all(env_path.parent().unwrap()).map_err(|e| format!("failed to create {}: {e}", env_path.parent().unwrap().display()))?;
 
             let mut yaml = String::from(
                 "# Bunkerbox workspace configuration\n\
@@ -61,6 +65,9 @@ impl EnvConfig {
         }
     }
 
+    /// Returns the effective quota in bytes, resolving `"auto"` or `None` by
+    /// walking the repository tree (skipping excluded directories) and applying
+    /// a 10% buffer with a 1 GiB floor.
     pub fn quota_bytes(&self, _runtime_default: u64, repo_root: &Path, runtime_exclude: Option<&[String]>) -> Result<u64, String> {
         match &self.quota {
             None => compute_auto_quota(repo_root, &self.effective_exclude(runtime_exclude)),
@@ -69,18 +76,18 @@ impl EnvConfig {
         }
     }
 
+    /// Merges the default exclude list, config-specified excludes, and runtime
+    /// excludes, deduplicating entries (comparison is done without trailing slashes).
     pub fn effective_exclude(&self, runtime_exclude: Option<&[String]>) -> Vec<String> {
         let mut exclude: Vec<String> = DEFAULT_EXCLUDE.iter().map(|s| s.to_string()).collect();
         for pat in &self.exclude {
-            let p = pat.trim_end_matches('/');
-            if !exclude.iter().any(|e| e.trim_end_matches('/') == p) {
+            if !exclude.iter().any(|e| e.trim_end_matches('/') == pat.trim_end_matches('/')) {
                 exclude.push(pat.clone());
             }
         }
         if let Some(runtime) = runtime_exclude {
             for pat in runtime {
-                let p = pat.trim_end_matches('/');
-                if !exclude.iter().any(|e| e.trim_end_matches('/') == p) {
+                if !exclude.iter().any(|e| e.trim_end_matches('/') == pat.trim_end_matches('/')) {
                     exclude.push(pat.clone());
                 }
             }
@@ -89,12 +96,14 @@ impl EnvConfig {
     }
 }
 
+/// Walks the repository to compute its total size (excluding specified
+/// directories) and returns the auto quota: size + 10%, floored at 1 GiB.
 fn compute_auto_quota(repo_root: &Path, exclude: &[String]) -> Result<u64, String> {
-    let total = walk_repo_size(repo_root, exclude)?;
-    let quota = total.saturating_mul(11).saturating_div(10);
-    Ok(quota.max(MIN_QUOTA))
+    Ok(walk_repo_size(repo_root, exclude)?.saturating_mul(11).saturating_div(10).max(MIN_QUOTA))
 }
 
+/// Recursively walks a directory tree, summing file sizes while skipping
+/// entries whose file name matches the exclude list.
 fn walk_repo_size(dir: &Path, exclude: &[String]) -> Result<u64, String> {
     let mut total: u64 = 0;
     for entry in fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))? {
@@ -123,15 +132,9 @@ fn walk_repo_size(dir: &Path, exclude: &[String]) -> Result<u64, String> {
     Ok(total)
 }
 
+/// Returns `true` if `name` is one of the well-known excluded directories
+/// (`.bunker`, `.bunkerbox`, `.git`) or matches any pattern in `exclude`
+/// (comparison is done without trailing slashes).
 fn is_excluded(name: &str, exclude: &[String]) -> bool {
-    if name == ".bunker" || name == ".bunkerbox" || name == ".git" {
-        return true;
-    }
-    for pattern in exclude {
-        let pat = pattern.trim_end_matches('/');
-        if name == pat {
-            return true;
-        }
-    }
-    false
+    name == ".bunker" || name == ".bunkerbox" || name == ".git" || exclude.iter().any(|p| name == p.trim_end_matches('/'))
 }

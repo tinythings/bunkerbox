@@ -352,11 +352,18 @@ fn sync_upper_dir(base: &Path, current: &Path, repo_root: &Path, count: &mut usi
         if metadata.is_dir() {
             sync_upper_dir(base, &path, repo_root, count)?;
         } else if metadata.is_file() {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+            let needs_copy = fs::read(&path)
+                .ok()
+                .and_then(|src| fs::read(&dest).ok().map(|dest_data| src != dest_data))
+                .unwrap_or(true);
+            if needs_copy {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+                }
+                fs::copy(&path, &dest).map_err(|e| format!("failed to copy {} to {}: {e}", path.display(), dest.display()))?;
+                *count += 1;
+                let _ = fs::remove_file(&path);
             }
-            fs::copy(&path, &dest).map_err(|e| format!("failed to copy {} to {}: {e}", path.display(), dest.display()))?;
-            *count += 1;
         }
     }
     Ok(())

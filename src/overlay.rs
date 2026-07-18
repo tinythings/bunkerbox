@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -98,7 +100,7 @@ impl CowWorkspace {
             repo_root: repo_root.to_string_lossy().to_string(),
         };
         fs::write(
-            &sessions_dir.join(format!("{app_name}.json")),
+            sessions_dir.join(format!("{app_name}.json")),
             serde_json::to_string(&state).map_err(|e| format!("failed to serialize session state: {e}"))?,
         ).map_err(|e| format!("failed to write session state: {e}"))?;
 
@@ -266,6 +268,9 @@ pub fn sync_sessions(repo_root: &Path, app_name: Option<&str>) -> Result<(), Str
     for entry in fs::read_dir(&sessions_dir).map_err(|e| format!("failed to read {}: {e}", sessions_dir.display()))? {
         let path = entry.map_err(|e| format!("failed to read session entry: {e}"))?.path();
         if path.extension().is_some_and(|ext| ext == "json") {
+            if path.file_name().is_some_and(|n| n.to_string_lossy().ends_with("-manifest.json")) {
+                continue;
+            }
             if let Some(name) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
                 if app_name.is_none_or(|n| n == name) {
                     sessions.push((name, path));
@@ -297,13 +302,20 @@ fn sync_session(sessions_dir: &Path, name: &str, state_path: &Path) -> Result<()
         return Ok(());
     }
 
-    let count = sync_upper(Path::new(&state.upper_dir), Path::new(&state.repo_root))?;
+    let (added, deleted) = sync_upper(Path::new(&state.upper_dir), Path::new(&state.repo_root), sessions_dir, name)?;
 
-    if count == 0 {
-        println!("{name}: no changes");
+    if added > 0 || deleted > 0 {
+        let mut parts = Vec::new();
+        if added > 0 {
+            parts.push(format!("{added} added"));
+        }
+        if deleted > 0 {
+            parts.push(format!("{deleted} deleted"));
+        }
+        println!("{name}: {}", parts.join(", "));
+        fs::write(sessions_dir.join(format!("{name}.synced")), "1").map_err(|e| format!("failed to write sync marker: {e}"))?;
     } else {
-        println!("{name}: {count} files synced");
-        fs::write(&sessions_dir.join(format!("{name}.synced")), "1").map_err(|e| format!("failed to write sync marker: {e}"))?;
+        println!("{name}: no changes");
     }
 
     Ok(())
@@ -324,34 +336,89 @@ fn is_mounted(path: &Path) -> bool {
     false
 }
 
-/// Recursively copies all non-whited-out files from the overlay upperdir to the repo root.
-/// Returns the count of files copied.
-fn sync_upper(upper_dir: &Path, repo_root: &Path) -> Result<usize, String> {
-    let mut count = 0;
-    sync_upper_dir(upper_dir, upper_dir, repo_root, &mut count)?;
-    Ok(count)
+/// Recursively copies non-whited-out files from the overlay upperdir to the repo root,
+/// processes whiteouts (deletions) and opaque markers, and tracks state via a manifest.
+/// Returns counts of files added and deleted.
+fn sync_upper(upper_dir: &Path, repo_root: &Path, sessions_dir: &Path, app_name: &str) -> Result<(usize, usize), String> {
+    let manifest_path = sessions_dir.join(format!("{app_name}-manifest.json"));
+    let manifest_old = load_manifest(&manifest_path);
+    let mut manifest_new = BTreeSet::new();
+    let mut count_add = 0;
+    let mut count_del = 0;
+
+    sync_upper_dir(upper_dir, upper_dir, repo_root, &mut count_add, &mut count_del, &manifest_old, &mut manifest_new)?;
+
+    for path in manifest_old.difference(&manifest_new) {
+        let target = repo_root.join(path);
+        if target.exists() {
+            if target.is_file() || target.is_symlink() {
+                fs::remove_file(&target).map_err(|e| format!("failed to remove {}: {e}", target.display()))?;
+            } else if target.is_dir() {
+                fs::remove_dir_all(&target).map_err(|e| format!("failed to remove {}: {e}", target.display()))?;
+            }
+            count_del += 1;
+        }
+    }
+
+    save_manifest(&manifest_path, &manifest_new)?;
+    Ok((count_add, count_del))
 }
 
-/// Recursive helper for `sync_upper` that walks a directory tree and copies files.
-fn sync_upper_dir(base: &Path, current: &Path, repo_root: &Path, count: &mut usize) -> Result<(), String> {
+/// Recursive helper that walks an upperdir directory, syncing files to repo_root,
+/// processing whiteouts and opaque markers, and building the new manifest.
+fn sync_upper_dir(
+    base: &Path, current: &Path, repo_root: &Path,
+    count_add: &mut usize, count_del: &mut usize,
+    _manifest_old: &BTreeSet<String>, manifest_new: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let mut has_opq = false;
+
     for entry in fs::read_dir(current).map_err(|e| format!("failed to read {}: {e}", current.display()))? {
         let entry = entry.map_err(|e| format!("failed to read entry: {e}"))?;
         let path = entry.path();
         let metadata = entry.metadata().map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
 
-        let Some(_name) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
 
-        if metadata.file_type().is_symlink() {
+        let file_type = metadata.file_type();
+
+        if file_type.is_char_device() {
+            if name == ".wh..wh..opq" {
+                has_opq = true;
+                continue;
+            }
+            if let Some(target_name) = name.strip_prefix(".wh.") {
+                let rel_parent = current.strip_prefix(base).map_err(|e| format!("strip prefix: {e}"))?;
+                let target = repo_root.join(rel_parent).join(target_name);
+                if target.exists() {
+                    if target.is_file() || target.is_symlink() {
+                        fs::remove_file(&target).map_err(|e| format!("failed to remove {}: {e}", target.display()))?;
+                    } else if target.is_dir() {
+                        fs::remove_dir_all(&target).map_err(|e| format!("failed to remove {}: {e}", target.display()))?;
+                    }
+                    *count_del += 1;
+                }
+                let _ = fs::remove_file(&path);
+            }
             continue;
         }
 
-        let dest = repo_root.join(path.strip_prefix(base).map_err(|e| format!("failed to compute relative path: {e}"))?);
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        let rel = path.strip_prefix(base).map_err(|e| format!("failed to compute relative path: {e}"))?;
+        let rel_str = rel.to_string_lossy().to_string();
+        let dest = repo_root.join(rel);
 
         if metadata.is_dir() {
-            sync_upper_dir(base, &path, repo_root, count)?;
-        } else if metadata.is_file() {
+            sync_upper_dir(base, &path, repo_root, count_add, count_del, _manifest_old, manifest_new)?;
+            continue;
+        }
+
+        if metadata.is_file() {
             let needs_copy = fs::read(&path)
                 .ok()
                 .and_then(|src| fs::read(&dest).ok().map(|dest_data| src != dest_data))
@@ -361,12 +428,59 @@ fn sync_upper_dir(base: &Path, current: &Path, repo_root: &Path, count: &mut usi
                     fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
                 }
                 fs::copy(&path, &dest).map_err(|e| format!("failed to copy {} to {}: {e}", path.display(), dest.display()))?;
-                *count += 1;
-                let _ = fs::remove_file(&path);
+                *count_add += 1;
             }
+            manifest_new.insert(rel_str);
+        }
+    }
+
+    if has_opq {
+        let rel_dir = current.strip_prefix(base).unwrap_or(Path::new(""));
+        let repo_dir = repo_root.join(rel_dir);
+        if repo_dir.exists() {
+            delete_opaque_lower_files(&repo_dir, repo_root, manifest_new, count_del)?;
+        }
+        let _ = fs::remove_file(current.join(".wh..wh..opq"));
+    }
+
+    Ok(())
+}
+
+/// Deletes files from repo_dir that are hidden by an opaque marker — any file not
+/// present in the current upperdir manifest is removed from the host repo.
+fn delete_opaque_lower_files(
+    repo_dir: &Path, repo_root: &Path,
+    manifest_new: &BTreeSet<String>, count_del: &mut usize,
+) -> Result<(), String> {
+    for entry in fs::read_dir(repo_dir).map_err(|e| format!("failed to read {}: {e}", repo_dir.display()))? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else { continue };
+
+        let Ok(rel) = path.strip_prefix(repo_root) else { continue };
+        let rel_str = rel.to_string_lossy().to_string();
+
+        if metadata.is_dir() {
+            delete_opaque_lower_files(&path, repo_root, manifest_new, count_del)?;
+        } else if (metadata.is_file() || metadata.is_symlink()) && !manifest_new.contains(&rel_str) {
+            fs::remove_file(&path).map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
+            *count_del += 1;
         }
     }
     Ok(())
+}
+
+fn load_manifest(path: &Path) -> BTreeSet<String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_manifest(path: &Path, manifest: &BTreeSet<String>) -> Result<(), String> {
+    let sorted: Vec<&String> = manifest.iter().collect();
+    let json = serde_json::to_string(&sorted).map_err(|e| format!("failed to serialize manifest: {e}"))?;
+    fs::write(path, json).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
 /// Cleans up the overlay workspace: warns about unsynced changes, removes session state,

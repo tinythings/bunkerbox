@@ -139,7 +139,7 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
         }
     }
 
-    let build_dir = env::temp_dir().join(format!("bunkerbox-image-{}", std::process::id()));
+    let build_dir = data_dir().join(format!("bunkerbox/build/bunkerbox-image-{}", std::process::id()));
     fs::create_dir_all(&build_dir).map_err(|err| format!("failed to create build dir {}: {err}", build_dir.display()))?;
 
     let result = (|| {
@@ -346,6 +346,18 @@ fn podman_remove_image(config: &ImageConfig) -> Result<(), String> {
     }
 
     run_command("podman", &["image".to_string(), "rm".to_string(), "-f".to_string(), config.image.clone()])
+}
+
+fn data_dir() -> PathBuf {
+    if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+
+    if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home).join(".local").join("share");
+    }
+
+    env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".local").join("share")
 }
 
 fn require_program(name: &str) -> Result<(), String> {

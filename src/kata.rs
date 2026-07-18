@@ -50,6 +50,14 @@ pub fn run(
     let wm_name = app_name.to_string();
     let wm_exclude = runtime_exclude.map(|v| v.to_vec());
 
+    let user = current_user_spec()?;
+    let Some((uid, gid)) = user.split_once(':') else {
+        return Err(format!("invalid current user spec: {user}"));
+    };
+    let runtime_dir = user_data_dir().join("bunkerbox/runtime");
+    run_command_allow_failure("sudo", &["mkdir", "-p", &format!("{}", runtime_dir.display())])?;
+    run_command_quiet("sudo", &["chown", &user, &format!("{}", runtime_dir.display())])?;
+
     let setup_handle = std::thread::spawn(move || -> Result<WorkspaceHandle, String> {
         let workspace = workspace::resolve(workspace_mode, quota, wm_exclude.as_deref(), &wm_name)?;
 
@@ -94,15 +102,10 @@ pub fn run(
         }
     }
 
-    let user = current_user_spec()?;
-    let Some((uid, gid)) = user.split_once(':') else {
-        return Err(format!("invalid current user spec: {user}"));
-    };
-
     let session_mb = config.session_mb();
     let session_dir: Option<PathBuf> = if session_mb > 0 {
         if let Some(ref hp) = home_path {
-            Some(setup_session(hp, session_mb, container_name, uid, gid)?)
+            Some(setup_session(hp, session_mb, uid, gid)?)
         } else {
             None
         }
@@ -264,7 +267,7 @@ fn write_resolv_conf() -> Result<PathBuf, String> {
         lines.push("nameserver 8.8.8.8".to_string());
     }
 
-    let path = std::env::temp_dir().join(format!("bunkerbox-resolv-{}.conf", std::process::id()));
+    let path = user_data_dir().join(format!("bunkerbox/runtime/resolv-{}.conf", std::process::id()));
     fs::write(&path, format!("{}\n", lines.join("\n"))).map_err(|err| format!("failed to write {}: {err}", path.display()))?;
 
     Ok(path)
@@ -396,7 +399,7 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
         }
     }
 
-    let temp = std::env::temp_dir().join(format!("bunkerbox-cni-{}.conflist", std::process::id()));
+    let temp = user_data_dir().join(format!("bunkerbox/runtime/cni-{}.conflist", std::process::id()));
     fs::write(&temp, format!(
         r#"{{
   "cniVersion": "0.4.0",
@@ -539,7 +542,7 @@ fn confirm(prompt: &str) -> bool {
 
 /// Reads a passphrase from the terminal without echoing.
 fn read_passphrase() -> Result<String, String> {
-    Ok(rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))?)
+    rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))
 }
 
 /// Derives a 256-bit AES key from a passphrase and salt via PBKDF2-HMAC-SHA256 (100k iterations).
@@ -660,10 +663,10 @@ fn seal_home(home: &Path, patterns: &[String], passphrase: &str) -> Result<(), S
 }
 
 /// Creates and mounts an ext4 session image, copies the home contents, and recovers any leftover image.
-fn setup_session(home_path: &Path, session_mb: u32, container_name: &str, uid: &str, gid: &str) -> Result<PathBuf, String> {
+fn setup_session(home_path: &Path, session_mb: u32, uid: &str, gid: &str) -> Result<PathBuf, String> {
     let bunker_dir = home_path.join(".bunker");
     let session_img = bunker_dir.join("session.img");
-    let session_dir = PathBuf::from(format!("/tmp/bunkerbox-session-{}", container_name));
+    let session_dir = home_path.parent().ok_or("home path has no parent directory")?.join("session-mount");
 
     if session_img.exists() {
         eprintln!("bunkerbox: found leftover session.img, recovering...");
@@ -674,6 +677,7 @@ fn setup_session(home_path: &Path, session_mb: u32, container_name: &str, uid: &
         if run_command_quiet("sudo", &["mount", "-o", "loop", &format!("{}", session_img.display()), &format!("{}", session_dir.display())]).is_ok() {
             let _ = run_command_allow_failure("sudo", &["chown", &format!("{}:{}", uid, gid), &format!("{}", session_dir.display())]);
             let _ = run_command_quiet("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
+            let _ = run_command_allow_failure("sudo", &["rm", "-rf", &format!("{}/lost+found", session_dir.display())]);
             let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
         } else {
             eprintln!("bunkerbox: warning: could not mount leftover session.img, discarding");

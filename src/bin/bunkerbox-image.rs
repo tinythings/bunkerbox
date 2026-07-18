@@ -25,6 +25,8 @@ struct ImageConfig {
     hooks: ImageHooks,
     #[serde(default)]
     files: Vec<BuildFile>,
+    #[serde(default)]
+    runtime: Option<serde_yaml::Value>,
     containerfile: String,
 }
 
@@ -144,6 +146,7 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
         write_build_context(config, &build_dir)?;
         podman_build(config, &build_dir)?;
         podman_save(config)?;
+        write_runtime_conf(config)?;
         podman_remove_image(config)?;
         println!("{}", config.output.display());
         Ok(())
@@ -151,6 +154,32 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
 
     let _ = fs::remove_dir_all(&build_dir);
     result
+}
+
+fn write_runtime_conf(config: &ImageConfig) -> Result<(), String> {
+    if let Some(runtime) = &config.runtime {
+        let mut mapping = serde_yaml::Mapping::new();
+        mapping.insert(
+            serde_yaml::Value::String("oci".into()),
+            serde_yaml::Value::String(config.output.to_string_lossy().into_owned()),
+        );
+        mapping.insert(
+            serde_yaml::Value::String("image".into()),
+            serde_yaml::Value::String(config.image.clone()),
+        );
+
+        if let serde_yaml::Value::Mapping(m) = runtime {
+            for (k, v) in m {
+                mapping.insert(k.clone(), v.clone());
+            }
+        }
+
+        let conf_name = format!("{}.conf", config.command.first().map(|c| c.as_str()).unwrap_or(&config.name));
+        let conf_path = config.output.with_file_name(conf_name);
+        let yaml = serde_yaml::to_string(&mapping).map_err(|e| format!("failed to serialize runtime conf: {e}"))?;
+        fs::write(&conf_path, yaml).map_err(|e| format!("failed to write {}: {e}", conf_path.display()))?;
+    }
+    Ok(())
 }
 
 fn build_entrypoint(config: &ImageConfig) -> Result<String, String> {
@@ -202,28 +231,25 @@ run_app() {{
 }}
 
 if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
-  local_home="/tmp/bunkerbox-home"
-  mkdir -p "$BUNKERBOX_PERSIST_HOME" "$local_home"
   hook_before_home_load
-  cp -R "$BUNKERBOX_PERSIST_HOME/." "$local_home/" 2>/dev/null || true
 
-  export HOME="$local_home"
-  export XDG_CONFIG_HOME="$local_home/.config"
-  export XDG_DATA_HOME="$local_home/.local/share"
-  export XDG_STATE_HOME="$local_home/.local/state"
-  export XDG_CACHE_HOME="$local_home/.cache"
-
-  set +e
-  run_app
-  status=$?
-  set -e
-
-  cp -R "$local_home/." "$BUNKERBOX_PERSIST_HOME/"
-  hook_after_home_save
-  exit "$status"
+  export HOME="$BUNKERBOX_PERSIST_HOME"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export XDG_DATA_HOME="$HOME/.local/share"
+  export XDG_STATE_HOME="$HOME/.local/state"
+  export XDG_CACHE_HOME="$HOME/.cache"
 fi
 
+set +e
 run_app
+status=$?
+set -e
+
+if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
+  hook_after_home_save
+fi
+
+exit "$status"
 "#
     ))
 }

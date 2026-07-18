@@ -48,7 +48,9 @@ In `share` mode, Bunkerbox mounts the current project directly. In `clone` mode,
 
 Many tools save config, cache, history, sessions, or login state in their home directory. Bunkerbox does not use your real home directory for this. Instead, it prepares a separate home for the tool.
 
-When persistence is enabled, that home is saved between runs. Inside the container, the tool writes to a temporary home. When the tool exits, Bunkerbox copies the data back to the persisted home store.
+When persistence is enabled, that home is saved between runs. By default, Bunkerbox creates a loop-mounted ext4 image file (`session.img`) on the host before starting the VM. The loop mount is bind-mounted into the VM, so the app writes through the ext4 journal. If the VM crashes, the image survives on the host disk and is recovered automatically on the next run.
+
+Setting `session_mb: 0` disables the loop mount. The raw persist home directory is bind-mounted directly into the VM.
 
 ## Hooks
 

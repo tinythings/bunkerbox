@@ -1,4 +1,4 @@
-.PHONY: dev check setup image install-image prepare docs docs-clean
+.PHONY: dev check test setup image install-image prepare docs docs-clean
 
 DOCS_VENV := .venv-docs
 DOCS_MKDOCS := $(DOCS_VENV)/bin/mkdocs
@@ -11,6 +11,9 @@ dev:
 check:
 	cargo fmt --all
 	cargo clippy --all-targets --all-features -- -D warnings || cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
+
+test:
+	cargo nextest run
 
 setup: dev
 	target/debug/bunkerbox setup

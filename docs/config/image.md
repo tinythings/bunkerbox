@@ -47,10 +47,37 @@ COPY bunker-entrypoint /usr/local/bin/bunker-entrypoint
 ENTRYPOINT ["/usr/local/bin/bunker-entrypoint"]
 ```
 
-This generated entrypoint is important. It handles persistent home loading and saving, runs hooks, starts the app command, and preserves the app exit status.
+This generated entrypoint is important. It sets up the app home directory, runs hooks, starts the app command, and preserves the app exit status. All session management (loop mount, recovery, sync) happens on the host — the entrypoint itself is a thin wrapper.
 
 ## Fields
 
 `name` is a short name for the image config. `image` is the local image tag used while building and importing. `output` is the OCI archive that will be written. `command` is the app command that runs inside the container. `containerfile` is the actual container build recipe.
 
-Optional fields add behavior. `overwrite` allows replacing an existing archive. `build_args` passes values into the container build. `hooks` adds lifecycle shell snippets. `files` adds extra files to the build context.
+Optional fields add behavior. `overwrite` allows replacing an existing archive. `build_args` passes values into the container build. `hooks` adds lifecycle shell snippets. `files` adds extra files to the build context. `runtime` auto-generates a runtime config file.
+
+## Runtime section
+
+The image author knows what runtime settings the tool needs (workspace mode, home persistence, network rules, and which files hold secrets). Define them once in the image config with the `runtime:` section, and the builder writes a runtime config automatically.
+
+```yaml
+runtime:
+  workspace: cow
+  home: persist
+  network: bridge
+  allow:
+    - api.deepseek.com
+  encrypt:
+    - ".local/share/opencode/auth.json"
+    - ".local/share/opencode/account.json"
+```
+
+When the builder finishes, it writes `<command>.conf` next to the OCI archive. The conf includes `oci` (the archive path) and `image` (the image tag) merged with everything from the `runtime:` section.
+
+For the OpenCode config above, the builder would produce:
+
+```text
+bunkerbox-opencode-1.17.18.oci
+opencode.conf
+```
+
+The packager installs both files. The `opencode.conf` is ready to use — no hand-editing needed.

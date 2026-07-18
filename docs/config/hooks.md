@@ -17,17 +17,17 @@ The generated entrypoint runs hooks in this order:
 ```text
 container starts
 before-home-load
-copy persisted home to temp home
 before-app
 run app
 after-app
 app-error, only if app failed
-copy temp home to persisted home
 after-home-save
 container exits
 ```
 
-`before-home-load` runs before persistent home data is copied into the container temp home. `before-app` runs right before the app command starts. `after-app` runs after the app exits, whether it succeeded or failed. `app-error` only runs when the app exits with a non-zero status. `after-home-save` runs after the temp home is copied back to persistent storage.
+All session management (creating the loop-mounted ext4 image, populating it from the persist home, recovering from crashes, syncing back on exit) happens on the host before the container starts and after it exits. The entrypoint inside the container is trivial — it just sets `HOME` and runs the app.
+
+`before-home-load` runs before the app starts but after the session home is bind-mounted. `before-app` runs right before the app command starts. `after-app` runs after the app exits, whether it succeeded or failed. `app-error` only runs when the app exits with a non-zero status. `after-home-save` runs before the container exits (before the host-side sync back to the persist home).
 
 ## Example
 
@@ -49,15 +49,15 @@ The app exit code is available as:
 BUNKERBOX_APP_STATUS
 ```
 
-When persistent home is enabled, hooks can also use these paths:
+When persistent home is enabled, hooks can reference these paths:
 
 ```text
 BUNKERBOX_PERSIST_HOME=/bunkerbox-persist-home
-HOME=/tmp/bunkerbox-home
-XDG_CONFIG_HOME=/tmp/bunkerbox-home/.config
-XDG_DATA_HOME=/tmp/bunkerbox-home/.local/share
-XDG_STATE_HOME=/tmp/bunkerbox-home/.local/state
-XDG_CACHE_HOME=/tmp/bunkerbox-home/.cache
+HOME=/bunkerbox-persist-home
+XDG_CONFIG_HOME=/bunkerbox-persist-home/.config
+XDG_DATA_HOME=/bunkerbox-persist-home/.local/share
+XDG_STATE_HOME=/bunkerbox-persist-home/.local/state
+XDG_CACHE_HOME=/bunkerbox-persist-home/.cache
 ```
 
 Empty hooks do nothing. Hooks use `/bin/sh`.

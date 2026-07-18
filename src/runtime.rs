@@ -16,6 +16,9 @@ pub struct RuntimeConfig {
     pub workspace_exclude: Option<Vec<String>>,
     pub home: Option<HomeMode>,
     pub home_path: Option<PathBuf>,
+    #[serde(default)]
+    pub encrypt: Option<Vec<String>>,
+    pub session_mb: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -74,6 +77,10 @@ impl RuntimeConfig {
             None => return default,
         };
         parse_size(raw).unwrap_or(default)
+    }
+
+    pub fn session_mb(&self) -> u32 {
+        self.session_mb.unwrap_or(50)
     }
 }
 

@@ -41,11 +41,13 @@ impl EnvConfig {
     pub fn load_or_create(repo_root: &Path) -> Result<Self, String> {
         let env_path = repo_root.join(Self::PATH);
         if env_path.exists() {
-            serde_yaml::from_str(&fs::read_to_string(&env_path).map_err(|e| format!("failed to read {}: {e}", env_path.display()))?).map_err(|e| format!("failed to parse {}: {e}", env_path.display()))
+            serde_yaml::from_str(&fs::read_to_string(&env_path).map_err(|e| format!("failed to read {}: {e}", env_path.display()))?)
+                .map_err(|e| format!("failed to parse {}: {e}", env_path.display()))
         } else {
             let default_config = EnvConfig { quota: Some("auto".to_string()), exclude: Vec::new() };
             fs::create_dir_all(env_path.parent().unwrap()).map_err(|e| format!("failed to create {}: {e}", env_path.parent().unwrap().display()))?;
-            fs::write(&env_path, serde_yaml::to_string(&default_config).map_err(|e| format!("failed to serialize default config: {e}"))?).map_err(|e| format!("failed to write {}: {e}", env_path.display()))?;
+            fs::write(&env_path, serde_yaml::to_string(&default_config).map_err(|e| format!("failed to serialize default config: {e}"))?)
+                .map_err(|e| format!("failed to write {}: {e}", env_path.display()))?;
             Ok(default_config)
         }
     }

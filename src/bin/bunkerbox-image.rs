@@ -159,14 +159,8 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
 fn write_runtime_conf(config: &ImageConfig) -> Result<(), String> {
     if let Some(runtime) = &config.runtime {
         let mut mapping = serde_yaml::Mapping::new();
-        mapping.insert(
-            serde_yaml::Value::String("oci".into()),
-            serde_yaml::Value::String(config.output.to_string_lossy().into_owned()),
-        );
-        mapping.insert(
-            serde_yaml::Value::String("image".into()),
-            serde_yaml::Value::String(config.image.clone()),
-        );
+        mapping.insert(serde_yaml::Value::String("oci".into()), serde_yaml::Value::String(config.output.to_string_lossy().into_owned()));
+        mapping.insert(serde_yaml::Value::String("image".into()), serde_yaml::Value::String(config.image.clone()));
 
         if let serde_yaml::Value::Mapping(m) = runtime {
             for (k, v) in m {

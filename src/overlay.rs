@@ -11,7 +11,18 @@ pub struct CowWorkspace {
     loopback: PathBuf,
     loop_mount: PathBuf,
     lower_root: PathBuf,
-    bind_mounts: Vec<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CowPaths {
+    overlay_dir: PathBuf,
+    loopback: PathBuf,
+    mounts_dir: PathBuf,
+    loop_mount: PathBuf,
+    upper_dir: PathBuf,
+    work_dir: PathBuf,
+    mount_point: PathBuf,
+    lower_root: PathBuf,
 }
 
 /// Persisted state for an active overlay session, saved so it can be synced later.
@@ -33,58 +44,51 @@ impl CowWorkspace {
     /// The overlay is mounted at `repo_root` itself with a read-only bind-mount of the
     /// raw repo serving as the lowerdir.
     pub fn setup(
-        repo_root: &Path, env_config: &EnvConfig, runtime_quota: u64, runtime_exclude: Option<&[String]>, app_name: &str,
+        repo_root: &Path, env_config: &EnvConfig, runtime_quota: u64, _runtime_exclude: Option<&[String]>, app_name: &str,
     ) -> Result<Self, String> {
-        let overlay_dir = repo_root.join(".bunkerbox");
-        let loopback = overlay_dir.join("upper.img");
-        let mounts_dir = overlay_dir.join("mounts");
-        let loop_mount = mounts_dir.join("loop");
-        let upper_dir = loop_mount.join("upper");
-        let work_dir = loop_mount.join("work");
-        let mount_point = overlay_dir.join("workspace");
-        let lower_root = mounts_dir.join("lower");
+        let paths = cow_paths(repo_root);
 
-        fs::create_dir_all(&overlay_dir).map_err(|e| format!("failed to create {}: {e}", overlay_dir.display()))?;
+        fs::create_dir_all(&paths.overlay_dir).map_err(|e| format!("failed to create {}: {e}", paths.overlay_dir.display()))?;
 
         Self::ensure_gitignore(repo_root)?;
 
         Self::cleanup_stale(repo_root)?;
 
-        let sessions_dir = overlay_dir.join("sessions");
+        let sessions_dir = paths.overlay_dir.join("sessions");
         let session_path = sessions_dir.join(format!("{app_name}.json"));
-        let reusing = loopback.exists();
+        let reusing = paths.loopback.exists();
 
-        fs::create_dir_all(&loop_mount).map_err(|e| format!("failed to create {}: {e}", loop_mount.display()))?;
+        fs::create_dir_all(&paths.loop_mount).map_err(|e| format!("failed to create {}: {e}", paths.loop_mount.display()))?;
 
         if reusing {
             if session_path.exists() {
                 eprintln!("bunkerbox: recovering previous session...");
             }
-            mount_loopback(&loopback, &loop_mount)?;
+            mount_loopback(&paths.loopback, &paths.loop_mount)?;
         } else {
-            let size_mb = env_config.quota_bytes(runtime_quota, repo_root, runtime_exclude)? / (1024 * 1024);
+            let size_mb = env_config.strict_cow_quota_bytes(repo_root)?.max(runtime_quota) / (1024 * 1024);
             if size_mb == 0 {
                 return Err("workspace quota too small".to_string());
             }
-            run_command("dd", &["if=/dev/zero", &format!("of={}", loopback.display()), "bs=1M", &format!("count={size_mb}"), "status=none"])?;
-            run_command("mkfs.ext4", &["-F", &loopback.to_string_lossy()])?;
-            mount_loopback(&loopback, &loop_mount)?;
+            run_command("dd", &["if=/dev/zero", &format!("of={}", paths.loopback.display()), "bs=1M", &format!("count={size_mb}"), "status=none"])?;
+            run_command("mkfs.ext4", &["-F", &paths.loopback.to_string_lossy()])?;
+            mount_loopback(&paths.loopback, &paths.loop_mount)?;
 
             let user = current_user_spec()?;
-            run_command("chown", &[&user, &loop_mount.to_string_lossy()])?;
+            run_command("chown", &[&user, &paths.loop_mount.to_string_lossy()])?;
         }
 
-        fs::create_dir_all(&upper_dir).map_err(|e| format!("failed to create {}: {e}", upper_dir.display()))?;
-        fs::create_dir_all(&work_dir).map_err(|e| format!("failed to create {}: {e}", work_dir.display()))?;
+        fs::create_dir_all(&paths.upper_dir).map_err(|e| format!("failed to create {}: {e}", paths.upper_dir.display()))?;
+        fs::create_dir_all(&paths.work_dir).map_err(|e| format!("failed to create {}: {e}", paths.work_dir.display()))?;
 
-        fs::create_dir_all(&lower_root).map_err(|e| format!("failed to create {}: {e}", lower_root.display()))?;
-        run_command("mount", &["--bind", &repo_root.to_string_lossy(), &lower_root.to_string_lossy()])?;
-        run_command("mount", &["-o", "remount,bind,ro", &lower_root.to_string_lossy()])?;
+        fs::create_dir_all(&paths.lower_root).map_err(|e| format!("failed to create {}: {e}", paths.lower_root.display()))?;
+        run_command("mount", &["--bind", &repo_root.to_string_lossy(), &paths.lower_root.to_string_lossy()])?;
+        run_command("mount", &["-o", "remount,bind,ro", &paths.lower_root.to_string_lossy()])?;
 
-        fs::create_dir_all(&mount_point).map_err(|e| format!("failed to create {}: {e}", mount_point.display()))?;
-        let lowerdir = lower_root.to_string_lossy();
-        let upperdir = upper_dir.to_string_lossy();
-        let workdir = work_dir.to_string_lossy();
+        fs::create_dir_all(&paths.mount_point).map_err(|e| format!("failed to create {}: {e}", paths.mount_point.display()))?;
+        let lowerdir = paths.lower_root.to_string_lossy();
+        let upperdir = paths.upper_dir.to_string_lossy();
+        let workdir = paths.work_dir.to_string_lossy();
         run_command(
             "mount",
             &[
@@ -93,44 +97,20 @@ impl CowWorkspace {
                 "overlay",
                 "-o",
                 &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir}"),
-                &mount_point.to_string_lossy(),
+                &paths.mount_point.to_string_lossy(),
             ],
         )?;
 
-        let mut bind_mounts: Vec<PathBuf> = Vec::new();
-        for pattern in env_config.effective_exclude(runtime_exclude) {
-            let src_path = repo_root.join(&pattern);
-
-            if src_path.exists() {
-                if let Ok(meta) = fs::symlink_metadata(&src_path) {
-                    if meta.file_type().is_symlink() {
-                        eprintln!("bunkerbox: warning: {} is a symlink, skipping bind mount", src_path.display());
-                        continue;
-                    }
-                }
-            }
-
-            let bind_src = overlay_dir.join("build-workspace").join(&pattern);
-            let bind_dst = mount_point.join(&pattern);
-
-            fs::create_dir_all(&bind_src).map_err(|e| format!("failed to create {}: {e}", bind_src.display()))?;
-            fs::create_dir_all(&bind_dst).map_err(|e| format!("failed to create {}: {e}", bind_dst.display()))?;
-
-            run_command("mount", &["--bind", &bind_src.to_string_lossy(), &bind_dst.to_string_lossy()])?;
-
-            bind_mounts.push(bind_dst);
-        }
-
-        let sessions_dir = overlay_dir.join("sessions");
+        let sessions_dir = paths.overlay_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).map_err(|e| format!("failed to create {}: {e}", sessions_dir.display()))?;
         let state = SessionState {
             app_name: app_name.to_string(),
-            mount_point: mount_point.to_string_lossy().to_string(),
-            upper_dir: upper_dir.to_string_lossy().to_string(),
-            work_dir: work_dir.to_string_lossy().to_string(),
+            mount_point: paths.mount_point.to_string_lossy().to_string(),
+            upper_dir: paths.upper_dir.to_string_lossy().to_string(),
+            work_dir: paths.work_dir.to_string_lossy().to_string(),
             repo_root: repo_root.to_string_lossy().to_string(),
-            loopback: loopback.to_string_lossy().to_string(),
-            lower_root: lower_root.to_string_lossy().to_string(),
+            loopback: paths.loopback.to_string_lossy().to_string(),
+            lower_root: paths.lower_root.to_string_lossy().to_string(),
         };
         fs::write(
             &sessions_dir.join(format!("{app_name}.json")),
@@ -138,7 +118,7 @@ impl CowWorkspace {
         )
         .map_err(|e| format!("failed to write session state: {e}"))?;
 
-        Ok(CowWorkspace { mount_point, loopback, loop_mount, lower_root, bind_mounts })
+        Ok(CowWorkspace { mount_point: paths.mount_point, loopback: paths.loopback, loop_mount: paths.loop_mount, lower_root: paths.lower_root })
     }
 
     /// Ensures `.bunkerbox/` is listed in the repo's `.gitignore` file.
@@ -210,6 +190,22 @@ impl CowWorkspace {
         }
 
         Ok(())
+    }
+}
+
+fn cow_paths(repo_root: &Path) -> CowPaths {
+    let overlay_dir = repo_root.join(".bunkerbox");
+    let mounts_dir = overlay_dir.join("mounts");
+    let loop_mount = mounts_dir.join("loop");
+    CowPaths {
+        loopback: overlay_dir.join("upper.img"),
+        upper_dir: loop_mount.join("upper"),
+        work_dir: loop_mount.join("work"),
+        mount_point: overlay_dir.join("workspace"),
+        lower_root: mounts_dir.join("lower"),
+        overlay_dir,
+        mounts_dir,
+        loop_mount,
     }
 }
 
@@ -522,7 +518,7 @@ fn remove_path_if_exists(path: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Cleans up the overlay workspace: warns about unsynced changes and unmounts bind mounts,
+/// Cleans up the overlay workspace: warns about unsynced changes and unmounts overlay,
 /// overlay, loop device, and lower-dir bind mount in reverse order while preserving session state.
 impl Drop for CowWorkspace {
     fn drop(&mut self) {
@@ -530,9 +526,6 @@ impl Drop for CowWorkspace {
             eprintln!("bunkerbox: session ending. Changes not synced. Run 'bunkerbox sync' to save.");
         }
 
-        for mnt in self.bind_mounts.iter().rev() {
-            let _ = run_command_allow_failure("umount", &[&mnt.to_string_lossy()]);
-        }
         let _ = run_command_allow_failure("umount", &[&self.mount_point.to_string_lossy()]);
         let _ = run_command_allow_failure("umount", &[&self.loop_mount.to_string_lossy()]);
 
@@ -553,8 +546,9 @@ impl Drop for CowWorkspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{flush_dir, sync_upper};
+    use super::{cow_paths, flush_dir, sync_upper};
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
 
     #[test]
@@ -596,5 +590,21 @@ mod tests {
 
         let remaining = fs::read_dir(&dir).unwrap().count();
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn cow_paths_stay_inside_project_bunkerbox() {
+        let repo_root = Path::new("/repo");
+        let paths = cow_paths(repo_root);
+
+        assert_eq!(paths.overlay_dir, Path::new("/repo/.bunkerbox"));
+        assert_eq!(paths.loopback, Path::new("/repo/.bunkerbox/upper.img"));
+        assert_eq!(paths.mounts_dir, Path::new("/repo/.bunkerbox/mounts"));
+        assert_eq!(paths.loop_mount, Path::new("/repo/.bunkerbox/mounts/loop"));
+        assert_eq!(paths.upper_dir, Path::new("/repo/.bunkerbox/mounts/loop/upper"));
+        assert_eq!(paths.work_dir, Path::new("/repo/.bunkerbox/mounts/loop/work"));
+        assert_eq!(paths.mount_point, Path::new("/repo/.bunkerbox/workspace"));
+        assert_eq!(paths.lower_root, Path::new("/repo/.bunkerbox/mounts/lower"));
+        assert!(!paths.overlay_dir.join("build-workspace").exists());
     }
 }

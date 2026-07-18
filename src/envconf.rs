@@ -63,6 +63,16 @@ impl EnvConfig {
         }
     }
 
+    /// Returns the strict cow quota in bytes. In strict cow mode every writable path
+    /// must be backed by the bounded image, so auto sizing walks the full project tree.
+    pub fn strict_cow_quota_bytes(&self, repo_root: &Path) -> Result<u64, String> {
+        match &self.quota {
+            None => compute_auto_quota(repo_root, &[]),
+            Some(s) if s == "auto" => compute_auto_quota(repo_root, &[]),
+            Some(s) => crate::runtime::parse_size(s).ok_or_else(|| format!("invalid quota: {s}")),
+        }
+    }
+
     /// Merges the default exclude list, config-specified excludes, and runtime
     /// excludes, deduplicating entries (comparison is done without trailing slashes).
     pub fn effective_exclude(&self, runtime_exclude: Option<&[String]>) -> Vec<String> {

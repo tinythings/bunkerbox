@@ -144,10 +144,9 @@ fn run_packaged_runtime(config: runtime::RuntimeConfig, workspace_override: Opti
     let workspace_mode = workspace_override.or(config.workspace).unwrap_or_default();
     let quota = config.workspace_quota_bytes();
     let name = runtime::invoked_name()?;
-    let workspace = workspace::resolve(workspace_mode, quota, config.workspace_exclude.as_deref(), &name)?;
     let container_name = format!("bunkerbox-{name}");
 
-    kata::run(&config, workspace.path(), &container_name, share_dir, &name)
+    kata::run(&config, workspace_mode, quota, config.workspace_exclude.as_deref(), &container_name, share_dir, &name)
 }
 
 fn print_subcommand_help(name: &str) -> Result<(), String> {

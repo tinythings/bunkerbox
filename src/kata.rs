@@ -1,4 +1,5 @@
-use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig};
+use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig, WorkspaceMode};
+use crate::workspace::{self, WorkspaceHandle};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm::aead::Aead;
 use aes_gcm::aead::consts::U12;
@@ -16,7 +17,15 @@ use std::thread;
 const BRIDGE_SUBNET: &str = "10.247.0.0/24";
 const BRIDGE_NAME: &str = "bunkerbox0";
 
-pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _share_dir: &Path, app_name: &str) -> Result<(), String> {
+pub fn run(
+    config: &RuntimeConfig,
+    workspace_mode: WorkspaceMode,
+    quota: u64,
+    runtime_exclude: Option<&[String]>,
+    container_name: &str,
+    _share_dir: &Path,
+    app_name: &str,
+) -> Result<(), String> {
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
     }
@@ -28,6 +37,40 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
     } else {
         None
     };
+
+    let needs_bridge = config.network == Some(NetworkMode::Bridge);
+    let ctr_name = container_name.to_string();
+    let oci_path = config.oci.to_string_lossy().into_owned();
+    let image_tag = config.image.clone();
+    let wm = workspace_mode;
+    let wm_quota = quota;
+    let wm_name = app_name.to_string();
+    let wm_exclude = runtime_exclude.map(|v| v.to_vec());
+
+    let setup_handle = std::thread::spawn(move || -> Result<WorkspaceHandle, String> {
+        let workspace = workspace::resolve(wm, wm_quota, wm_exclude.as_deref(), &wm_name)?;
+
+        let active = Command::new("sudo")
+            .args(["systemctl", "is-active", "containerd"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !active {
+            run_command_quiet("sudo", &["systemctl", "start", "containerd"])?;
+        }
+
+        if needs_bridge {
+            ensure_bridge_cni_config()?;
+        }
+        remove_stale_container(&ctr_name)?;
+
+        let _ = run_command_allow_failure("sudo", &["ctr", "images", "rm", &image_tag]);
+        run_command_quiet("sudo", &["ctr", "images", "import", &oci_path])?;
+
+        Ok(workspace)
+    });
 
     let encrypt_patterns: &[String] = config.encrypt.as_deref().unwrap_or(&[]);
     let passphrase = if !encrypt_patterns.is_empty() {
@@ -64,20 +107,20 @@ pub fn run(config: &RuntimeConfig, workspace: &Path, container_name: &str, _shar
         None
     };
 
-    run_command("sudo", &["systemctl", "start", "containerd"])?;
+    let workspace = match setup_handle.join() {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("setup thread panicked".to_string()),
+    };
+
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
-    if config.network == Some(NetworkMode::Bridge) {
-        ensure_bridge_cni_config()?;
-    }
-    remove_stale_container(container_name)?;
-    import_image(config)?;
 
     let resolv_conf = if config.network.is_some() { Some(write_resolv_conf()?) } else { None };
     if bridge_firewall {
         ensure_bridge_egress_firewall(config, resolv_conf.as_deref())?;
     }
     let resolv_conf_mount = resolv_conf.as_ref().map(|path| format!("type=bind,src={},dst=/etc/resolv.conf,options=rbind:ro", path.display()));
-    let workspace_mount = format!("type=bind,src={},dst=/workspace,options=rbind:rw", workspace.display());
+    let workspace_mount = format!("type=bind,src={},dst=/workspace,options=rbind:rw", workspace.path().display());
     let mut container_env = Vec::new();
     let home_mount = if let Some(ref hp) = home_path {
         let src = if let Some(ref sd) = session_dir {
@@ -395,15 +438,6 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
     result
 }
 
-fn import_image(config: &RuntimeConfig) -> Result<(), String> {
-    run_command_allow_failure("sudo", &["ctr", "images", "rm", &config.image])?;
-
-    run_command(
-        "sudo",
-        &["ctr", "images", "import", config.oci.to_str().ok_or_else(|| format!("path is not valid UTF-8: {}", config.oci.display()))?],
-    )
-}
-
 fn remove_stale_container(container_name: &str) -> Result<(), String> {
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "kill", "--signal", "SIGKILL", container_name]);
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "delete", "--force", container_name]);
@@ -463,19 +497,13 @@ fn run_command_allow_failure(program: &str, args: &[&str]) -> Result<(), String>
 }
 
 fn run_command_quiet(program: &str, args: &[&str]) -> Result<(), String> {
-    let mut child = Command::new(program)
+    let status = Command::new(program)
         .args(args)
-        .stdin(Stdio::inherit())
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::null())
+        .status()
         .map_err(|err| format!("failed to run {program}: {err}"))?;
-
-    let stderr = child.stderr.take().ok_or_else(|| format!("failed to capture stderr for {program}"))?;
-    let stderr_thread = thread::spawn(move || filter_stderr(stderr));
-
-    let status = child.wait().map_err(|err| format!("failed to wait for {program}: {err}"))?;
-    stderr_thread.join().map_err(|_| format!("stderr filter thread panicked for {program}"))??;
 
     if !status.success() {
         return Err(format!("command failed with status {status}: {program}"));
@@ -499,7 +527,9 @@ fn confirm(prompt: &str) -> bool {
 }
 
 fn read_passphrase() -> Result<String, String> {
-    rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))
+    let pass = rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))?;
+    eprintln!();
+    Ok(pass)
 }
 
 fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {

@@ -539,7 +539,7 @@ fn confirm(prompt: &str) -> bool {
 
 /// Reads a passphrase from the terminal without echoing.
 fn read_passphrase() -> Result<String, String> {
-    Ok(rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))?)
+    rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))
 }
 
 /// Derives a 256-bit AES key from a passphrase and salt via PBKDF2-HMAC-SHA256 (100k iterations).

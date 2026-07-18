@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 
 use crate::envconf::EnvConfig;
 
+/// A copy-on-write workspace using overlayfs and a loop-mounted ext4 image for upper storage.
 pub struct CowWorkspace {
     pub mount_point: PathBuf,
     overlay_dir: PathBuf,
@@ -12,6 +13,7 @@ pub struct CowWorkspace {
     bind_mounts: Vec<PathBuf>,
 }
 
+/// Persisted state for an active overlay session, saved so it can be synced later.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SessionState {
     app_name: String,
@@ -21,6 +23,8 @@ struct SessionState {
 }
 
 impl CowWorkspace {
+    /// Creates and mounts an overlay filesystem workspace with quota-limited storage,
+    /// bind-mounting excluded paths to separate directories outside the overlay.
     pub fn setup(
         repo_root: &Path, env_config: &EnvConfig, runtime_quota: u64, runtime_exclude: Option<&[String]>, app_name: &str,
     ) -> Result<Self, String> {
@@ -101,6 +105,7 @@ impl CowWorkspace {
         Ok(CowWorkspace { mount_point, overlay_dir, loopback, loop_mount, bind_mounts })
     }
 
+    /// Ensures `.bunkerbox/` is listed in the repo's `.gitignore` file.
     fn ensure_gitignore(repo_root: &Path) -> Result<(), String> {
         let gitignore = repo_root.join(".gitignore");
         let mut exists = false;
@@ -124,6 +129,7 @@ impl CowWorkspace {
         Ok(())
     }
 
+    /// Unmounts stale overlay and loop mounts from previous runs, then detaches the loop device.
     fn cleanup_stale(mount_point: &Path, loop_mount: &Path, loopback: &Path) -> Result<(), String> {
         for mnt in parse_bind_mounts_under(mount_point).iter().rev() {
             Self::run_command_allow_failure("umount", &[&mnt.to_string_lossy()])?;
@@ -140,6 +146,7 @@ impl CowWorkspace {
         Ok(())
     }
 
+    /// Finds the loop device (e.g. `/dev/loop0`) associated with a backing file via `losetup -j`.
     fn find_loop_device(loopback: &Path) -> Option<String> {
         let output =
             Command::new("sudo").args(["losetup", "-j", &loopback.to_string_lossy()]).stdout(Stdio::piped()).stderr(Stdio::null()).output().ok()?;
@@ -147,6 +154,7 @@ impl CowWorkspace {
         String::from_utf8(output.stdout).ok()?.split(':').next().map(|s| s.trim().to_string())
     }
 
+    /// Runs a command via `sudo`, returning an error on non-zero exit or failure to spawn.
     fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
         let mut all_args: Vec<&str> = vec![program];
         all_args.extend_from_slice(args);
@@ -164,6 +172,7 @@ impl CowWorkspace {
         Ok(())
     }
 
+    /// Runs a command via `sudo`, ignoring exit status and stderr. Fails only on spawn errors.
     fn run_command_allow_failure(program: &str, args: &[&str]) -> Result<(), String> {
         let mut all_args: Vec<&str> = vec![program];
         all_args.extend_from_slice(args);
@@ -177,6 +186,7 @@ impl CowWorkspace {
         Ok(())
     }
 
+    /// Recursively checks if the overlay upperdir has any unsynced file changes.
     fn has_unsynced_changes(&self) -> bool {
         fn check(dir: &Path) -> bool {
             let Ok(entries) = fs::read_dir(dir) else { return false };
@@ -202,6 +212,8 @@ impl CowWorkspace {
     }
 }
 
+/// Parses `/proc/mounts` for bind mounts nested under the given mount point,
+/// returning them sorted deepest-first for correct unmount ordering.
 fn parse_bind_mounts_under(mount_point: &Path) -> Vec<PathBuf> {
     let Ok(contents) = fs::read_to_string("/proc/mounts") else {
         return Vec::new();
@@ -221,6 +233,7 @@ fn parse_bind_mounts_under(mount_point: &Path) -> Vec<PathBuf> {
     mounts
 }
 
+/// Returns the current user's `uid:gid` string via the `id` command.
 fn current_user_spec() -> Result<String, String> {
     let uid = run_id_arg("-u")?;
     let gid = run_id_arg("-g")?;
@@ -230,6 +243,7 @@ fn current_user_spec() -> Result<String, String> {
     Ok(format!("{uid}:{gid}"))
 }
 
+/// Runs `id <arg>` and returns the trimmed stdout.
 fn run_id_arg(arg: &str) -> Result<String, String> {
     let output = Command::new("id").arg(arg).output().map_err(|e| format!("id {arg}: {e}"))?;
     if !output.status.success() {
@@ -238,6 +252,8 @@ fn run_id_arg(arg: &str) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| format!("id {arg}: {e}")).map(|s| s.trim().to_string())
 }
 
+/// Syncs unsaved changes from all active overlay sessions back to the repo root.
+/// If `app_name` is provided, only that session is synced.
 pub fn sync_sessions(repo_root: &Path, app_name: Option<&str>) -> Result<(), String> {
     let sessions_dir = repo_root.join(".bunkerbox/sessions");
 
@@ -270,6 +286,8 @@ pub fn sync_sessions(repo_root: &Path, app_name: Option<&str>) -> Result<(), Str
     Ok(())
 }
 
+/// Syncs changes from a single session's overlay upperdir to the repo root,
+/// then writes a `.synced` marker file.
 fn sync_session(sessions_dir: &Path, name: &str, state_path: &Path) -> Result<(), String> {
     let state: SessionState = serde_json::from_str(&fs::read_to_string(state_path).map_err(|e| format!("failed to read session state: {e}"))?).map_err(|e| format!("failed to parse session state: {e}"))?;
 
@@ -291,6 +309,7 @@ fn sync_session(sessions_dir: &Path, name: &str, state_path: &Path) -> Result<()
     Ok(())
 }
 
+/// Checks whether a path is currently mounted by scanning `/proc/mounts`.
 fn is_mounted(path: &Path) -> bool {
     let Ok(contents) = fs::read_to_string("/proc/mounts") else {
         return false;
@@ -305,12 +324,15 @@ fn is_mounted(path: &Path) -> bool {
     false
 }
 
+/// Recursively copies all non-whited-out files from the overlay upperdir to the repo root.
+/// Returns the count of files copied.
 fn sync_upper(upper_dir: &Path, repo_root: &Path) -> Result<usize, String> {
     let mut count = 0;
     sync_upper_dir(upper_dir, upper_dir, repo_root, &mut count)?;
     Ok(count)
 }
 
+/// Recursive helper for `sync_upper` that walks a directory tree and copies files.
 fn sync_upper_dir(base: &Path, current: &Path, repo_root: &Path, count: &mut usize) -> Result<(), String> {
     for entry in fs::read_dir(current).map_err(|e| format!("failed to read {}: {e}", current.display()))? {
         let entry = entry.map_err(|e| format!("failed to read entry: {e}"))?;
@@ -340,6 +362,8 @@ fn sync_upper_dir(base: &Path, current: &Path, repo_root: &Path, count: &mut usi
     Ok(())
 }
 
+/// Cleans up the overlay workspace: warns about unsynced changes, removes session state,
+/// and unmounts the overlay, loop device, and bind mounts.
 impl Drop for CowWorkspace {
     fn drop(&mut self) {
         let sessions_dir = self.overlay_dir.join("sessions");

@@ -37,9 +37,7 @@ impl CowWorkspace {
 
         Self::ensure_gitignore(repo_root)?;
 
-        let quota_bytes = env_config.quota_bytes(runtime_quota, repo_root, runtime_exclude)?;
-
-        let size_mb = quota_bytes / (1024 * 1024);
+        let size_mb = env_config.quota_bytes(runtime_quota, repo_root, runtime_exclude)? / (1024 * 1024);
         if size_mb == 0 {
             return Err("workspace quota too small".to_string());
         }
@@ -59,15 +57,11 @@ impl CowWorkspace {
         let lowerdir = repo_root.to_string_lossy();
         let upperdir = upper_dir.to_string_lossy();
         let workdir = work_dir.to_string_lossy();
-        let opts = format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir},redirect_dir=on");
-        let result = Self::run_command_allow_failure("mount", &["-t", "overlay", "overlay", "-o", &opts, &mount_point.to_string_lossy()]);
-        if result.is_err() {
-            let opts_no_redirect = format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir}");
-            Self::run_command("mount", &["-t", "overlay", "overlay", "-o", &opts_no_redirect, &mount_point.to_string_lossy()])?;
+        if Self::run_command_allow_failure("mount", &["-t", "overlay", "overlay", "-o", &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir},redirect_dir=on"), &mount_point.to_string_lossy()]).is_err() {
+            Self::run_command("mount", &["-t", "overlay", "overlay", "-o", &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir}"), &mount_point.to_string_lossy()])?;
         }
 
         let mut bind_mounts: Vec<PathBuf> = Vec::new();
-        let build_workspace = overlay_dir.join("build-workspace");
         for pattern in env_config.effective_exclude(runtime_exclude) {
             let src_path = repo_root.join(&pattern);
 
@@ -80,7 +74,7 @@ impl CowWorkspace {
                 }
             }
 
-            let bind_src = build_workspace.join(&pattern);
+            let bind_src = overlay_dir.join("build-workspace").join(&pattern);
             let bind_dst = mount_point.join(&pattern);
 
             fs::create_dir_all(&bind_src).map_err(|e| format!("failed to create {}: {e}", bind_src.display()))?;
@@ -99,9 +93,10 @@ impl CowWorkspace {
             upper_dir: upper_dir.to_string_lossy().to_string(),
             repo_root: repo_root.to_string_lossy().to_string(),
         };
-        let state_json = serde_json::to_string(&state).map_err(|e| format!("failed to serialize session state: {e}"))?;
-        let state_path = sessions_dir.join(format!("{app_name}.json"));
-        fs::write(&state_path, state_json).map_err(|e| format!("failed to write session state: {e}"))?;
+        fs::write(
+            &sessions_dir.join(format!("{app_name}.json")),
+            serde_json::to_string(&state).map_err(|e| format!("failed to serialize session state: {e}"))?,
+        ).map_err(|e| format!("failed to write session state: {e}"))?;
 
         Ok(CowWorkspace { mount_point, overlay_dir, loopback, loop_mount, bind_mounts })
     }
@@ -149,8 +144,7 @@ impl CowWorkspace {
         let output =
             Command::new("sudo").args(["losetup", "-j", &loopback.to_string_lossy()]).stdout(Stdio::piped()).stderr(Stdio::null()).output().ok()?;
 
-        let stdout = String::from_utf8(output.stdout).ok()?;
-        stdout.split(':').next().map(|s| s.trim().to_string())
+        String::from_utf8(output.stdout).ok()?.split(':').next().map(|s| s.trim().to_string())
     }
 
     fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
@@ -254,11 +248,9 @@ pub fn sync_sessions(repo_root: &Path, app_name: Option<&str>) -> Result<(), Str
 
     let mut sessions = Vec::new();
     for entry in fs::read_dir(&sessions_dir).map_err(|e| format!("failed to read {}: {e}", sessions_dir.display()))? {
-        let entry = entry.map_err(|e| format!("failed to read session entry: {e}"))?;
-        let path = entry.path();
+        let path = entry.map_err(|e| format!("failed to read session entry: {e}"))?.path();
         if path.extension().is_some_and(|ext| ext == "json") {
-            if let Some(file_stem) = path.file_stem() {
-                let name = file_stem.to_string_lossy().to_string();
+            if let Some(name) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
                 if app_name.is_none_or(|n| n == name) {
                     sessions.push((name, path));
                 }
@@ -279,27 +271,21 @@ pub fn sync_sessions(repo_root: &Path, app_name: Option<&str>) -> Result<(), Str
 }
 
 fn sync_session(sessions_dir: &Path, name: &str, state_path: &Path) -> Result<(), String> {
-    let contents = fs::read_to_string(state_path).map_err(|e| format!("failed to read session state: {e}"))?;
-    let state: SessionState = serde_json::from_str(&contents).map_err(|e| format!("failed to parse session state: {e}"))?;
+    let state: SessionState = serde_json::from_str(&fs::read_to_string(state_path).map_err(|e| format!("failed to read session state: {e}"))?).map_err(|e| format!("failed to parse session state: {e}"))?;
 
-    let mount_point = Path::new(&state.mount_point);
-    let upper_dir = Path::new(&state.upper_dir);
-    let repo_root = Path::new(&state.repo_root);
-
-    if !is_mounted(mount_point) {
+    if !is_mounted(Path::new(&state.mount_point)) {
         println!("{name}: session ended, removing state file");
         let _ = fs::remove_file(state_path);
         return Ok(());
     }
 
-    let count = sync_upper(upper_dir, repo_root)?;
+    let count = sync_upper(Path::new(&state.upper_dir), Path::new(&state.repo_root))?;
 
     if count == 0 {
         println!("{name}: no changes");
     } else {
         println!("{name}: {count} files synced");
-        let synced_path = sessions_dir.join(format!("{name}.synced"));
-        fs::write(&synced_path, "1").map_err(|e| format!("failed to write sync marker: {e}"))?;
+        fs::write(&sessions_dir.join(format!("{name}.synced")), "1").map_err(|e| format!("failed to write sync marker: {e}"))?;
     }
 
     Ok(())
@@ -339,8 +325,7 @@ fn sync_upper_dir(base: &Path, current: &Path, repo_root: &Path, count: &mut usi
             continue;
         }
 
-        let rel = path.strip_prefix(base).map_err(|e| format!("failed to compute relative path: {e}"))?;
-        let dest = repo_root.join(rel);
+        let dest = repo_root.join(path.strip_prefix(base).map_err(|e| format!("failed to compute relative path: {e}"))?);
 
         if metadata.is_dir() {
             sync_upper_dir(base, &path, repo_root, count)?;

@@ -238,11 +238,10 @@ fn user_data_dir() -> PathBuf {
 
 /// Writes a minimal resolv.conf from `/etc/resolv.conf` (filtering loopback), falling back to public DNS.
 fn write_resolv_conf() -> Result<PathBuf, String> {
-    let host = fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
     let mut lines = Vec::new();
     let mut nameserver_count = 0;
 
-    for line in host.lines() {
+    for line in fs::read_to_string("/etc/resolv.conf").unwrap_or_default().lines() {
         let trimmed = line.trim();
 
         if trimmed.starts_with("nameserver ") {
@@ -273,8 +272,6 @@ fn write_resolv_conf() -> Result<PathBuf, String> {
 
 /// Installs iptables egress firewall rules on the bridge, restricting outbound traffic to the allow list.
 fn ensure_bridge_egress_firewall(config: &RuntimeConfig, resolv_conf: Option<&Path>) -> Result<(), String> {
-    let allow = config.allow.as_ref().ok_or_else(|| "bridge egress firewall requires allow list".to_string())?;
-
     remove_bridge_egress_firewall()?;
     run_command("sudo", &["modprobe", "br_netfilter"])?;
     run_command("sudo", &["sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1"])?;
@@ -288,7 +285,7 @@ fn ensure_bridge_egress_firewall(config: &RuntimeConfig, resolv_conf: Option<&Pa
         add_bridge_allow_rule(&server.to_string(), Some("tcp"), Some("53"))?;
     }
 
-    for destination in resolve_allow_list(allow)? {
+    for destination in resolve_allow_list(config.allow.as_ref().ok_or_else(|| "bridge egress firewall requires allow list".to_string())?)? {
         add_bridge_allow_rule(&destination, None, None)?;
     }
 
@@ -298,14 +295,14 @@ fn ensure_bridge_egress_firewall(config: &RuntimeConfig, resolv_conf: Option<&Pa
 /// Removes all bridge egress firewall rules (FORWARD jump and BUNKERBOX-EGRESS chain).
 fn remove_bridge_egress_firewall() -> Result<(), String> {
     loop {
-        let output = Command::new("sudo")
+        if !Command::new("sudo")
             .args(["iptables", "-D", "FORWARD", "-s", BRIDGE_SUBNET, "-j", "BUNKERBOX-EGRESS"])
             .stderr(Stdio::null())
             .stdout(Stdio::null())
             .status()
-            .map_err(|err| format!("failed to run sudo: {err}"))?;
-
-        if !output.success() {
+            .map_err(|err| format!("failed to run sudo: {err}"))?
+            .success()
+        {
             break;
         }
     }
@@ -335,17 +332,15 @@ fn add_bridge_allow_rule(destination: &str, protocol: Option<&str>, port: Option
 
 /// Parses a resolv.conf file and extracts IPv4/IPv6 nameserver addresses.
 fn dns_servers(path: &Path) -> Result<Vec<IpAddr>, String> {
-    let contents = fs::read_to_string(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let mut servers = Vec::new();
 
-    for line in contents.lines() {
+    for line in fs::read_to_string(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with("nameserver ") {
             continue;
         }
 
-        let server = trimmed.split_whitespace().nth(1).unwrap_or_default();
-        if let Ok(ip) = server.parse::<IpAddr>() {
+        if let Ok(ip) = trimmed.split_whitespace().nth(1).unwrap_or_default().parse::<IpAddr>() {
             servers.push(ip);
         }
     }
@@ -372,8 +367,7 @@ fn resolve_allow_list(allow: &[String]) -> Result<Vec<String>, String> {
             return Err(format!("IPv6 allow entries are not supported by iptables firewall yet: {entry}"));
         }
 
-        let lookup = format!("{entry}:443");
-        for addr in lookup.to_socket_addrs().map_err(|err| format!("failed to resolve allowed host {entry}: {err}"))? {
+        for addr in format!("{entry}:443").to_socket_addrs().map_err(|err| format!("failed to resolve allowed host {entry}: {err}"))? {
             if let IpAddr::V4(ip) = addr.ip() {
                 destinations.insert(ip.to_string());
             }
@@ -402,7 +396,8 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
         }
     }
 
-    let config = format!(
+    let temp = std::env::temp_dir().join(format!("bunkerbox-cni-{}.conflist", std::process::id()));
+    fs::write(&temp, format!(
         r#"{{
   "cniVersion": "0.4.0",
   "name": "bunkerbox",
@@ -430,10 +425,7 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
 "#,
         bridge = BRIDGE_NAME,
         subnet = BRIDGE_SUBNET,
-    );
-
-    let temp = std::env::temp_dir().join(format!("bunkerbox-cni-{}.conflist", std::process::id()));
-    fs::write(&temp, config).map_err(|err| format!("failed to write {}: {err}", temp.display()))?;
+    )).map_err(|err| format!("failed to write {}: {err}", temp.display()))?;
 
     let result = run_command(
         "sudo",
@@ -565,11 +557,10 @@ fn encrypt_to_vec(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, String>
     let mut nonce_bytes = [0u8; 12];
     rng.fill(&mut nonce_bytes);
 
-    let key = derive_key(passphrase, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("cipher init: {e}"))?;
-    let nonce = Nonce::<U12>::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|_| "encryption failed".to_string())?;
+    let ciphertext = Aes256Gcm::new_from_slice(&derive_key(passphrase, &salt))
+        .map_err(|e| format!("cipher init: {e}"))?
+        .encrypt(Nonce::<U12>::from_slice(&nonce_bytes), plaintext)
+        .map_err(|_| "encryption failed".to_string())?;
 
     let mut result = Vec::with_capacity(28 + ciphertext.len());
     result.extend_from_slice(&salt);
@@ -587,27 +578,20 @@ fn decrypt_from_slice(passphrase: &str, encoded: &[u8]) -> Result<Vec<u8>, Strin
         return Err("encrypted data too short".to_string());
     }
 
-    let salt = &data[..16];
-    let nonce_bytes = &data[16..28];
-    let ciphertext = &data[28..];
-
-    let key = derive_key(passphrase, salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("cipher init: {e}"))?;
-    let nonce = Nonce::<U12>::from_slice(nonce_bytes);
-
-    cipher.decrypt(nonce, ciphertext).map_err(|_| "Failed to open credentials vault".to_string())
+    Aes256Gcm::new_from_slice(&derive_key(passphrase, &data[..16]))
+        .map_err(|e| format!("cipher init: {e}"))?
+        .decrypt(Nonce::<U12>::from_slice(&data[16..28]), &data[28..])
+        .map_err(|_| "Failed to open credentials vault".to_string())
 }
 
 /// Recursively walks `dir`, calling `f` with the full path and the path relative to `base` for each file.
 fn walk_files(base: &Path, dir: &Path, f: &mut dyn FnMut(&Path, &Path) -> Result<(), String>) -> Result<(), String> {
     for entry in fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))? {
-        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
-        let path = entry.path();
+        let path = entry.map_err(|e| format!("dir entry: {e}"))?.path();
         if path.is_dir() {
             walk_files(base, &path, f)?;
         } else if path.is_file() {
-            let rel = path.strip_prefix(base).unwrap_or(&path);
-            f(&path, rel)?;
+            f(&path, path.strip_prefix(base).unwrap_or(&path))?;
         }
     }
     Ok(())
@@ -739,8 +723,7 @@ fn check_containerd_version() -> Result<(), String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     for token in stdout.split_whitespace() {
-        let stripped = token.strip_prefix('v').unwrap_or(token);
-        let parts: Vec<&str> = stripped.split('.').collect();
+        let parts: Vec<&str> = token.strip_prefix('v').unwrap_or(token).split('.').collect();
         if parts.len() != 3 {
             continue;
         }
@@ -777,9 +760,7 @@ fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
 
 /// Reads lines from a stderr reader and prints them to real stderr, skipping filtered warnings.
 fn filter_stderr(stderr: impl std::io::Read) -> Result<(), String> {
-    let reader = BufReader::new(stderr);
-
-    for line in reader.lines() {
+    for line in BufReader::new(stderr).lines() {
         let line = line.map_err(|err| format!("failed to read stderr: {err}"))?;
         if !is_filtered_warning(&line) {
             eprintln!("{line}");
@@ -791,9 +772,7 @@ fn filter_stderr(stderr: impl std::io::Read) -> Result<(), String> {
 
 /// Prints each line of a stderr byte buffer to real stderr unless it matches a known ignorable warning.
 fn print_filtered_stderr(stderr: &[u8]) -> Result<(), String> {
-    let stderr = String::from_utf8_lossy(stderr);
-
-    for line in stderr.lines() {
+    for line in String::from_utf8_lossy(stderr).lines() {
         if !is_filtered_warning(line) {
             eprintln!("{line}");
         }

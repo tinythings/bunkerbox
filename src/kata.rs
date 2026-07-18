@@ -218,10 +218,12 @@ pub fn run(
     result
 }
 
+/// Returns the default home path under XDG_DATA_HOME/.local/share/bunkerbox/<app>/home.
 fn default_home_path(app_name: &str) -> PathBuf {
     user_data_dir().join("bunkerbox").join(app_name).join("home")
 }
 
+/// Resolves the XDG data directory (`$XDG_DATA_HOME`, or `~/.local/share`, or fallback).
 fn user_data_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
@@ -234,6 +236,7 @@ fn user_data_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".local").join("share")
 }
 
+/// Writes a minimal resolv.conf from `/etc/resolv.conf` (filtering loopback), falling back to public DNS.
 fn write_resolv_conf() -> Result<PathBuf, String> {
     let host = fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
     let mut lines = Vec::new();
@@ -268,6 +271,7 @@ fn write_resolv_conf() -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Installs iptables egress firewall rules on the bridge, restricting outbound traffic to the allow list.
 fn ensure_bridge_egress_firewall(config: &RuntimeConfig, resolv_conf: Option<&Path>) -> Result<(), String> {
     let allow = config.allow.as_ref().ok_or_else(|| "bridge egress firewall requires allow list".to_string())?;
 
@@ -291,6 +295,7 @@ fn ensure_bridge_egress_firewall(config: &RuntimeConfig, resolv_conf: Option<&Pa
     run_command("sudo", &["iptables", "-A", "BUNKERBOX-EGRESS", "-j", "REJECT"])
 }
 
+/// Removes all bridge egress firewall rules (FORWARD jump and BUNKERBOX-EGRESS chain).
 fn remove_bridge_egress_firewall() -> Result<(), String> {
     loop {
         let output = Command::new("sudo")
@@ -309,6 +314,7 @@ fn remove_bridge_egress_firewall() -> Result<(), String> {
     run_command_allow_failure("sudo", &["iptables", "-X", "BUNKERBOX-EGRESS"])
 }
 
+/// Adds a single ACCEPT rule to the BUNKERBOX-EGRESS chain for the given destination/protocol/port.
 fn add_bridge_allow_rule(destination: &str, protocol: Option<&str>, port: Option<&str>) -> Result<(), String> {
     let mut args = vec!["iptables", "-A", "BUNKERBOX-EGRESS", "-d", destination];
 
@@ -327,6 +333,7 @@ fn add_bridge_allow_rule(destination: &str, protocol: Option<&str>, port: Option
     run_command("sudo", &args)
 }
 
+/// Parses a resolv.conf file and extracts IPv4/IPv6 nameserver addresses.
 fn dns_servers(path: &Path) -> Result<Vec<IpAddr>, String> {
     let contents = fs::read_to_string(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let mut servers = Vec::new();
@@ -346,6 +353,7 @@ fn dns_servers(path: &Path) -> Result<Vec<IpAddr>, String> {
     Ok(servers)
 }
 
+/// Resolves allow-list entries (IPs, CIDRs, or hostnames) to unique IPv4 destination strings.
 fn resolve_allow_list(allow: &[String]) -> Result<Vec<String>, String> {
     let mut destinations = BTreeSet::new();
 
@@ -375,6 +383,7 @@ fn resolve_allow_list(allow: &[String]) -> Result<Vec<String>, String> {
     Ok(destinations.into_iter().collect())
 }
 
+/// Returns `true` if the entry is a valid IPv4 CIDR notation (e.g. `10.0.0.0/24`).
 fn is_ipv4_cidr(entry: &str) -> bool {
     let Some((addr, prefix)) = entry.split_once('/') else {
         return false;
@@ -383,6 +392,7 @@ fn is_ipv4_cidr(entry: &str) -> bool {
     addr.parse::<std::net::Ipv4Addr>().is_ok() && prefix.parse::<u8>().is_ok_and(|prefix| prefix <= 32)
 }
 
+/// Writes the bridge CNI conflist to `/etc/cni/net.d/`, creating or overwriting a bunkerbox config.
 fn ensure_bridge_cni_config() -> Result<(), String> {
     let path = Path::new("/etc/cni/net.d/10-bunkerbox.conflist");
 
@@ -441,6 +451,7 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
     result
 }
 
+/// Force-kills and removes a containerd task/container and its CNI state if left over from a prior run.
 fn remove_stale_container(container_name: &str) -> Result<(), String> {
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "kill", "--signal", "SIGKILL", container_name]);
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "delete", "--force", container_name]);
@@ -452,6 +463,7 @@ fn remove_stale_container(container_name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns the current user's `uid:gid` string for use with `--user` in container run commands.
 fn current_user_spec() -> Result<String, String> {
     let uid = command_output("id", &["-u"])?;
     let gid = command_output("id", &["-g"])?;
@@ -465,6 +477,7 @@ fn current_user_spec() -> Result<String, String> {
     Ok(format!("{uid}:{gid}"))
 }
 
+/// Runs a command with inherited stdio and filtered stderr, returning an error on non-zero exit.
 fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
     let mut child = Command::new(program)
         .args(args)
@@ -487,6 +500,7 @@ fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs a command silently (no stdio) and ignores non-zero exit codes, only reporting spawn errors.
 fn run_command_allow_failure(program: &str, args: &[&str]) -> Result<(), String> {
     Command::new(program)
         .args(args)
@@ -499,6 +513,7 @@ fn run_command_allow_failure(program: &str, args: &[&str]) -> Result<(), String>
     Ok(())
 }
 
+/// Runs a command silently (no stdio) and returns an error on non-zero exit.
 fn run_command_quiet(program: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new(program)
         .args(args)
@@ -515,6 +530,7 @@ fn run_command_quiet(program: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// Prompts the user with a yes/no question and returns `true` on 'y'/'Y'.
 fn confirm(prompt: &str) -> bool {
     use std::io::{self, Read, Write};
     let mut stdout = io::stdout();
@@ -529,16 +545,19 @@ fn confirm(prompt: &str) -> bool {
     buf[0] == b'y' || buf[0] == b'Y'
 }
 
+/// Reads a passphrase from the terminal without echoing.
 fn read_passphrase() -> Result<String, String> {
     Ok(rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))?)
 }
 
+/// Derives a 256-bit AES key from a passphrase and salt via PBKDF2-HMAC-SHA256 (100k iterations).
 fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
     pbkdf2::pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, 100_000, &mut key);
     key
 }
 
+/// Encrypts plaintext with AES-256-GCM, prepending random salt (16B) and nonce (12B), then base64-encodes.
 fn encrypt_to_vec(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let mut rng = rand::thread_rng();
     let mut salt = [0u8; 16];
@@ -560,6 +579,7 @@ fn encrypt_to_vec(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, String>
     Ok(BASE64.encode(&result).into_bytes())
 }
 
+/// Decrypts a base64-encoded AES-256-GCM payload (format: salt[16] || nonce[12] || ciphertext).
 fn decrypt_from_slice(passphrase: &str, encoded: &[u8]) -> Result<Vec<u8>, String> {
     let data = BASE64.decode(encoded).map_err(|_| "base64 decode failed".to_string())?;
 
@@ -578,6 +598,7 @@ fn decrypt_from_slice(passphrase: &str, encoded: &[u8]) -> Result<Vec<u8>, Strin
     cipher.decrypt(nonce, ciphertext).map_err(|_| "Failed to open credentials vault".to_string())
 }
 
+/// Recursively walks `dir`, calling `f` with the full path and the path relative to `base` for each file.
 fn walk_files(base: &Path, dir: &Path, f: &mut dyn FnMut(&Path, &Path) -> Result<(), String>) -> Result<(), String> {
     for entry in fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
@@ -592,6 +613,7 @@ fn walk_files(base: &Path, dir: &Path, f: &mut dyn FnMut(&Path, &Path) -> Result
     Ok(())
 }
 
+/// Walks `home` and decrypts every `.enc-cipher` file, writing the plaintext and removing the encrypted copy.
 fn unseal_home(home: &Path, passphrase: &str) -> Result<(), String> {
     walk_files(home, home, &mut |path, _rel| {
         let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
@@ -624,6 +646,7 @@ fn unseal_home(home: &Path, passphrase: &str) -> Result<(), String> {
     })
 }
 
+/// Walks `home` and encrypts files matching any glob `pattern` (skipping already-encrypted `.enc-cipher` files).
 fn seal_home(home: &Path, patterns: &[String], passphrase: &str) -> Result<(), String> {
     let compiled: Vec<glob::Pattern> =
         patterns.iter().map(|p| glob::Pattern::new(p)).collect::<Result<Vec<_>, _>>().map_err(|e| format!("invalid glob pattern: {e}"))?;
@@ -652,6 +675,7 @@ fn seal_home(home: &Path, patterns: &[String], passphrase: &str) -> Result<(), S
     })
 }
 
+/// Creates and mounts an ext4 session image, copies the home contents, and recovers any leftover image.
 fn setup_session(home_path: &Path, session_mb: u32, container_name: &str, uid: &str, gid: &str) -> Result<PathBuf, String> {
     let bunker_dir = home_path.join(".bunker");
     let session_img = bunker_dir.join("session.img");
@@ -690,6 +714,7 @@ fn setup_session(home_path: &Path, session_mb: u32, container_name: &str, uid: &
     Ok(session_dir)
 }
 
+/// Copies session changes back to home, unmounts, and removes the session image and mount point.
 fn teardown_session(home_path: &Path, session_dir: &Path) {
     let _ = run_command_quiet("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
 
@@ -700,6 +725,7 @@ fn teardown_session(home_path: &Path, session_dir: &Path) {
     let _ = run_command_allow_failure("sudo", &["rmdir", &format!("{}", session_dir.display())]);
 }
 
+/// Checks that containerd >= 2.2.5 is installed (required for Kata networking). Skippable via env var.
 fn check_containerd_version() -> Result<(), String> {
     if std::env::var("BUNKERBOX_SKIP_CONTAINERD_CHECK").is_ok() {
         return Ok(());
@@ -736,6 +762,7 @@ fn check_containerd_version() -> Result<(), String> {
     Ok(())
 }
 
+/// Runs a command, filters its stderr, and returns its stdout as a string on success.
 fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program).args(args).stderr(Stdio::piped()).output().map_err(|err| format!("failed to run {program}: {err}"))?;
 
@@ -748,6 +775,7 @@ fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|err| format!("command output is not UTF-8: {err}"))
 }
 
+/// Reads lines from a stderr reader and prints them to real stderr, skipping filtered warnings.
 fn filter_stderr(stderr: impl std::io::Read) -> Result<(), String> {
     let reader = BufReader::new(stderr);
 
@@ -761,6 +789,7 @@ fn filter_stderr(stderr: impl std::io::Read) -> Result<(), String> {
     Ok(())
 }
 
+/// Prints each line of a stderr byte buffer to real stderr unless it matches a known ignorable warning.
 fn print_filtered_stderr(stderr: &[u8]) -> Result<(), String> {
     let stderr = String::from_utf8_lossy(stderr);
 
@@ -773,6 +802,7 @@ fn print_filtered_stderr(stderr: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns `true` for known containerd deprecation warnings that can be safely ignored.
 fn is_filtered_warning(line: &str) -> bool {
     line.contains("DEPRECATION: The support for cgroup v1 is deprecated since containerd v2.2")
 }

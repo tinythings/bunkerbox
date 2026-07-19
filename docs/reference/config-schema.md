@@ -61,12 +61,11 @@ When using copy-on-write mode, per-project settings are stored in `.bunkerbox/en
 # Bunkerbox workspace configuration
 # Edit this file to customize behavior.
 
-# Quota for copy-on-write workspace. "auto" = walk repo (skipping excluded dirs), +10%, floor 1G.
+# Quota for copy-on-write workspace. "auto" = walk repo (skipping excluded dirs), +10%, floor 5G.
 # Use "10G", "500M", etc. for an explicit size.
 quota: auto
 
-# Directories excluded from copy-on-write (stored on host disk instead of in the capped loopback).
-# Patterns match directory names relative to the repository root.
+# Directories excluded from the auto-quota walk (their output still uses the loopback image).
 exclude:
   - target/
   - node_modules/
@@ -79,6 +78,13 @@ exclude:
   - .gradle/
   - cmake-build-debug/
   - cmake-build-release/
+
+# Passthrough: commands proxied from VM to host via vsock.
+# "make *" matches with any args. "make" matches only exact (no args).
+# Auto-detected on first run if empty.
+passthrough:
+  - "make *"
+  - "cargo *"
 ```
 
 During development, runtime configs live in `runtime/`. In a packaged install, they live under:

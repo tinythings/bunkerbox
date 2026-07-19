@@ -1,10 +1,10 @@
 use std::io::{self, BufRead, Write};
 
-use crate::cfg::{EnvMode, HomeMode, ImageOverrides, ProjectConfig, ProjectSection, WorkspaceMode};
+use crate::cfg::{EnvMode, ImageOverrides, ProjectConfig, ProjectSection, RuntimeConfig, WorkspaceMode};
 use crate::vscomm::buildsys;
 use crate::workspace;
 
-pub fn run() -> Result<(), String> {
+pub fn run(runtime: Option<&RuntimeConfig>) -> Result<(), String> {
     println!();
     println!("  Bunkerbox project setup");
     println!("  ========================");
@@ -24,7 +24,7 @@ pub fn run() -> Result<(), String> {
     let env_mode = pick_env_mode()?;
     let detected = if env_mode == EnvMode::Paranoid { buildsys::scan(&repo_root, buildsys::PassthroughMode::Paranoid) } else { detected_relaxed };
     let passthrough = build_passthrough(detected, env_mode)?;
-    let overrides = pick_overrides()?;
+    let overrides = pick_overrides(runtime)?;
 
     let cfg = ProjectConfig { project: ProjectSection { env: env_mode, quota: Some(quota), exclude: Vec::new(), passthrough }, image: overrides };
 
@@ -109,73 +109,121 @@ fn build_passthrough(detected: Vec<String>, env_mode: EnvMode) -> Result<Vec<Str
     Ok(entries)
 }
 
-fn pick_overrides() -> Result<ImageOverrides, String> {
+fn pick_overrides(runtime: Option<&RuntimeConfig>) -> Result<ImageOverrides, String> {
     println!();
-    let key = key_press("  Override runtime defaults? [y/N]", &['y', 'n'], 'n')?;
+    println!("  ══ Runtime overrides (optional) ═══");
+    println!();
+    println!("  Change how the container runs for this project.");
+    println!("  Press Enter on any option to keep the current value.");
+    println!();
+
+    let key = key_press("  Configure overrides? [y/N]", &['y', 'n'], 'n')?;
     if key == 'n' {
         return Ok(ImageOverrides::default());
     }
     println!();
 
-    let workspace = {
-        print!("  Workspace mode [cow/direct/isolated] (skip): ");
-        io::stdout().flush().map_err(|e| format!("flush: {e}"))?;
-        match read_line()?.as_str() {
-            "" => None,
-            "cow" => Some(WorkspaceMode::Cow),
-            "direct" => Some(WorkspaceMode::Direct),
-            "isolated" => Some(WorkspaceMode::Isolated),
-            "clone" => Some(WorkspaceMode::Isolated),
-            "share" => Some(WorkspaceMode::Cow),
-            _ => None,
-        }
-    };
+    let workspace = pick_workspace_override(runtime)?;
+    let session_mb = pick_session_override(runtime)?;
+    let allow = pick_allow_override(runtime)?;
 
-    let home = {
-        print!("  Home mode [persist/temporary] (skip): ");
-        io::stdout().flush().map_err(|e| format!("flush: {e}"))?;
-        match read_line()?.as_str() {
-            "" => None,
-            "persist" => Some(HomeMode::Persist),
-            "temporary" => Some(HomeMode::Temporary),
-            _ => None,
-        }
-    };
+    Ok(ImageOverrides { workspace, session_mb, allow })
+}
 
-    let home_path = {
-        print!("  Home path (skip): ");
+fn pick_workspace_override(runtime: Option<&RuntimeConfig>) -> Result<Option<WorkspaceMode>, String> {
+    let current = runtime.and_then(|r| r.workspace).unwrap_or_default();
+    println!("  Workspace mode (current: {}):", workspace_label(current));
+    println!("    [1] cow         copy-on-write, quota-limited (recommended)");
+    println!("    [2] direct      mount repo directly, no guardrails");
+    println!("    [3] isolated    disposable clone via git worktree");
+    println!();
+    let idx = pick_num_skip("  Pick [skip]", 1, 3)?;
+    Ok(match idx {
+        1 => Some(WorkspaceMode::Cow),
+        2 => Some(WorkspaceMode::Direct),
+        3 => Some(WorkspaceMode::Isolated),
+        _ => None,
+    })
+}
+
+fn pick_session_override(runtime: Option<&RuntimeConfig>) -> Result<Option<u32>, String> {
+    let current = runtime.map(|r| r.session_mb()).unwrap_or(50);
+    println!("  Session size (current: {current} MB):");
+    println!("    [1] 50 MB");
+    println!("    [2] 100 MB");
+    println!("    [3] 200 MB");
+    println!("    [4] 500 MB");
+    println!("    [c] custom");
+    println!();
+
+    let key = key_press("  Pick [skip]", &['1', '2', '3', '4', 'c'], 's')?;
+    Ok(match key {
+        '1' => Some(50),
+        '2' => Some(100),
+        '3' => Some(200),
+        '4' => Some(500),
+        'c' => {
+            print!("  Size in MB: ");
+            io::stdout().flush().map_err(|e| format!("flush: {e}"))?;
+            read_line()?.parse::<u32>().ok()
+        }
+        _ => None,
+    })
+}
+
+fn pick_allow_override(runtime: Option<&RuntimeConfig>) -> Result<Option<Vec<String>>, String> {
+    let base_hosts = runtime.and_then(|r| r.allow.as_deref()).unwrap_or(&[]);
+    if base_hosts.is_empty() {
+        println!("  No hosts found in runtime config.");
+        println!("  Pass --share <dir> to auto-detect from packaged config.");
+    } else {
+        println!("  Currently allowed hosts (from runtime config):");
+        for host in base_hosts {
+            println!("    - {host}");
+        }
+    }
+    println!();
+
+    let mut extras: Vec<String> = Vec::new();
+    loop {
+        println!("    [a] add a host");
+        println!("    [d] done");
+        println!();
+        let key = key_press("  Pick [d]", &['a', 'd'], 'd')?;
+        if key == 'd' {
+            break;
+        }
+        print!("  Host: ");
+        io::stdout().flush().map_err(|e| format!("flush: {e}"))?;
+        let line = read_line()?;
+        if !line.is_empty() {
+            extras.push(line.trim().to_string());
+        }
+    }
+    Ok(if extras.is_empty() { None } else { Some(extras) })
+}
+
+fn workspace_label(mode: WorkspaceMode) -> &'static str {
+    match mode {
+        WorkspaceMode::Cow => "cow",
+        WorkspaceMode::Direct => "direct",
+        WorkspaceMode::Isolated => "isolated",
+    }
+}
+
+fn pick_num_skip(prompt: &str, min: usize, max: usize) -> Result<usize, String> {
+    loop {
+        print!("{prompt}: ");
         io::stdout().flush().map_err(|e| format!("flush: {e}"))?;
         let line = read_line()?;
         if line.is_empty() {
-            None
-        } else {
-            Some(std::path::PathBuf::from(line))
+            return Ok(0);
         }
-    };
-
-    let session_mb = {
-        print!("  Session MB (skip): ");
-        io::stdout().flush().map_err(|e| format!("flush: {e}"))?;
-        let line = read_line()?;
-        if line.is_empty() {
-            None
-        } else {
-            line.parse::<u32>().ok()
+        match line.parse::<usize>() {
+            Ok(n) if n >= min && n <= max => return Ok(n),
+            _ => {}
         }
-    };
-
-    let allow = {
-        print!("  Extra allowed hosts (space-separated, skip): ");
-        io::stdout().flush().map_err(|e| format!("flush: {e}"))?;
-        let line = read_line()?;
-        if line.is_empty() {
-            None
-        } else {
-            Some(line.split_whitespace().map(String::from).collect())
-        }
-    };
-
-    Ok(ImageOverrides { workspace, home, home_path, session_mb, allow })
+    }
 }
 
 fn pick_num(prompt: &str, min: usize, max: usize) -> Result<usize, String> {

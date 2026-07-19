@@ -72,7 +72,11 @@ fn run() -> Result<(), String> {
                 print_subcommand_help("config")?;
                 return Ok(());
             }
-            cfgsetup::run()
+            let runtime = share_dir_from_args()
+                .ok()
+                .and_then(|d| cfg::RuntimeConfig::load_from_share_dir(&d))
+                .or_else(|| cfg::RuntimeConfig::load_from_share_dir(Path::new(cfg::DEFAULT_SHARE_DIR)));
+            cfgsetup::run(runtime.as_ref())
         }
         Some(("run", submatches)) => {
             if submatches.get_flag("help") {

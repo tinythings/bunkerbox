@@ -94,6 +94,20 @@ impl RuntimeConfig {
             .map(Some)
     }
 
+    /// Load the first valid runtime config found in a share directory.
+    pub fn load_from_share_dir(share_dir: &Path) -> Option<Self> {
+        let entries = fs::read_dir(share_dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "conf") {
+                if let Ok(cfg) = serde_yaml::from_str(&fs::read_to_string(&path).ok()?) {
+                    return Some(cfg);
+                }
+            }
+        }
+        None
+    }
+
     pub fn workspace_quota_bytes(&self) -> u64 {
         let raw = self.workspace_quota.as_deref().unwrap_or("10G");
         parse_size(raw).unwrap_or(10 * 1024 * 1024 * 1024)
@@ -109,8 +123,6 @@ impl RuntimeConfig {
             workspace: overrides.workspace.or(self.workspace).unwrap_or_default(),
             workspace_quota: self.workspace_quota_bytes(),
             workspace_exclude: self.workspace_exclude.clone().unwrap_or_default(),
-            home: overrides.home.or(self.home),
-            home_path: overrides.home_path.clone().or_else(|| self.home_path.clone()),
             session_mb: overrides.session_mb.or(self.session_mb).unwrap_or(50),
             network: self.network,
             allow: match (&self.allow, &overrides.allow) {
@@ -129,8 +141,6 @@ pub struct AppliedRuntime {
     pub workspace: WorkspaceMode,
     pub workspace_quota: u64,
     pub workspace_exclude: Vec<String>,
-    pub home: Option<HomeMode>,
-    pub home_path: Option<PathBuf>,
     pub session_mb: u32,
     pub network: Option<NetworkMode>,
     pub allow: Option<Vec<String>>,
@@ -161,10 +171,6 @@ pub struct ProjectSection {
 pub struct ImageOverrides {
     #[serde(default)]
     pub workspace: Option<WorkspaceMode>,
-    #[serde(default)]
-    pub home: Option<HomeMode>,
-    #[serde(default)]
-    pub home_path: Option<PathBuf>,
     #[serde(default)]
     pub allow: Option<Vec<String>>,
     #[serde(default)]
@@ -323,18 +329,6 @@ impl ProjectConfig {
                     }
                 ));
             }
-            if let Some(ref hm) = self.image.home {
-                y.push_str(&format!(
-                    "  home: {}\n",
-                    match hm {
-                        HomeMode::Persist => "persist",
-                        HomeMode::Temporary => "temporary",
-                    }
-                ));
-            }
-            if let Some(ref hp) = self.image.home_path {
-                y.push_str(&format!("  home_path: {}\n", hp.display()));
-            }
             if let Some(ref mb) = self.image.session_mb {
                 y.push_str(&format!("  session_mb: {mb}\n"));
             }
@@ -356,7 +350,7 @@ impl ProjectConfig {
 
 impl ImageOverrides {
     fn has_override(&self) -> bool {
-        self.workspace.is_some() || self.home.is_some() || self.home_path.is_some() || self.session_mb.is_some() || self.allow.is_some()
+        self.workspace.is_some() || self.session_mb.is_some() || self.allow.is_some()
     }
 }
 

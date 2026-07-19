@@ -1,32 +1,32 @@
-# Bunkerbox
+# Containers isolate processes.<br/>Bunkerbox isolates consequences.
 
-Bunkerbox runs developer tools inside an isolated container instead of running them directly on your machine.
+<div align="center">
+  <img src="images/bunkerbox.png" style="width: 100%" alt="Bunkerbox">
+</div>
 
-The idea is simple. Many modern developer tools need to read and edit files in your project. Some of them may also talk to the network, save state, or run helper commands. That is useful, but it also means the tool can touch more of your system than you may want. Bunkerbox gives the tool a smaller place to work.
+---
 
-When a tool runs through Bunkerbox, it sees your project as `/workspace`. Its app home is separated from your real home directory. Its image is built from a config file. Its runtime behavior is described by another config file. This makes the tool feel like a normal command, while still putting a boundary around it.
+## What it does
 
-## The basic flow
+AI coding agents are powerful. They can edit code, run builds, and iterate on your
+project. They can also `rm -rf` your home directory, exfiltrate your SSH keys, or
+fill your disk with garbage — because they run as *you*.
 
-First, you build an image from an image config. The image contains the tool and the generated Bunkerbox entrypoint.
+Bunkerbox puts the agent inside a lightweight, immutable VM. From that sandbox:
 
-```sh
-make image IMAGE=images/opencode.conf
-```
-
-Then, for local development, you import the OCI archive that was produced by the image build.
-
-```sh
-make install-image OCI=bunkerbox-opencode-1.17.18.oci
-```
-
-In a packaged install, the user does not need to think about that internal flow. They can run a command such as `opencode`, and Bunkerbox loads the matching runtime config for that command.
-
-## Why this exists
-
-Developer agents are getting stronger. They can edit code, inspect projects, call tools, and keep state. Running them directly on the host is convenient, but it gives them the same local access as the user who launched them.
-
-Bunkerbox explores a safer model. The tool still gets the project workspace it needs, but the runtime is prepared, isolated, and described explicitly.
+- **Your repo** is an overlay copy-on-write workspace. The agent sees and edits
+  files as usual, but your real repository stays untouched until you choose to
+  sync changes back.
+- **Your build tools** are available on-demand. A whitelist tells Bunkerbox which
+  host commands to proxy into the VM via vsock. The agent runs `cargo build`,
+  `make test`, or `go vet` using your real toolchain — inside the overlay, never
+  on the host itself.
+- **Your credentials** stay encrypted at rest. The VM gets a clean home directory.
+  Sensitive files are sealed with AES-256-GCM between sessions.
+- **Your network** is firewalled. Only destinations you explicitly allow are
+  reachable from inside the container.
+- **All changes auto-sync** when the agent exits. Your repo has the diff. You
+  review, accept, commit.
 
 ## Documentation website
 
@@ -44,4 +44,6 @@ target/site-docs/
 
 ## Where to go next
 
-Start with the [Quickstart](quickstart.md) if you want to run the development flow. Read [Concepts](concepts.md) if you want to understand the model. Read [Packaging](guides/packaging.md) if you want to understand how a tool becomes a normal command.
+Start with the [Tutorial](guides/tutorial.md) to set up Bunkerbox and let an AI agent
+work on a real project. Read [Concepts](concepts.md) to understand the model. Read
+[Packaging](guides/packaging.md) to understand how a tool becomes a normal command.

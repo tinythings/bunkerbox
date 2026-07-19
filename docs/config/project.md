@@ -38,6 +38,20 @@ project:
 
 Settings that describe *this* repository.
 
+**`env`** — controls how the guest VM environment is handled when proxying
+commands to the host. Two modes:
+
+- `relaxed` (default) — guest environment variables pass through to the host
+  command, except `HOME`, `PATH`, `XDG_*`, and `BUNKERBOX_*` which are
+  stripped.
+- `paranoid` — the guest environment is fully dropped. Commands inherit the
+  host daemon's environment only. Glob patterns in `passthrough` are
+  **rejected** — every entry must be an exact command name.
+
+Use `paranoid` when you want zero guest influence over host command execution.
+The AI can't set `LD_PRELOAD`, `RUSTFLAGS`, `PYTHONPATH`, or any other
+variable to manipulate the host toolchain.
+
 **`quota`** — upper-layer size limit for the copy-on-write workspace. Accepts
 `auto` (walk the repo, skip excluded dirs, add 10%, floor 5 GB), an explicit
 size string (`"20G"`, `"500M"`, `"1048576"`), or omit for auto. This controls

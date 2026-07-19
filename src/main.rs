@@ -155,8 +155,11 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     let repo_root = workspace::project_root()?;
     let env = ProjectConfig::load_or_create(&repo_root)?;
 
-    let daemon =
-        if !env.project.passthrough.is_empty() { Some(daemon::VsockDaemon::start(env.project.passthrough.clone(), workspace_path)?) } else { None };
+    let daemon = if !env.project.passthrough.is_empty() {
+        Some(daemon::VsockDaemon::start(env.project.passthrough.clone(), env.project.env, workspace_path)?)
+    } else {
+        None
+    };
 
     let result = kata::run(&config, ws, &container_name, share_dir, &name, daemon.is_some());
 

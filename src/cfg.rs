@@ -49,6 +49,18 @@ pub enum HomeMode {
     Temporary,
 }
 
+/// Controls whether the guest VM environment is forwarded to host commands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnvMode {
+    /// Guest environment is selectively passed to the host command.
+    #[default]
+    Relaxed,
+    /// Guest environment is fully dropped. Commands inherit the host daemon's
+    /// environment only. Glob patterns in `passthrough` are rejected.
+    Paranoid,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RuntimeConfig {
     pub oci: PathBuf,
@@ -136,6 +148,8 @@ pub struct ProjectConfig {
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectSection {
     #[serde(default)]
+    pub env: EnvMode,
+    #[serde(default)]
     pub quota: Option<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
@@ -169,9 +183,10 @@ impl ProjectConfig {
         if path.exists() {
             return serde_yaml::from_str(&fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?)
                 .map_err(|e| format!("failed to parse {}: {e}", path.display()))
-                .map(|mut cfg: Self| {
+                .and_then(|mut cfg: Self| {
                     cfg.auto_fill_passthrough(repo_root, &path);
-                    cfg
+                    cfg.validate()?;
+                    Ok(cfg)
                 });
         }
 
@@ -181,12 +196,31 @@ impl ProjectConfig {
         }
 
         let cfg = ProjectConfig {
-            project: ProjectSection { quota: Some("auto".into()), exclude: Vec::new(), passthrough: buildsys::scan(repo_root) },
+            project: ProjectSection {
+                env: EnvMode::default(),
+                quota: Some("auto".into()),
+                exclude: Vec::new(),
+                passthrough: buildsys::scan(repo_root),
+            },
             image: ImageOverrides::default(),
         };
+        cfg.validate()?;
         fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("failed to create {}: {e}", path.parent().unwrap().display()))?;
         fs::write(&path, cfg.to_yaml()).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
         Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.project.env == EnvMode::Paranoid {
+            for entry in &self.project.passthrough {
+                if entry.contains('*') {
+                    return Err(format!(
+                        "paranoid env mode: glob patterns are not allowed in passthrough. Found '{entry}'. Use exact command names only."
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn migrate_from_env_conf(_repo_root: &Path, legacy_path: &Path, new_path: &Path) -> Result<Self, String> {
@@ -205,9 +239,10 @@ impl ProjectConfig {
                 .map_err(|e| format!("failed to parse legacy {}: {e}", legacy_path.display()))?;
 
         let cfg = ProjectConfig {
-            project: ProjectSection { quota: old.quota, exclude: old.exclude, passthrough: old.passthrough },
+            project: ProjectSection { env: EnvMode::default(), quota: old.quota, exclude: old.exclude, passthrough: old.passthrough },
             image: ImageOverrides::default(),
         };
+        cfg.validate()?;
 
         fs::write(new_path, cfg.to_yaml()).map_err(|e| format!("failed to write {}: {e}", new_path.display()))?;
         let _ = fs::remove_file(legacy_path);
@@ -252,6 +287,9 @@ impl ProjectConfig {
         y.push_str("# Edit this file to customize behavior.\n\n");
 
         y.push_str("project:\n");
+        if self.project.env != EnvMode::Relaxed {
+            Self::yaml_field(&mut y, "  env", "paranoid");
+        }
         Self::yaml_field(&mut y, "  quota", self.project.quota.as_deref().unwrap_or("auto"));
         y.push_str("  exclude:\n");
         if self.project.exclude.is_empty() {

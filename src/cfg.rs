@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::vscomm::buildsys;
+use crate::vscomm::buildsys::{self, PassthroughMode};
 
 pub const DEFAULT_SHARE_DIR: &str = "/usr/share/bunkerbox";
 
@@ -200,7 +200,7 @@ impl ProjectConfig {
                 env: EnvMode::default(),
                 quota: Some("auto".into()),
                 exclude: Vec::new(),
-                passthrough: buildsys::scan(repo_root),
+                passthrough: buildsys::scan(repo_root, PassthroughMode::Relaxed),
             },
             image: ImageOverrides::default(),
         };
@@ -252,7 +252,7 @@ impl ProjectConfig {
 
     fn auto_fill_passthrough(&mut self, repo_root: &Path, path: &Path) {
         if self.project.passthrough.is_empty() {
-            self.project.passthrough = buildsys::scan(repo_root);
+            self.project.passthrough = buildsys::scan(repo_root, PassthroughMode::Relaxed);
             if !self.project.passthrough.is_empty() {
                 let _ = fs::write(path, self.to_yaml());
             }

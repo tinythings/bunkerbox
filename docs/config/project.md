@@ -3,6 +3,16 @@
 A project config tunes Bunkerbox behaviour for a specific repository. It lives
 at `.bunkerbox/project.conf` and is auto-generated on first run.
 
+You can create and edit this file interactively:
+
+```sh
+bunkerbox config
+```
+
+The wizard detects your build system, asks you a few questions, and writes a
+clean `project.conf` — no YAML knowledge needed. Pass `--share <dir>` to see
+current values from a packaged runtime config.
+
 The runtime config answers "how should this tool run on *any* machine?" The
 project config answers "how should this tool run on *this* project?" The
 runtime config ships in the package and is immutable; the project config lives
@@ -83,11 +93,6 @@ the runtime defaults take effect.
 **`workspace`** — override the workspace mode: `cow` (default, overlayfs with
 quota), `direct` (mount repo directly, no guardrails), or `isolated` (clone
 the repo via `git worktree`).
-
-**`home`** — override home persistence: `persist` (save tool state between
-runs) or `temporary` (discard after each run).
-
-**`home_path`** — override the directory used for persisted home storage.
 
 **`session_mb`** — override the session image size in megabytes. Default 50.
 Set 0 to disable the loop-mounted session image and bind-mount the raw home

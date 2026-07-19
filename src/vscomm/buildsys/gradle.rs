@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use super::PassthroughMode;
+
 pub struct Gradle;
 
 impl super::BuildSystem for Gradle {
@@ -13,7 +15,12 @@ impl super::BuildSystem for Gradle {
             || root.join("settings.gradle.kts").exists()
             || root.join("gradlew").exists()
     }
-    fn passthrough(&self) -> Vec<String> {
-        vec!["./gradlew *".into(), "gradle *".into()]
+    fn passthrough(&self, mode: PassthroughMode, _root: &Path) -> Vec<String> {
+        match mode {
+            PassthroughMode::Relaxed => vec!["./gradlew *".into(), "gradle *".into()],
+            PassthroughMode::Paranoid => {
+                vec!["./gradlew build".into(), "./gradlew test".into(), "gradle build".into(), "gradle test".into()]
+            }
+        }
     }
 }

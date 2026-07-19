@@ -1,4 +1,4 @@
-.PHONY: dev check test setup image install-image prepare docs docs-clean musl-vscomm
+.PHONY: dev check test setup image install-image prepare config docs docs-clean musl-vscomm
 
 DOCS_VENV := .venv-docs
 DOCS_MKDOCS := $(DOCS_VENV)/bin/mkdocs
@@ -31,6 +31,9 @@ install-image: dev
 	BUNKERBOX_OCI_ARCHIVE=$(OCI) target/debug/bunkerbox install-image
 
 prepare: dev
+config: dev
+	target/debug/bunkerbox config
+
 	target/debug/bunkerbox prepare
 
 $(DOCS_MKDOCS): docs/requirements.txt

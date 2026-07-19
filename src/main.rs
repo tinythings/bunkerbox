@@ -1,4 +1,5 @@
 mod cfg;
+mod cfgsetup;
 mod clidef;
 mod cmdrun;
 mod daemon;
@@ -19,13 +20,15 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let share_dir = share_dir_from_args()?;
     let workspace_override = workspace_mode_from_args()?;
 
-    if let Some(config) = cfg::RuntimeConfig::for_invoked_name(&share_dir)? {
-        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
-        let _guard = rt.enter();
-        return run_packaged_runtime(config, workspace_override, &share_dir);
+    if cfg::RuntimeConfig::invoked_name()? != clidef::APPNAME {
+        let share_dir = share_dir_from_args()?;
+        if let Some(config) = cfg::RuntimeConfig::for_invoked_name(&share_dir)? {
+            let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
+            let _guard = rt.enter();
+            return run_packaged_runtime(config, workspace_override, &share_dir);
+        }
     }
 
     let mut cli = clidef::cli(env!("CARGO_PKG_VERSION"));
@@ -63,6 +66,17 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             workspace::prepare(submatches.get_flag("reset"))
+        }
+        Some(("config", submatches)) => {
+            if submatches.get_flag("help") {
+                print_subcommand_help("config")?;
+                return Ok(());
+            }
+            let runtime = share_dir_from_args()
+                .ok()
+                .and_then(|d| cfg::RuntimeConfig::load_from_share_dir(&d))
+                .or_else(|| cfg::RuntimeConfig::load_from_share_dir(Path::new(cfg::DEFAULT_SHARE_DIR)));
+            cfgsetup::run(runtime.as_ref())
         }
         Some(("run", submatches)) => {
             if submatches.get_flag("help") {

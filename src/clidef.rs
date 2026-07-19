@@ -27,6 +27,7 @@ pub fn cli(version: &'static str) -> Command {
                 .arg(Arg::new("reset").long("reset").action(ArgAction::SetTrue).help("Recreate workspace if it already exists"))
                 .arg(help_arg()),
         )
+        .subcommand(Command::new("config").about("Interactive project config setup").styles(styles.clone()).disable_help_flag(true).arg(help_arg()))
         .subcommand(
             Command::new("run")
                 .about("Run named embedded YAML sequence")

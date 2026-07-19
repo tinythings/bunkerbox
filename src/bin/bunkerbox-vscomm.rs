@@ -103,13 +103,19 @@ fn install_symlinks() -> Result<(), String> {
 }
 
 fn find_config() -> Option<PathBuf> {
-    let paths = [PathBuf::from("/workspace/.bunkerbox/env.conf"), PathBuf::from(".bunkerbox/env.conf")];
+    let paths = [
+        PathBuf::from("/workspace/.bunkerbox/project.conf"),
+        PathBuf::from(".bunkerbox/project.conf"),
+        PathBuf::from("/workspace/.bunkerbox/env.conf"),
+        PathBuf::from(".bunkerbox/env.conf"),
+    ];
     paths.into_iter().find(|p| p.exists())
 }
 
 fn read_whitelist_entries(path: &Path) -> Result<Vec<String>, String> {
     let contents = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
 
+    let mut in_project = false;
     let mut in_passthrough = false;
     let mut entries = Vec::new();
 
@@ -118,7 +124,15 @@ fn read_whitelist_entries(path: &Path) -> Result<Vec<String>, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if !in_passthrough {
+        if !in_project && !in_passthrough {
+            if line == "project:" {
+                in_project = true;
+            } else if line == "passthrough:" {
+                in_passthrough = true;
+            }
+            continue;
+        }
+        if in_project && !in_passthrough {
             if line == "passthrough:" {
                 in_passthrough = true;
             }

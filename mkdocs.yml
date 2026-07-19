@@ -50,6 +50,7 @@ nav:
   - Concepts: concepts.md
   - Configuration:
       - Runtime config: config/runtime.md
+      - Project config: config/project.md
       - Image config: config/image.md
       - Image hooks: config/hooks.md
   - Guides:

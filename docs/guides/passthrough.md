@@ -17,7 +17,7 @@ build tooling, without letting the agent touch anything outside the workspace.
 ## How it works
 
 When the container boots, a small static binary called `bunkerbox-vscomm` reads
-the whitelist from your project's `.bunkerbox/env.conf`. For each whitelisted
+the whitelist from your project's `.bunkerbox/project.conf`. For each whitelisted
 command that is **not** already present inside the VM, it creates a symlink in
 `/usr/local/bunkerbox/bin/` and prepends that directory to `PATH`.
 
@@ -59,7 +59,7 @@ auto-synced back to your real repo when the container exits.
 
 ## Configuration
 
-The whitelist lives in `.bunkerbox/env.conf` under the `passthrough` key:
+The whitelist lives in `.bunkerbox/project.conf` under the `passthrough` key:
 
 ```yaml
 # Passthrough commands proxied from VM to host via vsock.
@@ -85,7 +85,7 @@ them, the agent gets a "command not found" — as it should be inside a bunker.
 
 ## Auto-detection
 
-When `.bunkerbox/env.conf` is first created (or if the `passthrough` list is
+When `.bunkerbox/project.conf` is first created (or if the `passthrough` list is
 empty on startup), Bunkerbox scans the repository root for known build system
 files and pre-fills the whitelist automatically:
 
@@ -134,7 +134,7 @@ host's real `HOME`, so caches like `~/.cargo/registry`, `~/.cache/go-build`, and
 `~/.npm` are shared across sessions — no repeated downloads.
 
 **Quota.** The overlay workspace has a capped loopback image (`upper.img`). Its
-size is controlled by the `quota` setting in `env.conf`. The default auto-quota
+size is controlled by the `quota` setting in `project.conf`. The default auto-quota
 is 5 GB. Set `quota: 20G` or higher if your builds produce large artifacts.
 
 ## Requirements

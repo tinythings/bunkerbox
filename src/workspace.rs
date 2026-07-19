@@ -1,6 +1,5 @@
-use crate::envconf::EnvConfig;
+use crate::cfg::{ProjectConfig, WorkspaceMode};
 use crate::overlay::CowWorkspace;
-use crate::runtime::WorkspaceMode;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -33,7 +32,7 @@ pub fn resolve(mode: WorkspaceMode, quota_bytes: u64, runtime_exclude: Option<&[
     match mode {
         WorkspaceMode::Cow => {
             let repo_root = project_root()?;
-            let env = EnvConfig::load_or_create(&repo_root)?;
+            let env = ProjectConfig::load_or_create(&repo_root)?;
             let cow = CowWorkspace::setup(&repo_root, &env, quota_bytes, runtime_exclude, app_name)?;
             Ok(WorkspaceHandle::Cow { inner: cow })
         }

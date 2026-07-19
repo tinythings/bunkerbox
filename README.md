@@ -1,3 +1,6 @@
+<img width="1536" height="1024" alt="bunkerbox" src="https://github.com/user-attachments/assets/563f83ce-f93c-45da-94a1-a5aa29c1e952" />
+
+
 # Bunkerbox
 
 **Run powerful development agents without handing them your whole machine.**

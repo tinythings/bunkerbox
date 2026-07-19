@@ -1,5 +1,6 @@
-use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig, WorkspaceMode};
-use crate::workspace::{self, WorkspaceHandle};
+use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig};
+use crate::vscomm::VSOCK_PORT;
+use crate::workspace::WorkspaceHandle;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm::aead::Aead;
 use aes_gcm::aead::consts::U12;
@@ -19,20 +20,20 @@ const BRIDGE_NAME: &str = "bunkerbox0";
 
 /// Runs the Kata container with the given runtime configuration.
 ///
-/// Sets up containerd, workspace, optional bridge networking,
-/// home directory encryption, session storage, and launches the container
-/// via `sudo ctr run` with the Kata runtime.
+/// Sets up containerd, optional bridge networking, home directory
+/// encryption, session storage, and launches the container via
+/// `sudo ctr run` with the Kata runtime.  The workspace must already
+/// be resolved by the caller.
 ///
 /// # Returns
 /// `Ok(())` on successful container execution, `Err(String)` on failure.
 pub fn run(
     config: &RuntimeConfig,
-    workspace_mode: WorkspaceMode,
-    quota: u64,
-    runtime_exclude: Option<&[String]>,
+    workspace: WorkspaceHandle,
     container_name: &str,
     _share_dir: &Path,
     app_name: &str,
+    vsock_enabled: bool,
 ) -> Result<(), String> {
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
@@ -47,8 +48,6 @@ pub fn run(
     let ctr_name = container_name.to_string();
     let oci_path = config.oci.to_string_lossy().into_owned();
     let image_tag = config.image.clone();
-    let wm_name = app_name.to_string();
-    let wm_exclude = runtime_exclude.map(|v| v.to_vec());
 
     let user = current_user_spec()?;
     let Some((uid, gid)) = user.split_once(':') else {
@@ -58,9 +57,7 @@ pub fn run(
     run_command_allow_failure("sudo", &["mkdir", "-p", &format!("{}", runtime_dir.display())])?;
     run_command_quiet("sudo", &["chown", &user, &format!("{}", runtime_dir.display())])?;
 
-    let setup_handle = std::thread::spawn(move || -> Result<WorkspaceHandle, String> {
-        let workspace = workspace::resolve(workspace_mode, quota, wm_exclude.as_deref(), &wm_name)?;
-
+    let setup_handle = std::thread::spawn(move || -> Result<(), String> {
         let active = Command::new("sudo")
             .args(["systemctl", "is-active", "containerd"])
             .stdout(Stdio::null())
@@ -80,7 +77,7 @@ pub fn run(
         let _ = run_command_allow_failure("sudo", &["ctr", "images", "rm", &image_tag]);
         run_command_quiet("sudo", &["ctr", "images", "import", &oci_path])?;
 
-        Ok(workspace)
+        Ok(())
     });
 
     let encrypt_patterns: &[String] = config.encrypt.as_deref().unwrap_or(&[]);
@@ -113,11 +110,11 @@ pub fn run(
         None
     };
 
-    let workspace = match setup_handle.join() {
-        Ok(Ok(ws)) => ws,
+    match setup_handle.join() {
+        Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err("setup thread panicked".to_string()),
-    };
+    }
 
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
 
@@ -144,6 +141,11 @@ pub fn run(
     } else {
         None
     };
+
+    if vsock_enabled {
+        container_env.push(format!("BUNKERBOX_VSOCK_PORT={VSOCK_PORT}"));
+    }
+
     let mut args = Vec::new();
 
     if config.network == Some(NetworkMode::Bridge) {

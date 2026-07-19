@@ -12,7 +12,6 @@ pub struct CowWorkspace {
     overlay_dir: PathBuf,
     loopback: PathBuf,
     loop_mount: PathBuf,
-    bind_mounts: Vec<PathBuf>,
 }
 
 /// Persisted state for an active overlay session, saved so it can be synced later.
@@ -67,30 +66,6 @@ impl CowWorkspace {
             Self::run_command("mount", &["-t", "overlay", "overlay", "-o", &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir}"), &mount_point.to_string_lossy()])?;
         }
 
-        let mut bind_mounts: Vec<PathBuf> = Vec::new();
-        for pattern in env_config.effective_exclude(runtime_exclude) {
-            let src_path = repo_root.join(&pattern);
-
-            if src_path.exists() {
-                if let Ok(meta) = fs::symlink_metadata(&src_path) {
-                    if meta.file_type().is_symlink() {
-                        eprintln!("bunkerbox: warning: {} is a symlink, skipping bind mount", src_path.display());
-                        continue;
-                    }
-                }
-            }
-
-            let bind_src = overlay_dir.join("build-workspace").join(&pattern);
-            let bind_dst = mount_point.join(&pattern);
-
-            fs::create_dir_all(&bind_src).map_err(|e| format!("failed to create {}: {e}", bind_src.display()))?;
-            fs::create_dir_all(&bind_dst).map_err(|e| format!("failed to create {}: {e}", bind_dst.display()))?;
-
-            Self::run_command("mount", &["--bind", &bind_src.to_string_lossy(), &bind_dst.to_string_lossy()])?;
-
-            bind_mounts.push(bind_dst);
-        }
-
         let sessions_dir = overlay_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).map_err(|e| format!("failed to create {}: {e}", sessions_dir.display()))?;
         let state = SessionState {
@@ -104,7 +79,7 @@ impl CowWorkspace {
             serde_json::to_string(&state).map_err(|e| format!("failed to serialize session state: {e}"))?,
         ).map_err(|e| format!("failed to write session state: {e}"))?;
 
-        Ok(CowWorkspace { mount_point, overlay_dir, loopback, loop_mount, bind_mounts })
+        Ok(CowWorkspace { mount_point, overlay_dir, loopback, loop_mount })
     }
 
     /// Ensures `.bunkerbox/` is listed in the repo's `.gitignore` file.
@@ -133,10 +108,6 @@ impl CowWorkspace {
 
     /// Unmounts stale overlay and loop mounts from previous runs, then detaches the loop device.
     fn cleanup_stale(mount_point: &Path, loop_mount: &Path, loopback: &Path) -> Result<(), String> {
-        for mnt in parse_bind_mounts_under(mount_point).iter().rev() {
-            Self::run_command_allow_failure("umount", &[&mnt.to_string_lossy()])?;
-        }
-
         Self::run_command_allow_failure("umount", &[&mount_point.to_string_lossy()])?;
 
         Self::run_command_allow_failure("umount", &[&loop_mount.to_string_lossy()])?;
@@ -212,27 +183,6 @@ impl CowWorkspace {
         }
         check(&self.loop_mount.join("upper"))
     }
-}
-
-/// Parses `/proc/mounts` for bind mounts nested under the given mount point,
-/// returning them sorted deepest-first for correct unmount ordering.
-fn parse_bind_mounts_under(mount_point: &Path) -> Vec<PathBuf> {
-    let Ok(contents) = fs::read_to_string("/proc/mounts") else {
-        return Vec::new();
-    };
-    let prefix = mount_point.to_string_lossy();
-    let mut mounts: Vec<PathBuf> = Vec::new();
-    for line in contents.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let mnt = parts[1];
-            if mnt.starts_with(prefix.as_ref()) && mnt != prefix.as_ref() {
-                mounts.push(PathBuf::from(mnt));
-            }
-        }
-    }
-    mounts.sort_by_key(|b| std::cmp::Reverse(b.as_os_str().len()));
-    mounts
 }
 
 /// Returns the current user's `uid:gid` string via the `id` command.
@@ -483,8 +433,8 @@ fn save_manifest(path: &Path, manifest: &BTreeSet<String>) -> Result<(), String>
     fs::write(path, json).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
-/// Cleans up the overlay workspace: warns about unsynced changes, removes session state,
-/// and unmounts the overlay, loop device, and bind mounts.
+/// Cleans up the overlay workspace: auto-syncs changes back to the repo,
+/// removes session state, and unmounts the overlay and loop device.
 impl Drop for CowWorkspace {
     fn drop(&mut self) {
         let sessions_dir = self.overlay_dir.join("sessions");
@@ -493,9 +443,14 @@ impl Drop for CowWorkspace {
             let Ok(entry) = entry else { continue };
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                let synced_marker = sessions_dir.join(format!("{}.synced", path.file_stem().unwrap_or_default().to_string_lossy()));
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                let synced_marker = sessions_dir.join(format!("{stem}.synced"));
                 if !synced_marker.exists() && self.has_unsynced_changes() {
-                    eprintln!("bunkerbox: session ending. Changes not synced. Run 'bunkerbox sync' to save.");
+                    eprintln!("bunkerbox: syncing changes back to repo...");
+                    let upper_dir = self.loop_mount.join("upper");
+                    let repo_root = self.overlay_dir.parent().expect("overlay_dir has no parent");
+                    let _ = sync_upper(&upper_dir, repo_root, &sessions_dir, &stem);
+                    eprintln!("bunkerbox: sync complete.");
                 }
                 let _ = fs::remove_file(&path);
                 let _ = fs::remove_file(&synced_marker);
@@ -504,9 +459,6 @@ impl Drop for CowWorkspace {
 
         let _ = fs::remove_dir_all(&sessions_dir);
 
-        for mnt in self.bind_mounts.iter().rev() {
-            let _ = Self::run_command_allow_failure("umount", &[&mnt.to_string_lossy()]);
-        }
         let _ = Self::run_command_allow_failure("umount", &[&self.mount_point.to_string_lossy()]);
         let _ = Self::run_command_allow_failure("umount", &[&self.loop_mount.to_string_lossy()]);
         if let Some(dev) = Self::find_loop_device(&self.loopback) {

@@ -1,7 +1,8 @@
-.PHONY: dev check test setup image install-image prepare docs docs-clean
+.PHONY: dev check test setup image install-image prepare docs docs-clean musl-vscomm
 
 DOCS_VENV := .venv-docs
 DOCS_MKDOCS := $(DOCS_VENV)/bin/mkdocs
+VSCOMM_TARGET := x86_64-unknown-linux-musl
 IMAGE ?=
 OCI ?=
 
@@ -18,7 +19,10 @@ test:
 setup: dev
 	target/debug/bunkerbox setup
 
-image: dev
+musl-vscomm:
+	cargo build --bin bunkerbox-vscomm --target $(VSCOMM_TARGET)
+
+image: dev musl-vscomm
 	@if [ -z "$(IMAGE)" ]; then echo "usage: make image IMAGE=images/name.conf" >&2; exit 1; fi
 	target/debug/bunkerbox-image $(IMAGE)
 

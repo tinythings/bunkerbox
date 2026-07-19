@@ -447,7 +447,7 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
 }
 
 /// Force-kills and removes a containerd task/container and its CNI state if left over from a prior run.
-fn remove_stale_container(container_name: &str) -> Result<(), String> {
+pub(crate) fn remove_stale_container(container_name: &str) -> Result<(), String> {
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "kill", "--signal", "SIGKILL", container_name]);
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "delete", "--force", container_name]);
     let _ = run_command_allow_failure("sudo", &["ctr", "containers", "rm", container_name]);

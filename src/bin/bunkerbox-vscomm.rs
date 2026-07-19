@@ -1,6 +1,7 @@
 #[path = "../vscomm/mod.rs"]
 mod vscomm;
 
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -79,9 +80,10 @@ fn install_symlinks() -> Result<(), String> {
     let vscomm_path = env::current_exe().map_err(|e| format!("failed to locate vscomm binary: {e}"))?;
 
     let mut installed = 0;
+    let mut seen = HashSet::new();
     for entry in &entries {
         let cmd = extract_command_name(entry);
-        if cmd.is_empty() {
+        if cmd.is_empty() || !seen.insert(cmd.clone()) {
             continue;
         }
         if command_exists_in_path_except(&cmd, &vscomm_path) {
@@ -150,12 +152,7 @@ fn read_whitelist_entries(path: &Path) -> Result<Vec<String>, String> {
 }
 
 fn extract_command_name(entry: &str) -> String {
-    let trimmed = entry.trim();
-    if let Some(rest) = trimmed.strip_suffix(" *") {
-        rest.trim().to_string()
-    } else {
-        trimmed.to_string()
-    }
+    entry.split_whitespace().next().unwrap_or("").trim_start_matches("./").to_string()
 }
 
 fn command_exists_in_path_except(cmd: &str, except: &Path) -> bool {

@@ -169,16 +169,21 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     Ok(())
 }
 
+fn normalize_cmd(s: &str) -> &str {
+    s.trim_start_matches("./")
+}
+
 pub(crate) fn is_allowed(passthrough: &[String], command: &str, args: &[String]) -> bool {
+    let command = normalize_cmd(command);
     for entry in passthrough {
-        let entry = entry.trim();
+        let entry = normalize_cmd(entry.trim());
         if entry.is_empty() {
             continue;
         }
 
         // Glob entry: "cmd *" allows the command with any arguments.
         if let Some(cmd) = entry.strip_suffix(" *") {
-            if cmd.trim() == command {
+            if normalize_cmd(cmd.trim()) == command {
                 return true;
             }
             continue;
@@ -187,7 +192,7 @@ pub(crate) fn is_allowed(passthrough: &[String], command: &str, args: &[String])
         // Exact/prefix entry: "cmd" matches zero args; "cmd sub" matches args starting with sub.
         let mut parts = entry.split_whitespace();
         if let Some(entry_cmd) = parts.next() {
-            if entry_cmd != command {
+            if normalize_cmd(entry_cmd) != command {
                 continue;
             }
             let prefix: Vec<&str> = parts.collect();

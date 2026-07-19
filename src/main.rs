@@ -1,5 +1,6 @@
 mod cfg;
 mod cfgsetup;
+mod cleanup;
 mod clidef;
 mod cmdrun;
 mod daemon;
@@ -159,15 +160,19 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
         return Err("runtime config missing image".to_string());
     }
 
-    let workspace_mode = workspace_override.or(config.workspace).unwrap_or_default();
-    let quota = config.workspace_quota_bytes();
+    let repo_root = workspace::project_root()?;
     let name = cfg::RuntimeConfig::invoked_name()?;
     let container_name = format!("bunkerbox-{name}");
+
+    cleanup::cleanup_project(&repo_root, &container_name);
+    cleanup::install_signal_handlers(repo_root.clone(), container_name.clone());
+
+    let workspace_mode = workspace_override.or(config.workspace).unwrap_or_default();
+    let quota = config.workspace_quota_bytes();
 
     let ws = workspace::resolve(workspace_mode, quota, config.workspace_exclude.as_deref(), &name)?;
     let workspace_path = ws.path().to_path_buf();
 
-    let repo_root = workspace::project_root()?;
     let env = ProjectConfig::load_or_create(&repo_root)?;
 
     let daemon = if !env.project.passthrough.is_empty() {

@@ -45,8 +45,9 @@ impl EnvConfig {
     pub fn load_or_create(repo_root: &Path) -> Result<Self, String> {
         let env_path = repo_root.join(Self::PATH);
         if env_path.exists() {
-            let mut cfg: EnvConfig = serde_yaml::from_str(&fs::read_to_string(&env_path).map_err(|e| format!("failed to read {}: {e}", env_path.display()))?)
-                .map_err(|e| format!("failed to parse {}: {e}", env_path.display()))?;
+            let mut cfg: EnvConfig =
+                serde_yaml::from_str(&fs::read_to_string(&env_path).map_err(|e| format!("failed to read {}: {e}", env_path.display()))?)
+                    .map_err(|e| format!("failed to parse {}: {e}", env_path.display()))?;
             if cfg.passthrough.is_empty() {
                 let detected = buildsys::scan(repo_root);
                 if !detected.is_empty() {

@@ -37,12 +37,7 @@ fn run() -> Result<(), String> {
     let cwd = env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let env_vars: Vec<(String, String)> = env::vars().collect();
 
-    let req = ExecRequest {
-        cwd: cwd.to_string_lossy().to_string(),
-        command: invoked_as,
-        args: args[1..].to_vec(),
-        env: env_vars,
-    };
+    let req = ExecRequest { cwd: cwd.to_string_lossy().to_string(), command: invoked_as, args: args[1..].to_vec(), env: env_vars };
 
     let frame = Frame::new(FrameType::ExecReq, req.serialize());
     let mut stream = vsock_connect(HOST_CID, VSOCK_PORT).map_err(|e| format!("vsock connect: {e}"))?;
@@ -96,8 +91,7 @@ fn install_symlinks() -> Result<(), String> {
         if target.exists() {
             let _ = fs::remove_file(&target);
         }
-        std::os::unix::fs::symlink(&vscomm_path, &target)
-            .map_err(|e| format!("symlink {cmd}: {e}"))?;
+        std::os::unix::fs::symlink(&vscomm_path, &target).map_err(|e| format!("symlink {cmd}: {e}"))?;
         installed += 1;
     }
 
@@ -109,10 +103,7 @@ fn install_symlinks() -> Result<(), String> {
 }
 
 fn find_config() -> Option<PathBuf> {
-    let paths = [
-        PathBuf::from("/workspace/.bunkerbox/env.conf"),
-        PathBuf::from(".bunkerbox/env.conf"),
-    ];
+    let paths = [PathBuf::from("/workspace/.bunkerbox/env.conf"), PathBuf::from(".bunkerbox/env.conf")];
     paths.into_iter().find(|p| p.exists())
 }
 
@@ -181,13 +172,7 @@ fn vsock_connect(cid: u32, port: u32) -> io::Result<VsockStream> {
             return Err(io::Error::last_os_error());
         }
 
-        let addr = libc::sockaddr_vm {
-            svm_family: libc::AF_VSOCK as u16,
-            svm_reserved1: 0,
-            svm_port: port,
-            svm_cid: cid,
-            svm_zero: [0u8; 4],
-        };
+        let addr = libc::sockaddr_vm { svm_family: libc::AF_VSOCK as u16, svm_reserved1: 0, svm_port: port, svm_cid: cid, svm_zero: [0u8; 4] };
 
         let addr_ptr = &addr as *const libc::sockaddr_vm as *const libc::sockaddr;
         let addr_len = mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
@@ -208,13 +193,7 @@ struct VsockStream {
 
 impl Read for VsockStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let ret = unsafe {
-            libc::read(
-                self.fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
+        let ret = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -224,13 +203,7 @@ impl Read for VsockStream {
 
 impl Write for VsockStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let ret = unsafe {
-            libc::write(
-                self.fd,
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-            )
-        };
+        let ret = unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }

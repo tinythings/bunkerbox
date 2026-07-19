@@ -159,14 +159,8 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
 fn write_runtime_conf(config: &ImageConfig) -> Result<(), String> {
     if let Some(runtime) = &config.runtime {
         let mut mapping = serde_yaml::Mapping::new();
-        mapping.insert(
-            serde_yaml::Value::String("oci".into()),
-            serde_yaml::Value::String(config.output.to_string_lossy().into_owned()),
-        );
-        mapping.insert(
-            serde_yaml::Value::String("image".into()),
-            serde_yaml::Value::String(config.image.clone()),
-        );
+        mapping.insert(serde_yaml::Value::String("oci".into()), serde_yaml::Value::String(config.output.to_string_lossy().into_owned()));
+        mapping.insert(serde_yaml::Value::String("image".into()), serde_yaml::Value::String(config.image.clone()));
 
         if let serde_yaml::Value::Mapping(m) = runtime {
             for (k, v) in m {
@@ -285,8 +279,7 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
     if let Some(vscomm_path) = find_vscomm_binary() {
         let dest = build_dir.join("bunkerbox-vscomm");
         fs::copy(&vscomm_path, &dest).map_err(|err| format!("failed to copy vscomm binary {}: {err}", dest.display()))?;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))
-            .map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
     }
 
     for file in &config.files {

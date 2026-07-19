@@ -19,10 +19,7 @@ impl VsockDaemon {
     pub fn start(passthrough: Vec<String>, workspace: PathBuf) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-        let session = Arc::new(VsockSession {
-            passthrough: Arc::new(passthrough),
-            workspace,
-        });
+        let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), workspace });
 
         let join_handle = tokio::spawn(async move {
             let result = daemon_loop(session, shutdown_rx).await;
@@ -40,10 +37,7 @@ impl VsockDaemon {
     }
 }
 
-async fn daemon_loop(
-    session: Arc<VsockSession>,
-    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-) -> Result<(), String> {
+async fn daemon_loop(session: Arc<VsockSession>, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
     use tokio_vsock::VsockListener;
 
     let listener = match VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, VSOCK_PORT)) {

@@ -7,9 +7,7 @@ impl super::BuildSystem for Python {
         "python"
     }
     fn detect(&self, root: &Path) -> bool {
-        root.join("pyproject.toml").exists()
-            || root.join("setup.py").exists()
-            || root.join("setup.cfg").exists()
+        root.join("pyproject.toml").exists() || root.join("setup.py").exists() || root.join("setup.cfg").exists()
     }
     fn passthrough(&self) -> Vec<String> {
         vec!["python *".into(), "pip *".into()]

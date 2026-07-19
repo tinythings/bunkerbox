@@ -1,9 +1,9 @@
 use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig};
 use crate::vscomm::VSOCK_PORT;
 use crate::workspace::WorkspaceHandle;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use aes_gcm::aead::Aead;
 use aes_gcm::aead::consts::U12;
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::Rng;
 use sha2::Sha256;
@@ -28,12 +28,7 @@ const BRIDGE_NAME: &str = "bunkerbox0";
 /// # Returns
 /// `Ok(())` on successful container execution, `Err(String)` on failure.
 pub fn run(
-    config: &RuntimeConfig,
-    workspace: WorkspaceHandle,
-    container_name: &str,
-    _share_dir: &Path,
-    app_name: &str,
-    vsock_enabled: bool,
+    config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, _share_dir: &Path, app_name: &str, vsock_enabled: bool,
 ) -> Result<(), String> {
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
@@ -41,8 +36,7 @@ pub fn run(
 
     check_containerd_version()?;
 
-    let home_path = (config.home == Some(HomeMode::Persist))
-        .then(|| config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)));
+    let home_path = (config.home == Some(HomeMode::Persist)).then(|| config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)));
 
     let needs_bridge = config.network == Some(NetworkMode::Bridge);
     let ctr_name = container_name.to_string();
@@ -402,8 +396,10 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
     }
 
     let temp = user_data_dir().join(format!("bunkerbox/runtime/cni-{}.conflist", std::process::id()));
-    fs::write(&temp, format!(
-        r#"{{
+    fs::write(
+        &temp,
+        format!(
+            r#"{{
   "cniVersion": "0.4.0",
   "name": "bunkerbox",
   "plugins": [
@@ -428,9 +424,11 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
   ]
 }}
 "#,
-        bridge = BRIDGE_NAME,
-        subnet = BRIDGE_SUBNET,
-    )).map_err(|err| format!("failed to write {}: {err}", temp.display()))?;
+            bridge = BRIDGE_NAME,
+            subnet = BRIDGE_SUBNET,
+        ),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", temp.display()))?;
 
     let result = run_command(
         "sudo",
@@ -453,10 +451,7 @@ fn remove_stale_container(container_name: &str) -> Result<(), String> {
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "kill", "--signal", "SIGKILL", container_name]);
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "delete", "--force", container_name]);
     let _ = run_command_allow_failure("sudo", &["ctr", "containers", "rm", container_name]);
-    let _ = run_command_allow_failure(
-        "sudo",
-        &["rm", "-f", &format!("/var/lib/cni/networks/{BRIDGE_NAME}/{container_name}")],
-    );
+    let _ = run_command_allow_failure("sudo", &["rm", "-f", &format!("/var/lib/cni/networks/{BRIDGE_NAME}/{container_name}")]);
     Ok(())
 }
 
@@ -721,10 +716,7 @@ fn check_containerd_version() -> Result<(), String> {
         return Ok(());
     }
 
-    let output = Command::new("containerd")
-        .arg("--version")
-        .output()
-        .map_err(|err| format!("failed to run containerd --version: {err}"))?;
+    let output = Command::new("containerd").arg("--version").output().map_err(|err| format!("failed to run containerd --version: {err}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -733,9 +725,15 @@ fn check_containerd_version() -> Result<(), String> {
         if parts.len() != 3 {
             continue;
         }
-        let Ok(major): Result<u32, _> = parts[0].parse() else { continue; };
-        let Ok(minor): Result<u32, _> = parts[1].parse() else { continue; };
-        let Ok(patch): Result<u32, _> = parts[2].parse() else { continue; };
+        let Ok(major): Result<u32, _> = parts[0].parse() else {
+            continue;
+        };
+        let Ok(minor): Result<u32, _> = parts[1].parse() else {
+            continue;
+        };
+        let Ok(patch): Result<u32, _> = parts[2].parse() else {
+            continue;
+        };
 
         if (major, minor, patch) < (2, 2, 5) {
             return Err(format!(

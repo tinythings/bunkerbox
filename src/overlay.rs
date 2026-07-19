@@ -62,8 +62,30 @@ impl CowWorkspace {
         let lowerdir = repo_root.to_string_lossy();
         let upperdir = upper_dir.to_string_lossy();
         let workdir = work_dir.to_string_lossy();
-        if Self::run_command_allow_failure("mount", &["-t", "overlay", "overlay", "-o", &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir},redirect_dir=on"), &mount_point.to_string_lossy()]).is_err() {
-            Self::run_command("mount", &["-t", "overlay", "overlay", "-o", &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir}"), &mount_point.to_string_lossy()])?;
+        if Self::run_command_allow_failure(
+            "mount",
+            &[
+                "-t",
+                "overlay",
+                "overlay",
+                "-o",
+                &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir},redirect_dir=on"),
+                &mount_point.to_string_lossy(),
+            ],
+        )
+        .is_err()
+        {
+            Self::run_command(
+                "mount",
+                &[
+                    "-t",
+                    "overlay",
+                    "overlay",
+                    "-o",
+                    &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir}"),
+                    &mount_point.to_string_lossy(),
+                ],
+            )?;
         }
 
         let sessions_dir = overlay_dir.join("sessions");
@@ -77,7 +99,8 @@ impl CowWorkspace {
         fs::write(
             sessions_dir.join(format!("{app_name}.json")),
             serde_json::to_string(&state).map_err(|e| format!("failed to serialize session state: {e}"))?,
-        ).map_err(|e| format!("failed to write session state: {e}"))?;
+        )
+        .map_err(|e| format!("failed to write session state: {e}"))?;
 
         Ok(CowWorkspace { mount_point, overlay_dir, loopback, loop_mount })
     }
@@ -244,7 +267,8 @@ pub fn sync_sessions(repo_root: &Path, app_name: Option<&str>) -> Result<(), Str
 /// Syncs changes from a single session's overlay upperdir to the repo root,
 /// then writes a `.synced` marker file.
 fn sync_session(sessions_dir: &Path, name: &str, state_path: &Path) -> Result<(), String> {
-    let state: SessionState = serde_json::from_str(&fs::read_to_string(state_path).map_err(|e| format!("failed to read session state: {e}"))?).map_err(|e| format!("failed to parse session state: {e}"))?;
+    let state: SessionState = serde_json::from_str(&fs::read_to_string(state_path).map_err(|e| format!("failed to read session state: {e}"))?)
+        .map_err(|e| format!("failed to parse session state: {e}"))?;
 
     if !is_mounted(Path::new(&state.mount_point)) {
         println!("{name}: session ended, removing state file");
@@ -317,9 +341,8 @@ fn sync_upper(upper_dir: &Path, repo_root: &Path, sessions_dir: &Path, app_name:
 /// Recursive helper that walks an upperdir directory, syncing files to repo_root,
 /// processing whiteouts and opaque markers, and building the new manifest.
 fn sync_upper_dir(
-    base: &Path, current: &Path, repo_root: &Path,
-    count_add: &mut usize, count_del: &mut usize,
-    _manifest_old: &BTreeSet<String>, manifest_new: &mut BTreeSet<String>,
+    base: &Path, current: &Path, repo_root: &Path, count_add: &mut usize, count_del: &mut usize, _manifest_old: &BTreeSet<String>,
+    manifest_new: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     let mut has_opq = false;
 
@@ -369,10 +392,7 @@ fn sync_upper_dir(
         }
 
         if metadata.is_file() {
-            let needs_copy = fs::read(&path)
-                .ok()
-                .and_then(|src| fs::read(&dest).ok().map(|dest_data| src != dest_data))
-                .unwrap_or(true);
+            let needs_copy = fs::read(&path).ok().and_then(|src| fs::read(&dest).ok().map(|dest_data| src != dest_data)).unwrap_or(true);
             if needs_copy {
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -398,10 +418,7 @@ fn sync_upper_dir(
 
 /// Deletes files from repo_dir that are hidden by an opaque marker — any file not
 /// present in the current upperdir manifest is removed from the host repo.
-fn delete_opaque_lower_files(
-    repo_dir: &Path, repo_root: &Path,
-    manifest_new: &BTreeSet<String>, count_del: &mut usize,
-) -> Result<(), String> {
+fn delete_opaque_lower_files(repo_dir: &Path, repo_root: &Path, manifest_new: &BTreeSet<String>, count_del: &mut usize) -> Result<(), String> {
     for entry in fs::read_dir(repo_dir).map_err(|e| format!("failed to read {}: {e}", repo_dir.display()))? {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
@@ -421,10 +438,7 @@ fn delete_opaque_lower_files(
 }
 
 fn load_manifest(path: &Path) -> BTreeSet<String> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 fn save_manifest(path: &Path, manifest: &BTreeSet<String>) -> Result<(), String> {

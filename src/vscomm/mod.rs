@@ -52,8 +52,8 @@ impl Frame {
         reader.read_exact(&mut header)?;
 
         let frame_type_raw = u16::from_le_bytes([header[0], header[1]]);
-        let frame_type =
-            FrameType::from_u16(frame_type_raw).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unknown frame type: {frame_type_raw}")))?;
+        let frame_type = FrameType::from_u16(frame_type_raw)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unknown frame type: {frame_type_raw}")))?;
 
         let payload_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
 
@@ -123,15 +123,9 @@ impl ExecRequest {
 
         let mut iter = parts.into_iter();
 
-        let cwd = iter
-            .next()
-            .map(|b| String::from_utf8_lossy(b).to_string())
-            .ok_or_else(|| "missing cwd".to_string())?;
+        let cwd = iter.next().map(|b| String::from_utf8_lossy(b).to_string()).ok_or_else(|| "missing cwd".to_string())?;
 
-        let command = iter
-            .next()
-            .map(|b| String::from_utf8_lossy(b).to_string())
-            .ok_or_else(|| "missing command".to_string())?;
+        let command = iter.next().map(|b| String::from_utf8_lossy(b).to_string()).ok_or_else(|| "missing command".to_string())?;
 
         let mut args = Vec::new();
         loop {

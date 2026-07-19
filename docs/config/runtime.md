@@ -35,9 +35,9 @@ By default, the quota is auto-computed by walking the repository (skipping exclu
 
 Per-project settings live in `.bunkerbox/project.conf` (auto-generated on first run). Edit this file to set an explicit quota or customize the exclude list.
 
-For projects that need host build tools inside the VM, see
-[Passthrough](../guides/passthrough.md) to whitelist commands like `make`,
-`cargo`, or `go` via vsock proxying.
+For projects that need host build tools inside the VM, see the
+[Project config](project.md) to whitelist commands via the `passthrough`
+setting. Full architecture in the [Passthrough guide](../guides/passthrough.md).
 
 ```yaml
 workspace: cow

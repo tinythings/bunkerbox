@@ -57,6 +57,8 @@ allow:
 
 When using copy-on-write mode, per-project settings are stored in `.bunkerbox/project.conf` (auto-generated on first run). This file takes precedence over the runtime config.
 
+For full documentation of every field, see [Project config](../config/project.md).
+
 ```yaml
 # Bunkerbox project configuration
 # Edit this file to customize behavior.

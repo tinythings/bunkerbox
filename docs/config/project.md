@@ -25,14 +25,18 @@ in your repo and you edit it freely.
 # Edit this file to customize behavior.
 
 project:
+  env: paranoid          # relaxed | paranoid | dangerous
   quota: auto
   exclude:
     - vendor/
     - docs/
   passthrough:
-    - "cargo *"
-    - "make *"
-    - "go *"
+    - "cargo build"
+    - "make"
+    - "go vet"
+
+sandbox:
+  bwrap: /usr/bin/bwrap   # optional, default: bwrap from PATH
 
 # Override shared runtime defaults (uncomment to use):
 # image:
@@ -49,18 +53,39 @@ project:
 Settings that describe *this* repository.
 
 **`env`** — controls how the guest VM environment is handled when proxying
-commands to the host. Two modes:
+commands to the host. Three modes:
 
 - `relaxed` (default) — guest environment variables pass through to the host
   command, except `HOME`, `PATH`, `XDG_*`, and `BUNKERBOX_*` which are
-  stripped.
+  stripped. Passthrough commands run inside a bubblewrap sandbox.
 - `paranoid` — the guest environment is fully dropped. Commands inherit the
   host daemon's environment only. Glob patterns in `passthrough` are
-  **rejected** — every entry must be an exact command name.
+  **rejected** — every entry must be an exact command or exact subcommand
+  (e.g. `cargo build`). Passthrough commands run inside a bubblewrap sandbox.
+- `dangerous` — guest environment is filtered like in `relaxed`, but the
+  bubblewrap sandbox is **disabled**. The command runs directly on the host.
+  This is useful as an escape hatch, but removes the filesystem/network
+  isolation that protects the host from malicious build files.
 
 Use `paranoid` when you want zero guest influence over host command execution.
 The AI can't set `LD_PRELOAD`, `RUSTFLAGS`, `PYTHONPATH`, or any other
 variable to manipulate the host toolchain.
+
+### `sandbox`
+
+Settings for the bubblewrap sandbox that wraps every passthrough command when
+`env` is `relaxed` or `paranoid`.
+
+**`bwrap`** — absolute path to a bubblewrap binary. If omitted, Bunkerbox
+looks for `bwrap` on the host `PATH`. The binary must be version `0.10.0`
+or newer.
+
+```yaml
+sandbox:
+  bwrap: /home/user/bin/bwrap
+```
+
+If `env` is `dangerous`, the `sandbox:` section is ignored.
 
 **`quota`** — upper-layer size limit for the copy-on-write workspace. Accepts
 `auto` (walk the repo, skip excluded dirs, add 10%, floor 5 GB), an explicit
@@ -72,12 +97,14 @@ These directories still live inside the loopback image (their writes count
 against the quota). They are merely excluded from the size estimate, not from
 the overlay. Common additions: `vendor/`, `docs/`, `out/`.
 
-**`passthrough`** — list of commands the AI agent is allowed to proxy from the
-VM to your host machine via vsock. Each entry is either an exact command name
-(`"make"` matches `make` with zero arguments only) or a command with an
-argument glob (`"make *"` matches `make` with any arguments, including zero).
-See the [Passthrough guide](../guides/passthrough.md) for the full
-architecture.
+**`passthrough`** — list of commands the AI agent is allowed to proxy from
+the VM to your host machine via vsock. In `relaxed` mode each entry is either
+an exact command name (`"make"` matches `make` with zero arguments only) or a
+command with an argument glob (`"make *"` matches `make` with any arguments,
+including zero). In `paranoid` mode glob patterns are rejected; use exact
+commands or exact subcommands such as `"cargo build"`, which matches
+`cargo build` plus any additional flags. See the
+[Passthrough guide](../guides/passthrough.md) for the full architecture.
 
 If `passthrough` is empty when the config is first loaded, Bunkerbox scans the
 repository for known build system files (`Cargo.toml`, `Makefile`,
@@ -126,6 +153,10 @@ are built in:
 | `build.gradle*` / `settings.gradle*` / `gradlew` | `gradle *`, `./gradlew *` |
 | `pom.xml` | `mvn *` |
 | `meson.build` | `meson *`, `ninja *` |
+
+The table shows the entries generated in `relaxed` mode. In `paranoid`
+mode, the same detectors add exact-subcommand entries instead, for example
+`cargo build`, `cargo test`, `make build`, and `go vet`.
 
 If your project has both a `Cargo.toml` and a `Makefile`, both show up.
 Detection only runs when the list is empty — once you've added a command,

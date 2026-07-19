@@ -64,6 +64,11 @@ For full documentation of every field, see [Project config](../config/project.md
 # Edit this file to customize behavior.
 
 project:
+  # Environment mode: relaxed (default), paranoid, or dangerous.
+  # relaxed/paranoid wrap passthrough commands in a bubblewrap sandbox.
+  # dangerous runs commands directly on the host.
+  env: relaxed
+
   # Quota for copy-on-write workspace. "auto" = walk repo (skipping excluded dirs), +10%, floor 5G.
   # Use "10G", "500M", etc. for an explicit size.
   quota: auto
@@ -83,11 +88,17 @@ project:
     - cmake-build-release/
 
   # Passthrough: commands proxied from VM to host via vsock.
-  # "make *" matches with any args. "make" matches only exact (no args).
+  # "make" matches no args. "make build" matches "make build ...".
+  # "make *" matches any args (relaxed/dangerous only; no globs in paranoid).
   # Auto-detected on first run if empty.
   passthrough:
-    - "make *"
-    - "cargo *"
+    - "make"
+    - "cargo build"
+
+sandbox:
+  # Absolute path to bubblewrap binary. Default is "bwrap" on PATH.
+  # Required when env is relaxed or paranoid.
+  bwrap: /usr/bin/bwrap
 
 # Override shared runtime defaults (optional, uncomment to use):
 # image:

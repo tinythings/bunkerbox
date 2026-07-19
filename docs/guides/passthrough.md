@@ -66,19 +66,24 @@ The whitelist lives in `.bunkerbox/project.conf` under the `passthrough` key:
 passthrough:
   - "make *"     # make with any arguments
   - "cargo *"    # cargo build, cargo test, cargo clippy...
-  - "go *"       # go build, go test, go vet...
+  - "go vet"     # go vet with any additional arguments
 ```
 
-Two syntax forms are supported:
+Three syntax forms are supported:
 
 | Entry | Matches |
 |---|---|
 | `"make"` | `make` with **no** arguments only |
+| `"make build"` | `make build` plus any additional arguments |
 | `"make *"` | `make` with **any** arguments (including zero) |
 
 The trailing `*` is a glob on arguments, not a shell wildcard. `"make *"` means
 "allow `make` with any number of arguments." `"make"` means "allow `make` only
-when called with no arguments at all."
+when called with no arguments at all." `"make build"` matches the default
+make target plus arbitrary extra arguments.
+
+Glob patterns are allowed only in `relaxed` and `dangerous` modes. `paranoid`
+mode rejects them and requires exact commands or exact subcommands.
 
 Commands that are not in the whitelist are not proxied. If the VM also lacks
 them, the agent gets a "command not found" — as it should be inside a bunker.
@@ -117,21 +122,27 @@ over.
 ## Security model
 
 **No unsolicited access.** Only commands explicitly listed in `passthrough` get
-proxied. The agent cannot call arbitrary host binaries.
+proxied.
 
-**No host exposure.** The daemon runs every command inside
-`.bunkerbox/workspace/` — the overlay mount point, not your real repository. The
-agent's work is isolated in the copy-on-write layer.
+**Filesystem sandbox.** In `relaxed` and `paranoid` modes, every proxied command
+runs inside a bubblewrap sandbox. The sandbox can see only read-only system
+directories (`/usr`, `/bin`, `/lib`, etc.) and the workspace mounted at
+`/workspace`. It has no access to your real `$HOME`, `~/.ssh`, `~/.aws`, or other
+projects. A malicious `Makefile` or `build.rs` can still execute, but it cannot
+read or write outside the workspace.
 
-**No system commands.** The whitelist is designed for build tools (`make`,
-`cargo`, `go`, `npm`, `meson`, etc.). There is no reason to put `rm`, `dd`,
-`curl`, `ssh`, or `sudo` in the whitelist — and if you do, you take the risk.
+**No network from passthrough.** By default the sandbox drops network access
+entirely (`--unshare-all`). A malicious build script cannot phone home or
+exfiltrate code over the network from the host.
 
-**Environment sanitization.** The guest VM passes its environment to the host
-daemon. Before spawning, the daemon strips `HOME`, `XDG_*`, `PATH`, `VSOCK_CID`,
-and `BUNKERBOX_*` variables from the guest environment. The command inherits the
-host's real `HOME`, so caches like `~/.cargo/registry`, `~/.cache/go-build`, and
-`~/.npm` are shared across sessions — no repeated downloads.
+**`dangerous` mode.** You can disable the sandbox with `env: dangerous`. In
+that mode commands run directly on the host with the same environment filtering
+as `relaxed`. This is an explicit opt-out and should be used only when you
+really need an unsandboxed host tool.
+
+**Environment sanitization.** In `relaxed` and `dangerous` modes, the daemon
+strips `HOME`, `PATH`, `XDG_*`, `VSOCK_CID`, and `BUNKERBOX_*` from the guest
+environment. In `paranoid` mode the guest environment is dropped entirely.
 
 **Quota.** The overlay workspace has a capped loopback image (`upper.img`). Its
 size is controlled by the `quota` setting in `project.conf`. The default auto-quota
@@ -139,8 +150,41 @@ is 5 GB. Set `quota: 20G` or higher if your builds produce large artifacts.
 
 ## Requirements
 
-The host needs the `vhost_vsock` kernel module. Most distributions include it by
-default. Verify with:
+The host needs:
+
+- The `vhost_vsock` kernel module (for the vsock passthrough channel).
+- [bubblewrap](https://github.com/containers/bubblewrap) version **0.10.0 or newer**
+  (unless you run with `env: dangerous`).
+
+If `bwrap` is not installed or is too old, install it from your distribution
+package manager or build it from source:
+
+```sh
+git clone https://github.com/containers/bubblewrap.git
+cd bubblewrap
+git checkout v0.11.0
+meson setup build
+meson compile -C build
+# use build/bwrap in .bunkerbox/project.conf:
+#   sandbox:
+#     bwrap: /absolute/path/to/build/bwrap
+```
+
+### vhost_vsock
+
+Most distributions include it by default. Verify with:
+
+```sh
+lsmod | grep vsock
+```
+
+If missing:
+
+```sh
+sudo modprobe vhost_vsock
+```
+
+The module must be loaded before starting Bunkerbox. If vsock is unavailable, the
 
 ```sh
 lsmod | grep vsock

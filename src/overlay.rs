@@ -4,7 +4,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::envconf::EnvConfig;
+use crate::cfg::ProjectConfig;
 
 /// A copy-on-write workspace using overlayfs and a loop-mounted ext4 image for upper storage.
 pub struct CowWorkspace {
@@ -27,7 +27,7 @@ impl CowWorkspace {
     /// Creates and mounts an overlay filesystem workspace with quota-limited storage,
     /// bind-mounting excluded paths to separate directories outside the overlay.
     pub fn setup(
-        repo_root: &Path, env_config: &EnvConfig, runtime_quota: u64, runtime_exclude: Option<&[String]>, app_name: &str,
+        repo_root: &Path, env_config: &ProjectConfig, runtime_quota: u64, runtime_exclude: Option<&[String]>, app_name: &str,
     ) -> Result<Self, String> {
         let overlay_dir = repo_root.join(".bunkerbox");
         let loopback = overlay_dir.join("upper.img");

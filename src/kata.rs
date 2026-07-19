@@ -1,4 +1,4 @@
-use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig};
+use crate::cfg::{HomeMode, NetworkMode, RuntimeConfig};
 use crate::vscomm::VSOCK_PORT;
 use crate::workspace::WorkspaceHandle;
 use aes_gcm::aead::consts::U12;

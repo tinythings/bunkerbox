@@ -486,3 +486,102 @@ fn load_or_create_accepts_paranoid_exact() {
     write_project_conf(root.path(), "project:\n  env: paranoid\n  passthrough:\n    - \"make\"\n    - \"cargo\"\n");
     assert!(ProjectConfig::load_or_create(root.path()).is_ok());
 }
+
+/// Dangerous env mode is parsed correctly.
+#[test]
+fn load_or_create_parses_dangerous() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(root.path(), "project:\n  env: dangerous\n  passthrough:\n    - \"make *\"\n");
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+    assert_eq!(cfg.project.env, EnvMode::Dangerous);
+}
+
+/// Dangerous env mode allows glob patterns.
+#[test]
+fn dangerous_allows_globs() {
+    let cfg = ProjectConfig {
+        project: ProjectSection { env: EnvMode::Dangerous, passthrough: vec!["make *".into()], ..Default::default() },
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+/// Absolute bwrap path is accepted.
+#[test]
+fn sandbox_bwrap_absolute_ok() {
+    let cfg = ProjectConfig {
+        project: ProjectSection {
+            env: EnvMode::Paranoid,
+            sandbox: SandboxConfig { bwrap: Some(PathBuf::from("/usr/bin/bwrap")) },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+/// Relative bwrap path is rejected.
+#[test]
+fn sandbox_bwrap_relative_rejected() {
+    let cfg = ProjectConfig {
+        project: ProjectSection { env: EnvMode::Paranoid, sandbox: SandboxConfig { bwrap: Some(PathBuf::from("./bwrap")) }, ..Default::default() },
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_err());
+}
+
+/// to_yaml emits dangerous env and custom bwrap path.
+#[test]
+fn to_yaml_shows_dangerous_and_sandbox() {
+    let cfg = ProjectConfig {
+        project: ProjectSection {
+            env: EnvMode::Dangerous,
+            quota: Some("auto".into()),
+            passthrough: vec!["make *".into()],
+            sandbox: SandboxConfig { bwrap: Some(PathBuf::from("/home/user/bin/bwrap")) },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let y = cfg.to_yaml();
+    assert!(y.contains("env: dangerous"));
+    assert!(y.contains("sandbox:"));
+    assert!(y.contains("bwrap: /home/user/bin/bwrap"));
+}
+
+/// Exact command matches only zero-argument invocation.
+#[test]
+fn is_allowed_exact_no_args_only() {
+    use crate::daemon::is_allowed;
+    assert!(is_allowed(&["make".into()], "make", &[]));
+    assert!(!is_allowed(&["make".into()], "make", &["build".into()]));
+}
+
+/// Exact subcommand prefix matches additional arguments.
+#[test]
+fn is_allowed_exact_prefix_matches_extra_args() {
+    use crate::daemon::is_allowed;
+    assert!(is_allowed(&["cargo build".into()], "cargo", &["build".into()]));
+    assert!(is_allowed(&["cargo build".into()], "cargo", &["build".into(), "--release".into()]));
+    assert!(!is_allowed(&["cargo build".into()], "cargo", &["test".into()]));
+    assert!(!is_allowed(&["cargo build".into()], "cargo", &[]));
+}
+
+/// Glob entry matches any arguments.
+#[test]
+fn is_allowed_glob_matches_any_args() {
+    use crate::daemon::is_allowed;
+    assert!(is_allowed(&["make *".into()], "make", &[]));
+    assert!(is_allowed(&["make *".into()], "make", &["build".into(), "release".into()]));
+    assert!(!is_allowed(&["make *".into()], "cargo", &["build".into()]));
+}
+
+/// Multi-word entries emitted by paranoid detectors now work.
+#[test]
+fn is_allowed_paranoid_detector_entries() {
+    use crate::daemon::is_allowed;
+    assert!(is_allowed(&["make build".into()], "make", &["build".into()]));
+    assert!(is_allowed(&["make test".into()], "make", &["test".into()]));
+    assert!(is_allowed(&["cargo check".into()], "cargo", &["check".into()]));
+    assert!(is_allowed(&["go vet".into()], "go", &["vet".into(), "./...".into()]));
+}

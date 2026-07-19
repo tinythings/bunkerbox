@@ -73,7 +73,12 @@ fn migrate_from_flat_env_conf() {
 #[test]
 fn to_yaml_produces_list_format() {
     let cfg = ProjectConfig {
-        project: ProjectSection { quota: Some("auto".into()), exclude: vec!["target/".into(), "build/".into()], passthrough: vec!["cargo *".into()] },
+        project: ProjectSection {
+            quota: Some("auto".into()),
+            exclude: vec!["target/".into(), "build/".into()],
+            passthrough: vec!["cargo *".into()],
+            ..Default::default()
+        },
         image: ImageOverrides::default(),
     };
     let y = cfg.to_yaml();
@@ -408,4 +413,76 @@ fn parse_size_parses_megabytes() {
 #[test]
 fn parse_size_returns_none_on_invalid() {
     assert_eq!(parse_size("xyz"), None);
+}
+
+/// Paranoid env mode rejects glob patterns in passthrough.
+#[test]
+fn paranoid_rejects_globs() {
+    let cfg = ProjectConfig {
+        project: ProjectSection { env: EnvMode::Paranoid, passthrough: vec!["make *".into()], ..Default::default() },
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_err());
+}
+
+/// Paranoid env mode accepts exact passthrough entries.
+#[test]
+fn paranoid_accepts_exact() {
+    let cfg = ProjectConfig {
+        project: ProjectSection { env: EnvMode::Paranoid, passthrough: vec!["make".into(), "cargo".into()], ..Default::default() },
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+/// Relaxed env mode permits glob patterns.
+#[test]
+fn relaxed_allows_globs() {
+    let cfg = ProjectConfig {
+        project: ProjectSection { env: EnvMode::Relaxed, passthrough: vec!["make *".into(), "cargo *".into()], ..Default::default() },
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+/// Default env mode is Relaxed.
+#[test]
+fn default_env_is_relaxed() {
+    let cfg = ProjectConfig::default();
+    assert_eq!(cfg.project.env, EnvMode::Relaxed);
+}
+
+/// Paranoid env mode writes env field to YAML.
+#[test]
+fn to_yaml_shows_paranoid() {
+    let cfg = ProjectConfig {
+        project: ProjectSection { env: EnvMode::Paranoid, quota: Some("auto".into()), passthrough: vec!["make".into()], ..Default::default() },
+        ..Default::default()
+    };
+    let y = cfg.to_yaml();
+    assert!(y.contains("env: paranoid"));
+}
+
+/// Default relaxed env mode is omitted from YAML.
+#[test]
+fn to_yaml_hides_relaxed() {
+    let cfg = ProjectConfig::default();
+    let y = cfg.to_yaml();
+    assert!(!y.contains("env:"));
+}
+
+/// load_or_create rejects globs when env: paranoid is set in existing config.
+#[test]
+fn load_or_create_rejects_paranoid_with_globs() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(root.path(), "project:\n  env: paranoid\n  passthrough:\n    - \"make *\"\n");
+    assert!(ProjectConfig::load_or_create(root.path()).is_err());
+}
+
+/// load_or_create accepts paranoid with exact-only passthrough.
+#[test]
+fn load_or_create_accepts_paranoid_exact() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(root.path(), "project:\n  env: paranoid\n  passthrough:\n    - \"make\"\n    - \"cargo\"\n");
+    assert!(ProjectConfig::load_or_create(root.path()).is_ok());
 }

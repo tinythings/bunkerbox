@@ -1,3 +1,4 @@
+use crate::cfg::EnvMode;
 use crate::vscomm::{ExecRequest, Frame, FrameType, VSOCK_PORT};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -7,6 +8,7 @@ use tokio::process::Command;
 
 struct VsockSession {
     passthrough: Arc<Vec<String>>,
+    env_mode: EnvMode,
     workspace: PathBuf,
 }
 
@@ -16,10 +18,10 @@ pub struct VsockDaemon {
 }
 
 impl VsockDaemon {
-    pub fn start(passthrough: Vec<String>, workspace: PathBuf) -> Result<Self, String> {
+    pub fn start(passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-        let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), workspace });
+        let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), env_mode, workspace });
 
         let join_handle = tokio::spawn(async move {
             let result = daemon_loop(session, shutdown_rx).await;
@@ -100,11 +102,13 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    for (key, val) in &req.env {
-        if key == "PATH" || key == "HOME" || key == "VSOCK_CID" || key.starts_with("BUNKERBOX_") || key.starts_with("XDG_") {
-            continue;
+    if session.env_mode == EnvMode::Relaxed {
+        for (key, val) in &req.env {
+            if key == "PATH" || key == "HOME" || key == "VSOCK_CID" || key.starts_with("BUNKERBOX_") || key.starts_with("XDG_") {
+                continue;
+            }
+            cmd.env(key, val);
         }
-        cmd.env(key, val);
     }
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", req.command))?;

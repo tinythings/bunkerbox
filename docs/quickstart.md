@@ -24,7 +24,7 @@ This formats the code and runs lint checks.
 
 ## Setup the host runtime
 
-Bunkerbox uses host runtime pieces such as containerd and Kata. Prepare them with:
+Bunkerbox needs containerd and its lightweight VM runtime. Set them up with:
 
 ```sh
 make setup

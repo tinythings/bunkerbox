@@ -28,7 +28,7 @@ spawns the real command inside the overlay workspace at `.bunkerbox/workspace/`,
 and streams stdout, stderr, and the exit code back.
 
 ```
-┌─ Kata VM ──────────────────────────────────────────┐
+┌─ Bunkerbox VM ──────────────────────────────────────┐
 │  AI agent calls "make build"                       │
 │    │                                               │
 │    ├─ /usr/local/bunkerbox/bin/make                │

@@ -54,11 +54,16 @@ pub enum HomeMode {
 #[serde(rename_all = "kebab-case")]
 pub enum EnvMode {
     /// Guest environment is selectively passed to the host command.
+    /// Passthrough commands run inside a bubblewrap sandbox.
     #[default]
     Relaxed,
     /// Guest environment is fully dropped. Commands inherit the host daemon's
     /// environment only. Glob patterns in `passthrough` are rejected.
+    /// Passthrough commands run inside a bubblewrap sandbox.
     Paranoid,
+    /// Guest environment is filtered and passed through, but the bubblewrap
+    /// sandbox is disabled. The command runs directly on the host. Use with care.
+    Dangerous,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +160,13 @@ pub struct ProjectConfig {
     pub image: ImageOverrides,
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SandboxConfig {
+    /// Optional absolute path to a bubblewrap binary.
+    /// If unset, "bwrap" is resolved from PATH.
+    pub bwrap: Option<PathBuf>,
+}
+
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectSection {
     #[serde(default)]
@@ -165,6 +177,8 @@ pub struct ProjectSection {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub passthrough: Vec<String>,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -207,6 +221,7 @@ impl ProjectConfig {
                 quota: Some("auto".into()),
                 exclude: Vec::new(),
                 passthrough: buildsys::scan(repo_root, PassthroughMode::Relaxed),
+                sandbox: SandboxConfig::default(),
             },
             image: ImageOverrides::default(),
         };
@@ -224,6 +239,11 @@ impl ProjectConfig {
                         "paranoid env mode: glob patterns are not allowed in passthrough. Found '{entry}'. Use exact command names only."
                     ));
                 }
+            }
+        }
+        if let Some(ref bwrap) = self.project.sandbox.bwrap {
+            if !Path::is_absolute(bwrap) {
+                return Err(format!("sandbox.bwrap must be an absolute path, got: {}", bwrap.display()));
             }
         }
         Ok(())
@@ -245,7 +265,13 @@ impl ProjectConfig {
                 .map_err(|e| format!("failed to parse legacy {}: {e}", legacy_path.display()))?;
 
         let cfg = ProjectConfig {
-            project: ProjectSection { env: EnvMode::default(), quota: old.quota, exclude: old.exclude, passthrough: old.passthrough },
+            project: ProjectSection {
+                env: EnvMode::default(),
+                quota: old.quota,
+                exclude: old.exclude,
+                passthrough: old.passthrough,
+                sandbox: SandboxConfig::default(),
+            },
             image: ImageOverrides::default(),
         };
         cfg.validate()?;
@@ -293,8 +319,10 @@ impl ProjectConfig {
         y.push_str("# Edit this file to customize behavior.\n\n");
 
         y.push_str("project:\n");
-        if self.project.env != EnvMode::Relaxed {
-            Self::yaml_field(&mut y, "  env", "paranoid");
+        match self.project.env {
+            EnvMode::Relaxed => {}
+            EnvMode::Paranoid => Self::yaml_field(&mut y, "  env", "paranoid"),
+            EnvMode::Dangerous => Self::yaml_field(&mut y, "  env", "dangerous"),
         }
         Self::yaml_field(&mut y, "  quota", self.project.quota.as_deref().unwrap_or("auto"));
         y.push_str("  exclude:\n");
@@ -337,6 +365,14 @@ impl ProjectConfig {
                 for host in allow {
                     y.push_str(&format!("    - {host}\n"));
                 }
+            }
+        }
+
+        if self.project.sandbox.bwrap.is_some() {
+            y.push('\n');
+            y.push_str("sandbox:\n");
+            if let Some(ref bwrap) = self.project.sandbox.bwrap {
+                Self::yaml_field(&mut y, "  bwrap", &bwrap.to_string_lossy());
             }
         }
 

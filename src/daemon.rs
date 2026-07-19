@@ -1,4 +1,5 @@
-use crate::cfg::EnvMode;
+use crate::cfg::{EnvMode, SandboxConfig};
+use crate::sandbox::{resolve_bwrap, Sandbox};
 use crate::vscomm::{ExecRequest, Frame, FrameType, VSOCK_PORT};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -10,6 +11,7 @@ struct VsockSession {
     passthrough: Arc<Vec<String>>,
     env_mode: EnvMode,
     workspace: PathBuf,
+    sandbox: Option<Sandbox>,
 }
 
 pub struct VsockDaemon {
@@ -18,10 +20,16 @@ pub struct VsockDaemon {
 }
 
 impl VsockDaemon {
-    pub fn start(passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf) -> Result<Self, String> {
+    pub fn start(passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, sandbox_config: SandboxConfig) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-        let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), env_mode, workspace });
+        let sandbox = if env_mode == EnvMode::Dangerous {
+            None
+        } else {
+            Some(Sandbox::new(resolve_bwrap(sandbox_config.bwrap.as_deref())?, workspace.clone()))
+        };
+
+        let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), env_mode, workspace, sandbox });
 
         let join_handle = tokio::spawn(async move {
             let result = daemon_loop(session, shutdown_rx).await;
@@ -98,17 +106,23 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     let mut cmd = Command::new(&req.command);
     cmd.args(&req.args);
     cmd.current_dir(&cwd);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
 
-    if session.env_mode == EnvMode::Relaxed {
+    if session.env_mode == EnvMode::Dangerous {
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
         for (key, val) in &req.env {
             if key == "PATH" || key == "HOME" || key == "VSOCK_CID" || key.starts_with("BUNKERBOX_") || key.starts_with("XDG_") {
                 continue;
             }
             cmd.env(key, val);
         }
+    } else {
+        let sandbox = session.sandbox.as_ref().ok_or_else(|| "sandbox not available for relaxed/paranoid mode".to_string())?;
+        cmd = sandbox.wrap(&req.command, &req.args, session.env_mode, &req.env)?;
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
     }
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", req.command))?;
@@ -155,15 +169,35 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     Ok(())
 }
 
-fn is_allowed(passthrough: &[String], command: &str, args: &[String]) -> bool {
+pub(crate) fn is_allowed(passthrough: &[String], command: &str, args: &[String]) -> bool {
     for entry in passthrough {
         let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        // Glob entry: "cmd *" allows the command with any arguments.
         if let Some(cmd) = entry.strip_suffix(" *") {
             if cmd.trim() == command {
                 return true;
             }
-        } else if entry == command && args.is_empty() {
-            return true;
+            continue;
+        }
+
+        // Exact/prefix entry: "cmd" matches zero args; "cmd sub" matches args starting with sub.
+        let mut parts = entry.split_whitespace();
+        if let Some(entry_cmd) = parts.next() {
+            if entry_cmd != command {
+                continue;
+            }
+            let prefix: Vec<&str> = parts.collect();
+            if prefix.is_empty() {
+                if args.is_empty() {
+                    return true;
+                }
+            } else if args.len() >= prefix.len() && prefix.iter().enumerate().all(|(i, p)| args[i].as_str() == *p) {
+                return true;
+            }
         }
     }
     false

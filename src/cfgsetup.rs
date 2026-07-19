@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, Write};
+use std::os::unix::fs::PermissionsExt;
 
-use crate::cfg::{EnvMode, ImageOverrides, ProjectConfig, ProjectSection, RuntimeConfig, WorkspaceMode};
+use crate::cfg::{EnvMode, ImageOverrides, ProjectConfig, ProjectSection, RuntimeConfig, SandboxConfig, WorkspaceMode};
 use crate::vscomm::buildsys;
 use crate::workspace;
 
@@ -26,7 +27,10 @@ pub fn run(runtime: Option<&RuntimeConfig>) -> Result<(), String> {
     let passthrough = build_passthrough(detected, env_mode)?;
     let overrides = pick_overrides(runtime)?;
 
-    let cfg = ProjectConfig { project: ProjectSection { env: env_mode, quota: Some(quota), exclude: Vec::new(), passthrough }, image: overrides };
+    let sandbox = if env_mode == EnvMode::Dangerous { SandboxConfig::default() } else { pick_bwrap_path()? };
+
+    let cfg =
+        ProjectConfig { project: ProjectSection { env: env_mode, quota: Some(quota), exclude: Vec::new(), passthrough, sandbox }, image: overrides };
 
     let path = repo_root.join(ProjectConfig::PATH);
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("failed to create {}: {e}", path.parent().unwrap().display()))?;
@@ -61,13 +65,15 @@ fn pick_quota() -> Result<String, String> {
 
 fn pick_env_mode() -> Result<EnvMode, String> {
     println!("  Env mode:");
-    println!("    [r] relaxed           (default)");
-    println!("    [p] paranoid");
+    println!("    [r] relaxed            (default) - sandboxed, globs allowed");
+    println!("    [p] paranoid           - sandboxed, exact commands only");
+    println!("    [d] dangerous          - no sandbox, use at your own risk");
     println!();
 
-    let key = key_press("  Pick [r]", &['r', 'p'], 'r')?;
+    let key = key_press("  Pick [r]", &['r', 'p', 'd'], 'r')?;
     Ok(match key {
         'p' => EnvMode::Paranoid,
+        'd' => EnvMode::Dangerous,
         _ => EnvMode::Relaxed,
     })
 }
@@ -261,4 +267,36 @@ fn read_line() -> Result<String, String> {
     let mut line = String::new();
     stdin.lock().read_line(&mut line).map_err(|e| format!("read: {e}"))?;
     Ok(line.trim().to_string())
+}
+
+fn pick_bwrap_path() -> Result<SandboxConfig, String> {
+    println!();
+    println!("  Bubblewrap sandbox binary:");
+    println!("    Enter an absolute path to a custom bwrap binary, or");
+    println!("    press Enter to use the system bwrap from PATH.");
+    println!();
+
+    loop {
+        print!("  bwrap path [system]: ");
+        io::stdout().flush().map_err(|e| format!("flush: {e}"))?;
+        let line = read_line()?;
+        if line.is_empty() {
+            return Ok(SandboxConfig::default());
+        }
+        let path = std::path::PathBuf::from(&line);
+        if !path.is_absolute() {
+            println!("  ! bwrap path must be absolute");
+            continue;
+        }
+        if !path.is_file() {
+            println!("  ! not a file: {}", path.display());
+            continue;
+        }
+        let metadata = std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            println!("  ! not executable: {}", path.display());
+            continue;
+        }
+        return Ok(SandboxConfig { bwrap: Some(path) });
+    }
 }

@@ -33,7 +33,7 @@ Uses overlayfs with a loopback ext4 image (stored at `.bunkerbox/upper.img` in t
 
 By default, the quota is auto-computed by walking the repository (skipping excluded directories) and adding 10% with a 1 GB floor. Build directories are excluded from the walk and bind-mounted to uncapped host storage under `.bunkerbox/build-workspace/`.
 
-Per-project settings live in `.bunkerbox/env.conf` (auto-generated on first run). Edit this file to set an explicit quota or customize the exclude list.
+Per-project settings live in `.bunkerbox/project.conf` (auto-generated on first run). Edit this file to set an explicit quota or customize the exclude list.
 
 For projects that need host build tools inside the VM, see
 [Passthrough](../guides/passthrough.md) to whitelist commands like `make`,
@@ -41,7 +41,7 @@ For projects that need host build tools inside the VM, see
 
 ```yaml
 workspace: cow
-workspace_quota: 10G     # optional, fallback when env.conf has no explicit quota
+workspace_quota: 10G     # optional, fallback when project.conf has no explicit quota
 workspace_exclude:       # optional, fallback exclude patterns
   - target/
 ```

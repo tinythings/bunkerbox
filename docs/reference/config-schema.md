@@ -53,38 +53,48 @@ allow:
   - hostname
 ```
 
-## Workspace env.conf
+## Workspace project.conf
 
-When using copy-on-write mode, per-project settings are stored in `.bunkerbox/env.conf` (auto-generated on first run). This file takes precedence over the runtime config.
+When using copy-on-write mode, per-project settings are stored in `.bunkerbox/project.conf` (auto-generated on first run). This file takes precedence over the runtime config.
 
 ```yaml
-# Bunkerbox workspace configuration
+# Bunkerbox project configuration
 # Edit this file to customize behavior.
 
-# Quota for copy-on-write workspace. "auto" = walk repo (skipping excluded dirs), +10%, floor 5G.
-# Use "10G", "500M", etc. for an explicit size.
-quota: auto
+project:
+  # Quota for copy-on-write workspace. "auto" = walk repo (skipping excluded dirs), +10%, floor 5G.
+  # Use "10G", "500M", etc. for an explicit size.
+  quota: auto
 
-# Directories excluded from the auto-quota walk (their output still uses the loopback image).
-exclude:
-  - target/
-  - node_modules/
-  - .venv/
-  - venv/
-  - build/
-  - __pycache__/
-  - dist/
-  - .next/
-  - .gradle/
-  - cmake-build-debug/
-  - cmake-build-release/
+  # Directories excluded from the auto-quota walk (their output still uses the loopback image).
+  exclude:
+    - target/
+    - node_modules/
+    - .venv/
+    - venv/
+    - build/
+    - __pycache__/
+    - dist/
+    - .next/
+    - .gradle/
+    - cmake-build-debug/
+    - cmake-build-release/
 
-# Passthrough: commands proxied from VM to host via vsock.
-# "make *" matches with any args. "make" matches only exact (no args).
-# Auto-detected on first run if empty.
-passthrough:
-  - "make *"
-  - "cargo *"
+  # Passthrough: commands proxied from VM to host via vsock.
+  # "make *" matches with any args. "make" matches only exact (no args).
+  # Auto-detected on first run if empty.
+  passthrough:
+    - "make *"
+    - "cargo *"
+
+# Override shared runtime defaults (optional, uncomment to use):
+# image:
+#   workspace: direct
+#   home: persist
+#   home_path: /custom/path
+#   session_mb: 200
+#   allow:
+#     - extra.api.example.com
 ```
 
 During development, runtime configs live in `runtime/`. In a packaged install, they live under:

@@ -143,7 +143,7 @@ cd ~/bunkerbox-tutorial
 
 Replace `/path/to/bunkerbox` with the actual path to the cloned repository.
 
-Open `.bunkerbox/env.conf`. You should see something like:
+Open `.bunkerbox/project.conf`. You should see something like:
 
 ```yaml
 quota: auto
@@ -164,7 +164,7 @@ also be there.
 Verify it was detected:
 
 ```sh
-grep -A2 passthrough .bunkerbox/env.conf
+grep -A2 passthrough .bunkerbox/project.conf
 ```
 
 *Why `prepare`?* This step is like `npm install` or `cargo init` — it
@@ -293,7 +293,7 @@ sudo modprobe vhost_vsock
 
 **"bunkerbox-vscomm: installed 0 passthrough commands"**
 The auto-detection didn't find a build system, or your `passthrough` list is
-empty. Edit `.bunkerbox/env.conf` and add your tools manually.
+empty. Edit `.bunkerbox/project.conf` and add your tools manually.
 
 **Build failures inside the AI session**
 The passthrough only proxies whitelisted commands. If the AI tries `rustup`,
@@ -302,7 +302,7 @@ VM), the call fails. The agent gets "command not found" — which is correct
 inside a bunker.
 
 **The AI asks for tools you didn't whitelist**
-Add them. Edit `.bunkerbox/env.conf`, add the command to `passthrough`, and
+Add them. Edit `.bunkerbox/project.conf`, add the command to `passthrough`, and
 run the session again. The symlinks are created fresh on every boot.
 
 ---

@@ -131,46 +131,45 @@ std::iter::Sum`. The AI needs to figure that out and fix it.
 compile, fail, read the error, fix the code, recompile, succeed. If the
 project already builds, the AI has nothing to demonstrate.
 
-## Step 5 — Prepare the workspace
+## Step 5 — Configure the workspace
 
-Bunkerbox needs a workspace configuration. This step creates `.bunkerbox/` in
-your project root and auto-detects what build tools you use.
+Bunkerbox needs a project configuration. Use the interactive wizard:
 
 ```sh
 cd ~/bunkerbox-tutorial
-/path/to/bunkerbox/demo/kilocode/kilo --share /path/to/bunkerbox/demo/kilocode/share prepare
+/path/to/bunkerbox/target/debug/bunkerbox config
 ```
 
-Replace `/path/to/bunkerbox` with the actual path to the cloned repository.
-
-Open `.bunkerbox/project.conf`. You should see something like:
+The wizard detects your build system (`Makefile`, `Cargo.toml`), asks you
+a few questions, and writes `.bunkerbox/project.conf`. Press Enter on every
+prompt to accept the defaults. In seconds you'll have:
 
 ```yaml
-quota: auto
-exclude:
-  - target/
-  - node_modules/
-  - .venv/
-  - ...
-passthrough:
-  - "cargo *"
+# .bunkerbox/project.conf
+project:
+  quota: auto
+  passthrough:
+    - "make *"
+    - "cargo *"
 ```
 
-The `passthrough` section is the key. `"cargo *"` means: "let the AI call
-`cargo` with any arguments." Bunkerbox detected `Cargo.toml` in your project
-root and added it automatically. If you had a `Makefile` too, `"make *"` would
-also be there.
+The `passthrough` section is the key. `"cargo *"` means "let the AI call
+`cargo` with any arguments." The wizard auto-detected both build systems and
+added them automatically.
 
-Verify it was detected:
+To see current values from a packaged runtime config, pass `--share`:
 
 ```sh
-grep -A2 passthrough .bunkerbox/project.conf
+/path/to/bunkerbox/target/debug/bunkerbox config --share /path/to/bunkerbox/demo/kilocode/share
 ```
 
-*Why `prepare`?* This step is like `npm install` or `cargo init` — it
-bootstraps the project for Bunkerbox. It creates the overlay image, the
-workspace directory, and the config file. It only needs to run once per
-project.
+This shows the actual workspace mode, current allowed hosts, and session
+size from the KiloCode config — so you know what you're overriding.
+
+*Why a wizard?* Most people don't know YAML, don't know the field names,
+and shouldn't need to read documentation to configure a project. The wizard
+asks questions in plain English, shows current values, and writes a correct
+file. It only needs to run once per project.
 
 ## Step 6 — Let the AI work
 
@@ -293,7 +292,8 @@ sudo modprobe vhost_vsock
 
 **"bunkerbox-vscomm: installed 0 passthrough commands"**
 The auto-detection didn't find a build system, or your `passthrough` list is
-empty. Edit `.bunkerbox/project.conf` and add your tools manually.
+empty. Run `bunkerbox config` to set it up interactively, or edit
+`.bunkerbox/project.conf` manually.
 
 **Build failures inside the AI session**
 The passthrough only proxies whitelisted commands. If the AI tries `rustup`,
@@ -302,8 +302,9 @@ VM), the call fails. The agent gets "command not found" — which is correct
 inside a bunker.
 
 **The AI asks for tools you didn't whitelist**
-Add them. Edit `.bunkerbox/project.conf`, add the command to `passthrough`, and
-run the session again. The symlinks are created fresh on every boot.
+Add them. Run `bunkerbox config` or edit `.bunkerbox/project.conf`, add the
+command to `passthrough`, and run the session again. The symlinks are created
+fresh on every boot.
 
 ---
 

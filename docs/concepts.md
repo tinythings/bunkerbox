@@ -58,6 +58,20 @@ Hooks are shell snippets inside an image config. They run inside the container a
 
 Hooks are useful for small setup and cleanup tasks. For example, a hook can prepare config files, mark `/workspace` as a safe Git directory, or remove cache before state is saved.
 
+## Passthrough
+
+Many projects need build tools like `cargo`, `make`, or `go` that are not
+installed inside the isolated VM. Passthrough proxies whitelisted commands from
+the VM to the host via vsock, so the AI agent can run builds, tests, and
+linters transparently — without giving it real access to your host machine.
+
+All commands run inside the overlay workspace. Output streams back to the agent
+in real time. When the container exits, changes are auto-synced to your
+repository.
+
+See the [Passthrough guide](guides/passthrough.md) for setup and
+configuration.
+
 ## Packaging
 
 Packaging makes a tool feel like a normal command. The package installs the Bunkerbox binary, an app command symlink, a runtime config, and the OCI archive.

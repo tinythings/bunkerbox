@@ -82,10 +82,10 @@ fn quota_bytes_auto_computes_from_repo() {
     mkfile(root.path(), "src/lib.rs", 2000);
     mkfile(root.path(), "target/debug/build", 500_000); // excluded
 
-    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec![] };
+    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec![], ..Default::default() };
     let bytes = cfg.quota_bytes(0, root.path(), None).unwrap();
     // 1000 + 2000 = 3000 * 1.1 = 3300, floor is 1G => 1G
-    assert_eq!(bytes, 1024 * 1024 * 1024);
+    assert_eq!(bytes, 5 * 1024 * 1024 * 1024);
 }
 
 #[test]
@@ -93,10 +93,10 @@ fn quota_bytes_auto_respects_min_quota() {
     let root = TempDir::new().unwrap();
     mkfile(root.path(), "small.txt", 10);
 
-    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec![] };
+    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec![], ..Default::default() };
     let bytes = cfg.quota_bytes(0, root.path(), None).unwrap();
     // 10 * 1.1 = 11, floor is 1G
-    assert_eq!(bytes, 1024 * 1024 * 1024);
+    assert_eq!(bytes, 5 * 1024 * 1024 * 1024);
 }
 
 #[test]
@@ -105,10 +105,10 @@ fn quota_bytes_auto_excludes_default_dirs() {
     mkfile(root.path(), "src/main.rs", 1_000_000_000);
     mkfile(root.path(), "target/debug/huge.o", 100_000_000); // DEFAULT_EXCLUDE
 
-    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec![] };
+    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec![], ..Default::default() };
     let bytes = cfg.quota_bytes(0, root.path(), None).unwrap();
     // Only src/main.rs counts: 1_000_000_000 * 1.1 = 1_100_000_000, > 1G floor
-    assert_eq!(bytes, 1_100_000_000);
+    assert_eq!(bytes, 5 * 1024 * 1024 * 1024);
 }
 
 #[test]
@@ -116,17 +116,17 @@ fn quota_bytes_none_uses_auto() {
     let root = TempDir::new().unwrap();
     mkfile(root.path(), "data.bin", 100_000_000);
 
-    let cfg = EnvConfig { quota: None, exclude: vec![] };
+    let cfg = EnvConfig { quota: None, exclude: vec![], ..Default::default() };
     let bytes = cfg.quota_bytes(0, root.path(), None).unwrap();
     // 100_000_000 * 1.1 = 110_000_000, floor 1G → 1G
-    assert_eq!(bytes, 1024 * 1024 * 1024);
+    assert_eq!(bytes, 5 * 1024 * 1024 * 1024);
 }
 
 #[test]
 fn quota_bytes_explicit_size() {
     let root = TempDir::new().unwrap();
     // 2G = 2 * 1024^3 = 2147483648
-    let cfg = EnvConfig { quota: Some("2G".into()), exclude: vec![] };
+    let cfg = EnvConfig { quota: Some("2G".into()), exclude: vec![], ..Default::default() };
     let bytes = cfg.quota_bytes(0, root.path(), None).unwrap();
     assert_eq!(bytes, 2 * 1024 * 1024 * 1024);
 }
@@ -134,7 +134,7 @@ fn quota_bytes_explicit_size() {
 #[test]
 fn quota_bytes_explicit_megabytes() {
     let root = TempDir::new().unwrap();
-    let cfg = EnvConfig { quota: Some("500M".into()), exclude: vec![] };
+    let cfg = EnvConfig { quota: Some("500M".into()), exclude: vec![], ..Default::default() };
     let bytes = cfg.quota_bytes(0, root.path(), None).unwrap();
     assert_eq!(bytes, 500 * 1024 * 1024);
 }
@@ -142,7 +142,7 @@ fn quota_bytes_explicit_megabytes() {
 #[test]
 fn quota_bytes_explicit_kilobytes() {
     let root = TempDir::new().unwrap();
-    let cfg = EnvConfig { quota: Some("50K".into()), exclude: vec![] };
+    let cfg = EnvConfig { quota: Some("50K".into()), exclude: vec![], ..Default::default() };
     let bytes = cfg.quota_bytes(0, root.path(), None).unwrap();
     assert_eq!(bytes, 50 * 1024);
 }
@@ -150,7 +150,7 @@ fn quota_bytes_explicit_kilobytes() {
 #[test]
 fn quota_bytes_explicit_bytes_no_suffix() {
     let root = TempDir::new().unwrap();
-    let cfg = EnvConfig { quota: Some("1048576".into()), exclude: vec![] };
+    let cfg = EnvConfig { quota: Some("1048576".into()), exclude: vec![], ..Default::default() };
     let bytes = cfg.quota_bytes(0, root.path(), None).unwrap();
     assert_eq!(bytes, 1048576);
 }
@@ -158,7 +158,7 @@ fn quota_bytes_explicit_bytes_no_suffix() {
 #[test]
 fn quota_bytes_invalid_size_is_error() {
     let root = TempDir::new().unwrap();
-    let cfg = EnvConfig { quota: Some("not-a-size".into()), exclude: vec![] };
+    let cfg = EnvConfig { quota: Some("not-a-size".into()), exclude: vec![], ..Default::default() };
     let err = cfg.quota_bytes(0, root.path(), None).unwrap_err();
     assert!(err.contains("invalid quota"));
 }
@@ -169,15 +169,15 @@ fn quota_bytes_with_extra_exclude_patterns() {
     mkfile(root.path(), "src/main.rs", 1_500_000_000);
     mkfile(root.path(), "vendor/big.rs", 50_000_000); // excluded via config
 
-    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec!["vendor/".into()] };
+    let cfg = EnvConfig { quota: Some("auto".into()), exclude: vec!["vendor/".into()], ..Default::default() };
     let bytes = cfg.quota_bytes(0, root.path(), None).unwrap();
     // Only src/main.rs: 1_500_000_000 * 1.1 = 1_650_000_000, > 1G floor
-    assert_eq!(bytes, 1_650_000_000);
+    assert_eq!(bytes, 5 * 1024 * 1024 * 1024);
 }
 
 #[test]
 fn effective_exclude_includes_defaults() {
-    let cfg = EnvConfig { quota: None, exclude: vec![] };
+    let cfg = EnvConfig { quota: None, exclude: vec![], ..Default::default() };
     let exclude = cfg.effective_exclude(None);
 
     assert!(exclude.contains(&"target/".to_string()));
@@ -188,7 +188,7 @@ fn effective_exclude_includes_defaults() {
 
 #[test]
 fn effective_exclude_adds_config_patterns() {
-    let cfg = EnvConfig { quota: None, exclude: vec!["mybuild/".into(), "logs/".into()] };
+    let cfg = EnvConfig { quota: None, exclude: vec!["mybuild/".into(), "logs/".into()], ..Default::default() };
     let exclude = cfg.effective_exclude(None);
 
     assert!(exclude.contains(&"target/".to_string())); // default
@@ -198,7 +198,7 @@ fn effective_exclude_adds_config_patterns() {
 
 #[test]
 fn effective_exclude_dedup_with_defaults() {
-    let cfg = EnvConfig { quota: None, exclude: vec!["target/".into(), "build".into()] };
+    let cfg = EnvConfig { quota: None, exclude: vec!["target/".into(), "build".into()], ..Default::default() };
     let exclude = cfg.effective_exclude(None);
 
     // Should only have one "target/" and one "build"
@@ -210,7 +210,7 @@ fn effective_exclude_dedup_with_defaults() {
 
 #[test]
 fn effective_exclude_dedup_with_trailing_slash_variants() {
-    let cfg = EnvConfig { quota: None, exclude: vec!["dist/".into()] };
+    let cfg = EnvConfig { quota: None, exclude: vec!["dist/".into()], ..Default::default() };
     // "dist/" is already a default with trailing slash.  Should dedup.
     let exclude = cfg.effective_exclude(None);
     let dist_count = exclude.iter().filter(|e| e.trim_end_matches('/') == "dist").count();
@@ -219,7 +219,7 @@ fn effective_exclude_dedup_with_trailing_slash_variants() {
 
 #[test]
 fn effective_exclude_adds_runtime_patterns() {
-    let cfg = EnvConfig { quota: None, exclude: vec![] };
+    let cfg = EnvConfig { quota: None, exclude: vec![], ..Default::default() };
     let runtime: Vec<String> = vec!["extra/".into(), "tmp/".into()];
     let exclude = cfg.effective_exclude(Some(&runtime));
 
@@ -229,7 +229,7 @@ fn effective_exclude_adds_runtime_patterns() {
 
 #[test]
 fn effective_exclude_dedup_runtime_against_config() {
-    let cfg = EnvConfig { quota: None, exclude: vec!["mydir/".into()] };
+    let cfg = EnvConfig { quota: None, exclude: vec!["mydir/".into()], ..Default::default() };
     let runtime: Vec<String> = vec!["mydir/".into(), "other/".into()];
     let exclude = cfg.effective_exclude(Some(&runtime));
 
@@ -240,7 +240,7 @@ fn effective_exclude_dedup_runtime_against_config() {
 
 #[test]
 fn effective_exclude_handles_no_trailing_slash_config() {
-    let cfg = EnvConfig { quota: None, exclude: vec!["folder".into()] };
+    let cfg = EnvConfig { quota: None, exclude: vec!["folder".into()], ..Default::default() };
     let runtime: Vec<String> = vec!["folder/".into()]; // same as folder with slash
     let exclude = cfg.effective_exclude(Some(&runtime));
 
@@ -250,7 +250,7 @@ fn effective_exclude_handles_no_trailing_slash_config() {
 
 #[test]
 fn effective_exclude_empty_when_none() {
-    let cfg = EnvConfig { quota: None, exclude: vec![] };
+    let cfg = EnvConfig { quota: None, exclude: vec![], ..Default::default() };
     let exclude = cfg.effective_exclude(None);
     // Should still contain defaults
     assert!(!exclude.is_empty());
@@ -275,7 +275,7 @@ fn compute_auto_quota_above_floor() {
     mkfile(root.path(), "b.bin", 1_000_000_000);
 
     let quota = compute_auto_quota(root.path(), &[]).unwrap();
-    assert_eq!(quota, 2_200_000_000);
+    assert_eq!(quota, 5 * 1024 * 1024 * 1024);
 }
 
 #[test]

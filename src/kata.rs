@@ -1,8 +1,9 @@
-use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig, WorkspaceMode};
-use crate::workspace::{self, WorkspaceHandle};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use aes_gcm::aead::Aead;
+use crate::runtime::{HomeMode, NetworkMode, RuntimeConfig};
+use crate::vscomm::VSOCK_PORT;
+use crate::workspace::WorkspaceHandle;
 use aes_gcm::aead::consts::U12;
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::Rng;
 use sha2::Sha256;
@@ -19,20 +20,15 @@ const BRIDGE_NAME: &str = "bunkerbox0";
 
 /// Runs the Kata container with the given runtime configuration.
 ///
-/// Sets up containerd, workspace, optional bridge networking,
-/// home directory encryption, session storage, and launches the container
-/// via `sudo ctr run` with the Kata runtime.
+/// Sets up containerd, optional bridge networking, home directory
+/// encryption, session storage, and launches the container via
+/// `sudo ctr run` with the Kata runtime.  The workspace must already
+/// be resolved by the caller.
 ///
 /// # Returns
 /// `Ok(())` on successful container execution, `Err(String)` on failure.
 pub fn run(
-    config: &RuntimeConfig,
-    workspace_mode: WorkspaceMode,
-    quota: u64,
-    runtime_exclude: Option<&[String]>,
-    container_name: &str,
-    _share_dir: &Path,
-    app_name: &str,
+    config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, _share_dir: &Path, app_name: &str, vsock_enabled: bool,
 ) -> Result<(), String> {
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
@@ -40,15 +36,12 @@ pub fn run(
 
     check_containerd_version()?;
 
-    let home_path = (config.home == Some(HomeMode::Persist))
-        .then(|| config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)));
+    let home_path = (config.home == Some(HomeMode::Persist)).then(|| config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)));
 
     let needs_bridge = config.network == Some(NetworkMode::Bridge);
     let ctr_name = container_name.to_string();
     let oci_path = config.oci.to_string_lossy().into_owned();
     let image_tag = config.image.clone();
-    let wm_name = app_name.to_string();
-    let wm_exclude = runtime_exclude.map(|v| v.to_vec());
 
     let user = current_user_spec()?;
     let Some((uid, gid)) = user.split_once(':') else {
@@ -58,9 +51,7 @@ pub fn run(
     run_command_allow_failure("sudo", &["mkdir", "-p", &format!("{}", runtime_dir.display())])?;
     run_command_quiet("sudo", &["chown", &user, &format!("{}", runtime_dir.display())])?;
 
-    let setup_handle = std::thread::spawn(move || -> Result<WorkspaceHandle, String> {
-        let workspace = workspace::resolve(workspace_mode, quota, wm_exclude.as_deref(), &wm_name)?;
-
+    let setup_handle = std::thread::spawn(move || -> Result<(), String> {
         let active = Command::new("sudo")
             .args(["systemctl", "is-active", "containerd"])
             .stdout(Stdio::null())
@@ -80,7 +71,7 @@ pub fn run(
         let _ = run_command_allow_failure("sudo", &["ctr", "images", "rm", &image_tag]);
         run_command_quiet("sudo", &["ctr", "images", "import", &oci_path])?;
 
-        Ok(workspace)
+        Ok(())
     });
 
     let encrypt_patterns: &[String] = config.encrypt.as_deref().unwrap_or(&[]);
@@ -113,11 +104,11 @@ pub fn run(
         None
     };
 
-    let workspace = match setup_handle.join() {
-        Ok(Ok(ws)) => ws,
+    match setup_handle.join() {
+        Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err("setup thread panicked".to_string()),
-    };
+    }
 
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
 
@@ -144,6 +135,11 @@ pub fn run(
     } else {
         None
     };
+
+    if vsock_enabled {
+        container_env.push(format!("BUNKERBOX_VSOCK_PORT={VSOCK_PORT}"));
+    }
+
     let mut args = Vec::new();
 
     if config.network == Some(NetworkMode::Bridge) {
@@ -400,8 +396,10 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
     }
 
     let temp = user_data_dir().join(format!("bunkerbox/runtime/cni-{}.conflist", std::process::id()));
-    fs::write(&temp, format!(
-        r#"{{
+    fs::write(
+        &temp,
+        format!(
+            r#"{{
   "cniVersion": "0.4.0",
   "name": "bunkerbox",
   "plugins": [
@@ -426,9 +424,11 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
   ]
 }}
 "#,
-        bridge = BRIDGE_NAME,
-        subnet = BRIDGE_SUBNET,
-    )).map_err(|err| format!("failed to write {}: {err}", temp.display()))?;
+            bridge = BRIDGE_NAME,
+            subnet = BRIDGE_SUBNET,
+        ),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", temp.display()))?;
 
     let result = run_command(
         "sudo",
@@ -451,10 +451,7 @@ fn remove_stale_container(container_name: &str) -> Result<(), String> {
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "kill", "--signal", "SIGKILL", container_name]);
     let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "delete", "--force", container_name]);
     let _ = run_command_allow_failure("sudo", &["ctr", "containers", "rm", container_name]);
-    let _ = run_command_allow_failure(
-        "sudo",
-        &["rm", "-f", &format!("/var/lib/cni/networks/{BRIDGE_NAME}/{container_name}")],
-    );
+    let _ = run_command_allow_failure("sudo", &["rm", "-f", &format!("/var/lib/cni/networks/{BRIDGE_NAME}/{container_name}")]);
     Ok(())
 }
 
@@ -719,10 +716,7 @@ fn check_containerd_version() -> Result<(), String> {
         return Ok(());
     }
 
-    let output = Command::new("containerd")
-        .arg("--version")
-        .output()
-        .map_err(|err| format!("failed to run containerd --version: {err}"))?;
+    let output = Command::new("containerd").arg("--version").output().map_err(|err| format!("failed to run containerd --version: {err}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -731,9 +725,15 @@ fn check_containerd_version() -> Result<(), String> {
         if parts.len() != 3 {
             continue;
         }
-        let Ok(major): Result<u32, _> = parts[0].parse() else { continue; };
-        let Ok(minor): Result<u32, _> = parts[1].parse() else { continue; };
-        let Ok(patch): Result<u32, _> = parts[2].parse() else { continue; };
+        let Ok(major): Result<u32, _> = parts[0].parse() else {
+            continue;
+        };
+        let Ok(minor): Result<u32, _> = parts[1].parse() else {
+            continue;
+        };
+        let Ok(patch): Result<u32, _> = parts[2].parse() else {
+            continue;
+        };
 
         if (major, minor, patch) < (2, 2, 5) {
             return Err(format!(

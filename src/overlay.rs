@@ -12,7 +12,6 @@ pub struct CowWorkspace {
     overlay_dir: PathBuf,
     loopback: PathBuf,
     loop_mount: PathBuf,
-    bind_mounts: Vec<PathBuf>,
 }
 
 /// Persisted state for an active overlay session, saved so it can be synced later.
@@ -63,32 +62,30 @@ impl CowWorkspace {
         let lowerdir = repo_root.to_string_lossy();
         let upperdir = upper_dir.to_string_lossy();
         let workdir = work_dir.to_string_lossy();
-        if Self::run_command_allow_failure("mount", &["-t", "overlay", "overlay", "-o", &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir},redirect_dir=on"), &mount_point.to_string_lossy()]).is_err() {
-            Self::run_command("mount", &["-t", "overlay", "overlay", "-o", &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir}"), &mount_point.to_string_lossy()])?;
-        }
-
-        let mut bind_mounts: Vec<PathBuf> = Vec::new();
-        for pattern in env_config.effective_exclude(runtime_exclude) {
-            let src_path = repo_root.join(&pattern);
-
-            if src_path.exists() {
-                if let Ok(meta) = fs::symlink_metadata(&src_path) {
-                    if meta.file_type().is_symlink() {
-                        eprintln!("bunkerbox: warning: {} is a symlink, skipping bind mount", src_path.display());
-                        continue;
-                    }
-                }
-            }
-
-            let bind_src = overlay_dir.join("build-workspace").join(&pattern);
-            let bind_dst = mount_point.join(&pattern);
-
-            fs::create_dir_all(&bind_src).map_err(|e| format!("failed to create {}: {e}", bind_src.display()))?;
-            fs::create_dir_all(&bind_dst).map_err(|e| format!("failed to create {}: {e}", bind_dst.display()))?;
-
-            Self::run_command("mount", &["--bind", &bind_src.to_string_lossy(), &bind_dst.to_string_lossy()])?;
-
-            bind_mounts.push(bind_dst);
+        if Self::run_command_allow_failure(
+            "mount",
+            &[
+                "-t",
+                "overlay",
+                "overlay",
+                "-o",
+                &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir},redirect_dir=on"),
+                &mount_point.to_string_lossy(),
+            ],
+        )
+        .is_err()
+        {
+            Self::run_command(
+                "mount",
+                &[
+                    "-t",
+                    "overlay",
+                    "overlay",
+                    "-o",
+                    &format!("lowerdir={lowerdir},upperdir={upperdir},workdir={workdir}"),
+                    &mount_point.to_string_lossy(),
+                ],
+            )?;
         }
 
         let sessions_dir = overlay_dir.join("sessions");
@@ -102,9 +99,10 @@ impl CowWorkspace {
         fs::write(
             sessions_dir.join(format!("{app_name}.json")),
             serde_json::to_string(&state).map_err(|e| format!("failed to serialize session state: {e}"))?,
-        ).map_err(|e| format!("failed to write session state: {e}"))?;
+        )
+        .map_err(|e| format!("failed to write session state: {e}"))?;
 
-        Ok(CowWorkspace { mount_point, overlay_dir, loopback, loop_mount, bind_mounts })
+        Ok(CowWorkspace { mount_point, overlay_dir, loopback, loop_mount })
     }
 
     /// Ensures `.bunkerbox/` is listed in the repo's `.gitignore` file.
@@ -133,10 +131,6 @@ impl CowWorkspace {
 
     /// Unmounts stale overlay and loop mounts from previous runs, then detaches the loop device.
     fn cleanup_stale(mount_point: &Path, loop_mount: &Path, loopback: &Path) -> Result<(), String> {
-        for mnt in parse_bind_mounts_under(mount_point).iter().rev() {
-            Self::run_command_allow_failure("umount", &[&mnt.to_string_lossy()])?;
-        }
-
         Self::run_command_allow_failure("umount", &[&mount_point.to_string_lossy()])?;
 
         Self::run_command_allow_failure("umount", &[&loop_mount.to_string_lossy()])?;
@@ -214,27 +208,6 @@ impl CowWorkspace {
     }
 }
 
-/// Parses `/proc/mounts` for bind mounts nested under the given mount point,
-/// returning them sorted deepest-first for correct unmount ordering.
-fn parse_bind_mounts_under(mount_point: &Path) -> Vec<PathBuf> {
-    let Ok(contents) = fs::read_to_string("/proc/mounts") else {
-        return Vec::new();
-    };
-    let prefix = mount_point.to_string_lossy();
-    let mut mounts: Vec<PathBuf> = Vec::new();
-    for line in contents.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let mnt = parts[1];
-            if mnt.starts_with(prefix.as_ref()) && mnt != prefix.as_ref() {
-                mounts.push(PathBuf::from(mnt));
-            }
-        }
-    }
-    mounts.sort_by_key(|b| std::cmp::Reverse(b.as_os_str().len()));
-    mounts
-}
-
 /// Returns the current user's `uid:gid` string via the `id` command.
 fn current_user_spec() -> Result<String, String> {
     let uid = run_id_arg("-u")?;
@@ -294,7 +267,8 @@ pub fn sync_sessions(repo_root: &Path, app_name: Option<&str>) -> Result<(), Str
 /// Syncs changes from a single session's overlay upperdir to the repo root,
 /// then writes a `.synced` marker file.
 fn sync_session(sessions_dir: &Path, name: &str, state_path: &Path) -> Result<(), String> {
-    let state: SessionState = serde_json::from_str(&fs::read_to_string(state_path).map_err(|e| format!("failed to read session state: {e}"))?).map_err(|e| format!("failed to parse session state: {e}"))?;
+    let state: SessionState = serde_json::from_str(&fs::read_to_string(state_path).map_err(|e| format!("failed to read session state: {e}"))?)
+        .map_err(|e| format!("failed to parse session state: {e}"))?;
 
     if !is_mounted(Path::new(&state.mount_point)) {
         println!("{name}: session ended, removing state file");
@@ -367,9 +341,8 @@ fn sync_upper(upper_dir: &Path, repo_root: &Path, sessions_dir: &Path, app_name:
 /// Recursive helper that walks an upperdir directory, syncing files to repo_root,
 /// processing whiteouts and opaque markers, and building the new manifest.
 fn sync_upper_dir(
-    base: &Path, current: &Path, repo_root: &Path,
-    count_add: &mut usize, count_del: &mut usize,
-    _manifest_old: &BTreeSet<String>, manifest_new: &mut BTreeSet<String>,
+    base: &Path, current: &Path, repo_root: &Path, count_add: &mut usize, count_del: &mut usize, _manifest_old: &BTreeSet<String>,
+    manifest_new: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     let mut has_opq = false;
 
@@ -419,10 +392,7 @@ fn sync_upper_dir(
         }
 
         if metadata.is_file() {
-            let needs_copy = fs::read(&path)
-                .ok()
-                .and_then(|src| fs::read(&dest).ok().map(|dest_data| src != dest_data))
-                .unwrap_or(true);
+            let needs_copy = fs::read(&path).ok().and_then(|src| fs::read(&dest).ok().map(|dest_data| src != dest_data)).unwrap_or(true);
             if needs_copy {
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -448,10 +418,7 @@ fn sync_upper_dir(
 
 /// Deletes files from repo_dir that are hidden by an opaque marker — any file not
 /// present in the current upperdir manifest is removed from the host repo.
-fn delete_opaque_lower_files(
-    repo_dir: &Path, repo_root: &Path,
-    manifest_new: &BTreeSet<String>, count_del: &mut usize,
-) -> Result<(), String> {
+fn delete_opaque_lower_files(repo_dir: &Path, repo_root: &Path, manifest_new: &BTreeSet<String>, count_del: &mut usize) -> Result<(), String> {
     for entry in fs::read_dir(repo_dir).map_err(|e| format!("failed to read {}: {e}", repo_dir.display()))? {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
@@ -471,10 +438,7 @@ fn delete_opaque_lower_files(
 }
 
 fn load_manifest(path: &Path) -> BTreeSet<String> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 fn save_manifest(path: &Path, manifest: &BTreeSet<String>) -> Result<(), String> {
@@ -483,8 +447,8 @@ fn save_manifest(path: &Path, manifest: &BTreeSet<String>) -> Result<(), String>
     fs::write(path, json).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
-/// Cleans up the overlay workspace: warns about unsynced changes, removes session state,
-/// and unmounts the overlay, loop device, and bind mounts.
+/// Cleans up the overlay workspace: auto-syncs changes back to the repo,
+/// removes session state, and unmounts the overlay and loop device.
 impl Drop for CowWorkspace {
     fn drop(&mut self) {
         let sessions_dir = self.overlay_dir.join("sessions");
@@ -493,9 +457,14 @@ impl Drop for CowWorkspace {
             let Ok(entry) = entry else { continue };
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                let synced_marker = sessions_dir.join(format!("{}.synced", path.file_stem().unwrap_or_default().to_string_lossy()));
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                let synced_marker = sessions_dir.join(format!("{stem}.synced"));
                 if !synced_marker.exists() && self.has_unsynced_changes() {
-                    eprintln!("bunkerbox: session ending. Changes not synced. Run 'bunkerbox sync' to save.");
+                    eprintln!("bunkerbox: syncing changes back to repo...");
+                    let upper_dir = self.loop_mount.join("upper");
+                    let repo_root = self.overlay_dir.parent().expect("overlay_dir has no parent");
+                    let _ = sync_upper(&upper_dir, repo_root, &sessions_dir, &stem);
+                    eprintln!("bunkerbox: sync complete.");
                 }
                 let _ = fs::remove_file(&path);
                 let _ = fs::remove_file(&synced_marker);
@@ -504,9 +473,6 @@ impl Drop for CowWorkspace {
 
         let _ = fs::remove_dir_all(&sessions_dir);
 
-        for mnt in self.bind_mounts.iter().rev() {
-            let _ = Self::run_command_allow_failure("umount", &[&mnt.to_string_lossy()]);
-        }
         let _ = Self::run_command_allow_failure("umount", &[&self.mount_point.to_string_lossy()]);
         let _ = Self::run_command_allow_failure("umount", &[&self.loop_mount.to_string_lossy()]);
         if let Some(dev) = Self::find_loop_device(&self.loopback) {

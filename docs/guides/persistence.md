@@ -71,7 +71,7 @@ The loop image lives at `.bunker/session.img` inside the persist home directory 
           │
           ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ GUEST (Kata VM)                                                 │
+│ GUEST (Bunkerbox VM)                                            │
 │                                                                 │
 │ /bunkerbox-persist-home  (bind mount of the loop mount)         │
 │   └── .config/ .local/share/ .cache/                            │

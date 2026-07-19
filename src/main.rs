@@ -1,11 +1,14 @@
 mod clidef;
 mod cmdrun;
+mod daemon;
 mod envconf;
 mod kata;
 mod overlay;
 mod runtime;
+mod vscomm;
 mod workspace;
 
+use envconf::EnvConfig;
 use runtime::WorkspaceMode;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,8 @@ fn run() -> Result<(), String> {
     let workspace_override = workspace_mode_from_args()?;
 
     if let Some(config) = runtime::load_for_invoked_name(&share_dir)? {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
+        let _guard = rt.enter();
         return run_packaged_runtime(config, workspace_override, &share_dir);
     }
 
@@ -146,7 +151,21 @@ fn run_packaged_runtime(config: runtime::RuntimeConfig, workspace_override: Opti
     let name = runtime::invoked_name()?;
     let container_name = format!("bunkerbox-{name}");
 
-    kata::run(&config, workspace_mode, quota, config.workspace_exclude.as_deref(), &container_name, share_dir, &name)
+    let ws = workspace::resolve(workspace_mode, quota, config.workspace_exclude.as_deref(), &name)?;
+    let workspace_path = ws.path().to_path_buf();
+
+    let repo_root = workspace::project_root()?;
+    let env = EnvConfig::load_or_create(&repo_root)?;
+
+    let daemon = if !env.passthrough.is_empty() { Some(daemon::VsockDaemon::start(env.passthrough, workspace_path)?) } else { None };
+
+    let result = kata::run(&config, ws, &container_name, share_dir, &name, daemon.is_some());
+
+    if let Some(d) = daemon {
+        tokio::runtime::Handle::current().block_on(d.shutdown());
+    }
+
+    result
 }
 
 fn print_subcommand_help(name: &str) -> Result<(), String> {

@@ -45,6 +45,7 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Tutorial: guides/tutorial.md
   - Quickstart: quickstart.md
   - Concepts: concepts.md
   - Configuration:
@@ -52,6 +53,7 @@ nav:
       - Image config: config/image.md
       - Image hooks: config/hooks.md
   - Guides:
+      - Passthrough: guides/passthrough.md
       - Persistence: guides/persistence.md
       - Networking: guides/networking.md
       - Custom images: guides/custom-images.md

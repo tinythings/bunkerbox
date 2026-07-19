@@ -139,7 +139,7 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
         }
     }
 
-    let build_dir = data_dir().join(format!("bunkerbox/build/bunkerbox-image-{}", std::process::id()));
+    let build_dir = env::temp_dir().join(format!("bunkerbox-image-{}", std::process::id()));
     fs::create_dir_all(&build_dir).map_err(|err| format!("failed to create build dir {}: {err}", build_dir.display()))?;
 
     let result = (|| {
@@ -159,14 +159,8 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
 fn write_runtime_conf(config: &ImageConfig) -> Result<(), String> {
     if let Some(runtime) = &config.runtime {
         let mut mapping = serde_yaml::Mapping::new();
-        mapping.insert(
-            serde_yaml::Value::String("oci".into()),
-            serde_yaml::Value::String(config.output.to_string_lossy().into_owned()),
-        );
-        mapping.insert(
-            serde_yaml::Value::String("image".into()),
-            serde_yaml::Value::String(config.image.clone()),
-        );
+        mapping.insert(serde_yaml::Value::String("oci".into()), serde_yaml::Value::String(config.output.to_string_lossy().into_owned()));
+        mapping.insert(serde_yaml::Value::String("image".into()), serde_yaml::Value::String(config.image.clone()));
 
         if let serde_yaml::Value::Mapping(m) = runtime {
             for (k, v) in m {
@@ -240,6 +234,12 @@ if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
   export XDG_CACHE_HOME="$HOME/.cache"
 fi
 
+VSCOMM_BIN="/usr/local/bunkerbox/bin"
+if [ -x "$VSCOMM_BIN/bunkerbox-vscomm" ]; then
+  "$VSCOMM_BIN/bunkerbox-vscomm" install
+  export PATH="$VSCOMM_BIN:$PATH"
+fi
+
 set +e
 run_app
 status=$?
@@ -276,12 +276,18 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
     fs::set_permissions(&entrypoint_path, fs::Permissions::from_mode(0o755))
         .map_err(|err| format!("failed to chmod {}: {err}", entrypoint_path.display()))?;
 
+    if let Some(vscomm_path) = find_vscomm_binary() {
+        let dest = build_dir.join("bunkerbox-vscomm");
+        fs::copy(&vscomm_path, &dest).map_err(|err| format!("failed to copy vscomm binary {}: {err}", dest.display()))?;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
+    }
+
     for file in &config.files {
         if file.path.is_absolute() || file.path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
             return Err(format!("unsafe build file path: {}", file.path.display()));
         }
-        if file.path == Path::new("bunker-entrypoint") {
-            return Err("image config files must not override generated bunker-entrypoint".to_string());
+        if file.path == Path::new("bunker-entrypoint") || file.path == Path::new("bunkerbox-vscomm") {
+            return Err(format!("image config files must not override reserved file: {}", file.path.display()));
         }
 
         let full_path = build_dir.join(&file.path);
@@ -295,6 +301,24 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
     }
 
     Ok(())
+}
+
+fn find_vscomm_binary() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let parent = exe.parent()?;
+    let target_dir = parent.parent()?;
+
+    let musl_candidate = target_dir.join("x86_64-unknown-linux-musl").join("debug").join("bunkerbox-vscomm");
+    if musl_candidate.is_file() {
+        return Some(musl_candidate);
+    }
+
+    let candidate = parent.join("bunkerbox-vscomm");
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+
+    None
 }
 
 fn podman_build(config: &ImageConfig, build_dir: &Path) -> Result<(), String> {
@@ -346,18 +370,6 @@ fn podman_remove_image(config: &ImageConfig) -> Result<(), String> {
     }
 
     run_command("podman", &["image".to_string(), "rm".to_string(), "-f".to_string(), config.image.clone()])
-}
-
-fn data_dir() -> PathBuf {
-    if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(path);
-    }
-
-    if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home).join(".local").join("share");
-    }
-
-    env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".local").join("share")
 }
 
 fn require_program(name: &str) -> Result<(), String> {

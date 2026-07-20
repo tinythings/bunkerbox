@@ -3,14 +3,23 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+
+if [ -n "${PROD:-}" ]; then
+    BUILD_PROFILE="release"
+    MAKE_TARGET="release"
+else
+    BUILD_PROFILE="debug"
+    MAKE_TARGET="dev"
+fi
+
 SHARE_DIR="${SCRIPT_DIR}/share"
 OCI_DIR="${SHARE_DIR}/oci"
 KATA_DIR="${SHARE_DIR}/kata"
 OCI_FILE="${OCI_DIR}/bunkerbox-netdebug-0.1.0.oci"
 IMAGE_CONF="${SCRIPT_DIR}/netdebug-image.conf"
 RUNTIME_CONF="${SHARE_DIR}/netdebug.conf"
-BUNKERBOX="${PROJECT_ROOT}/target/debug/bunkerbox"
-BUNKERBOX_IMAGE="${PROJECT_ROOT}/target/debug/bunkerbox-image"
+BUNKERBOX="${PROJECT_ROOT}/target/${BUILD_PROFILE}/bunkerbox"
+BUNKERBOX_IMAGE="${PROJECT_ROOT}/target/${BUILD_PROFILE}/bunkerbox-image"
 NETDEBUG_LINK="${SCRIPT_DIR}/netdebug"
 KATA_VERSION="${KATA_VERSION:-3.32.0}"
 KATA_TARBALL_NAME="kata-static-${KATA_VERSION}-amd64.tar.zst"
@@ -24,7 +33,7 @@ rm -f "$NETDEBUG_LINK" "$IMAGE_CONF"
 rm -rf "$SHARE_DIR"
 mkdir -p "$OCI_DIR" "$KATA_DIR"
 
-make -C "$PROJECT_ROOT" dev
+make -C "$PROJECT_ROOT" "${MAKE_TARGET}"
 
 if [ ! -f "$KATA_TARBALL" ]; then
   echo "Downloading Kata ${KATA_VERSION}..."
@@ -142,6 +151,7 @@ ln -sfn "$BUNKERBOX" "$NETDEBUG_LINK"
 
 cat <<EOF_DONE
 Netdebug demo ready.
+To rebuild with the production (release) version: PROD=1 ./run-demo.sh
 
 Now run:
   cd ${SCRIPT_DIR}

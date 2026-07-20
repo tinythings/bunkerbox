@@ -3,13 +3,22 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+
+if [ -n "${PROD:-}" ]; then
+    BUILD_PROFILE="release"
+    MAKE_TARGET="release"
+else
+    BUILD_PROFILE="debug"
+    MAKE_TARGET="dev"
+fi
+
 SHARE_DIR="${SCRIPT_DIR}/share"
 OCI_DIR="${SHARE_DIR}/oci"
 KATA_DIR="${SHARE_DIR}/kata"
 OCI_FILE="${OCI_DIR}/bunkerbox-crush-0.84.1.oci"
 RUNTIME_CONF="${SHARE_DIR}/crush.conf"
-BUNKERBOX="${PROJECT_ROOT}/target/debug/bunkerbox"
-BUNKERBOX_IMAGE="${PROJECT_ROOT}/target/debug/bunkerbox-image"
+BUNKERBOX="${PROJECT_ROOT}/target/${BUILD_PROFILE}/bunkerbox"
+BUNKERBOX_IMAGE="${PROJECT_ROOT}/target/${BUILD_PROFILE}/bunkerbox-image"
 CRUSH_LINK="${SCRIPT_DIR}/crush"
 KATA_VERSION="${KATA_VERSION:-3.32.0}"
 KATA_TARBALL_NAME="kata-static-${KATA_VERSION}-amd64.tar.zst"
@@ -23,7 +32,7 @@ rm -f "$CRUSH_LINK"
 rm -rf "$OCI_DIR" "$KATA_DIR"
 mkdir -p "$OCI_DIR" "$KATA_DIR"
 
-make -C "$PROJECT_ROOT" dev
+make -C "$PROJECT_ROOT" "${MAKE_TARGET}"
 
 if [ ! -x "${KATA_DIR}/bin/containerd-shim-kata-v2" ]; then
   if [ ! -f "$KATA_TARBALL" ]; then
@@ -83,6 +92,7 @@ ln -sfn "$BUNKERBOX" "$CRUSH_LINK"
 
 cat <<EOF_DONE
 Demo ready.
+To rebuild with the production (release) version: PROD=1 ./run-demo.sh
 
 Now run:
   cd ${SCRIPT_DIR}

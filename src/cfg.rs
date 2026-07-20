@@ -22,6 +22,18 @@ const DEFAULT_EXCLUDE: &[&str] = &[
     "cmake-build-release/",
 ];
 
+const DEFAULT_SESSION_CLEANUP: &[&str] = &[
+    ".bunker",
+    ".npm",
+    ".config/kilo/node_modules",
+    ".config/opencode/node_modules",
+    ".config/crush/node_modules",
+    ".local/share/kilo/log",
+    ".local/share/opencode/log",
+    ".local/share/crush/log",
+    ".cache",
+];
+
 const MIN_QUOTA: u64 = 5 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -75,6 +87,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub encrypt: Option<Vec<String>>,
     pub session_mb: Option<u32>,
+    #[serde(default)]
+    pub session_cleanup: Option<Vec<String>>,
 }
 
 impl RuntimeConfig {
@@ -115,6 +129,15 @@ impl RuntimeConfig {
 
     pub fn session_mb(&self) -> u32 {
         self.session_mb.unwrap_or(50)
+    }
+
+    pub fn effective_session_cleanup(&self) -> Vec<String> {
+        let user = self.session_cleanup.as_deref().unwrap_or(&[]);
+        DEFAULT_SESSION_CLEANUP
+            .iter()
+            .map(|s| s.to_string())
+            .chain(user.iter().cloned())
+            .collect()
     }
 
     #[allow(dead_code)]

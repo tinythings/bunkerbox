@@ -276,11 +276,10 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
     fs::set_permissions(&entrypoint_path, fs::Permissions::from_mode(0o755))
         .map_err(|err| format!("failed to chmod {}: {err}", entrypoint_path.display()))?;
 
-    if let Some(vscomm_path) = find_vscomm_binary() {
-        let dest = build_dir.join("bunkerbox-vscomm");
-        fs::copy(&vscomm_path, &dest).map_err(|err| format!("failed to copy vscomm binary {}: {err}", dest.display()))?;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
-    }
+    let vscomm_path = find_vscomm_binary()?;
+    let dest = build_dir.join("bunkerbox-vscomm");
+    fs::copy(&vscomm_path, &dest).map_err(|err| format!("failed to copy vscomm binary {}: {err}", dest.display()))?;
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
 
     for file in &config.files {
         if file.path.is_absolute() || file.path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
@@ -303,22 +302,22 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
     Ok(())
 }
 
-fn find_vscomm_binary() -> Option<PathBuf> {
-    let exe = env::current_exe().ok()?;
-    let parent = exe.parent()?;
-    let target_dir = parent.parent()?;
+fn find_vscomm_binary() -> Result<PathBuf, String> {
+    let exe = env::current_exe().map_err(|e| format!("failed to locate self: {e}"))?;
+    let parent = exe.parent().ok_or_else(|| "failed to determine parent directory".to_string())?;
+    let target_dir = parent.parent().ok_or_else(|| "failed to determine target directory".to_string())?;
 
-    let musl_candidate = target_dir.join("x86_64-unknown-linux-musl").join("debug").join("bunkerbox-vscomm");
-    if musl_candidate.is_file() {
-        return Some(musl_candidate);
+    for profile in &["release", "debug"] {
+        let musl_candidate = target_dir.join("x86_64-unknown-linux-musl").join(profile).join("bunkerbox-vscomm");
+        if musl_candidate.is_file() {
+            return Ok(musl_candidate);
+        }
     }
 
-    let candidate = parent.join("bunkerbox-vscomm");
-    if candidate.is_file() {
-        return Some(candidate);
-    }
-
-    None
+    Err(format!(
+        "musl-static bunkerbox-vscomm not found in target/x86_64-unknown-linux-musl/{{release,debug}}/\n\
+         build it first: make musl-vscomm"
+    ))
 }
 
 fn podman_build(config: &ImageConfig, build_dir: &Path) -> Result<(), String> {

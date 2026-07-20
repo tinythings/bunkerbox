@@ -93,6 +93,12 @@ pub fn run(
         }
     }
 
+    let cleanup_patterns = config.effective_session_cleanup();
+    if let Some(ref hp) = home_path {
+        eprintln!("bunkerbox: cleaning up home directory...");
+        cleanup_home_junk(hp, &cleanup_patterns);
+    }
+
     let session_mb = config.session_mb();
     let session_dir: Option<PathBuf> = if session_mb > 0 {
         if let Some(ref hp) = home_path {
@@ -202,7 +208,8 @@ pub fn run(
 
     if let Some(ref sd) = session_dir {
         if let Some(ref hp) = home_path {
-            teardown_session(hp, sd);
+            let cleanup = config.effective_session_cleanup();
+            teardown_session(hp, sd, &cleanup);
         }
     }
 
@@ -694,13 +701,32 @@ fn setup_session(home_path: &Path, session_mb: u32, uid: &str, gid: &str) -> Res
     run_command_quiet("sudo", &["chown", &format!("{}:{}", uid, gid), &format!("{}", session_dir.display())])?;
     let _ = run_command_quiet("sudo", &["rm", "-rf", &format!("{}/lost+found", session_dir.display())]);
 
-    let _ = run_command_quiet("cp", &["-a", &format!("{}/.", home_path.display()), &format!("{}/", session_dir.display())]);
+    let home_size = dir_size(home_path);
+    let max_size = (session_mb as u64) * 1024 * 1024;
+    if home_size > max_size {
+        eprintln!(
+            "bunkerbox: warning: home directory is {} MB but session is only {} MB - copy may fail",
+            home_size / (1024 * 1024),
+            session_mb
+        );
+    }
+
+    let cp_status = run_command_quiet("cp", &["-a", &format!("{}/.", home_path.display()), &format!("{}/", session_dir.display())]);
+    if let Err(e) = cp_status {
+        let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
+        let _ = run_command_allow_failure("sudo", &["rmdir", &format!("{}", session_dir.display())]);
+        let _ = run_command_allow_failure("rm", &["-f", &format!("{}", session_img.display())]);
+        return Err(format!("failed to copy home into session image: {e}"));
+    }
 
     Ok(session_dir)
 }
 
 /// Copies session changes back to home, unmounts, and removes the session image and mount point.
-fn teardown_session(home_path: &Path, session_dir: &Path) {
+fn teardown_session(home_path: &Path, session_dir: &Path, cleanup_patterns: &[String]) {
+    eprintln!("bunkerbox: preparing to persist session...");
+    cleanup_home_junk(session_dir, cleanup_patterns);
+
     let _ = run_command_quiet("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
 
     let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
@@ -788,4 +814,32 @@ fn print_filtered_stderr(stderr: &[u8]) -> Result<(), String> {
 /// Returns `true` for known containerd deprecation warnings that can be safely ignored.
 fn is_filtered_warning(line: &str) -> bool {
     line.contains("DEPRECATION: The support for cgroup v1 is deprecated since containerd v2.2")
+}
+
+fn cleanup_home_junk(path: &Path, patterns: &[String]) {
+    for pattern in patterns {
+        let target = path.join(pattern);
+        if target.exists() {
+            eprintln!("bunkerbox: purging {pattern}");
+            let _ = run_command_allow_failure("rm", &["-rf", &format!("{}", target.display())]);
+        }
+    }
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return total;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path()));
+        } else if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
 }

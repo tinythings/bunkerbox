@@ -10,6 +10,9 @@ struct VsockSession {
     passthrough: Arc<Vec<String>>,
     env_mode: EnvMode,
     workspace: PathBuf,
+    profiles: Arc<Vec<String>>,
+    share_dir: PathBuf,
+    sandbox_bin: PathBuf,
 }
 
 pub struct VsockDaemon {
@@ -18,10 +21,27 @@ pub struct VsockDaemon {
 }
 
 impl VsockDaemon {
-    pub fn start(passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf) -> Result<Self, String> {
+    pub fn start(
+        passthrough: Vec<String>,
+        env_mode: EnvMode,
+        workspace: PathBuf,
+        profiles: Vec<String>,
+        share_dir: PathBuf,
+    ) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-        let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), env_mode, workspace });
+        let sandbox_bin = std::env::current_exe()
+            .map_err(|e| format!("current_exe: {e}"))?
+            .with_file_name("bunkerbox-sandbox");
+
+        let session = Arc::new(VsockSession {
+            passthrough: Arc::new(passthrough),
+            env_mode,
+            workspace,
+            profiles: Arc::new(profiles),
+            share_dir,
+            sandbox_bin,
+        });
 
         let join_handle = tokio::spawn(async move {
             let result = daemon_loop(session, shutdown_rx).await;
@@ -39,7 +59,10 @@ impl VsockDaemon {
     }
 }
 
-async fn daemon_loop(session: Arc<VsockSession>, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
+async fn daemon_loop(
+    session: Arc<VsockSession>,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), String> {
     use tokio_vsock::VsockListener;
 
     let listener = match VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, VSOCK_PORT)) {
@@ -77,7 +100,10 @@ async fn daemon_loop(session: Arc<VsockSession>, mut shutdown_rx: tokio::sync::o
     Ok(())
 }
 
-async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSession) -> Result<(), String> {
+async fn handle_connection(
+    stream: tokio_vsock::VsockStream,
+    session: &VsockSession,
+) -> Result<(), String> {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let req = read_exec_request(&mut reader).await?;
@@ -90,26 +116,17 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     }
 
     let cwd = if req.cwd.starts_with("/workspace") {
-        session.workspace.join(req.cwd.strip_prefix("/workspace").unwrap_or(&req.cwd).trim_start_matches('/'))
+        session
+            .workspace
+            .join(req.cwd.strip_prefix("/workspace").unwrap_or(&req.cwd).trim_start_matches('/'))
     } else {
         PathBuf::from(&req.cwd)
     };
 
-    let mut cmd = Command::new(&req.command);
-    cmd.args(&req.args);
-    cmd.current_dir(&cwd);
+    let mut cmd = build_command(session, &req, &cwd)?;
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-
-    if session.env_mode == EnvMode::Relaxed {
-        for (key, val) in &req.env {
-            if key == "PATH" || key == "HOME" || key == "VSOCK_CID" || key.starts_with("BUNKERBOX_") || key.starts_with("XDG_") {
-                continue;
-            }
-            cmd.env(key, val);
-        }
-    }
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", req.command))?;
 
@@ -119,12 +136,8 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-    let stdout_task = tokio::spawn(async move {
-        pump_to_channel(child_stdout, stdout_tx).await;
-    });
-    let stderr_task = tokio::spawn(async move {
-        pump_to_channel(child_stderr, stderr_tx).await;
-    });
+    let stdout_task = tokio::spawn(async move { pump_to_channel(child_stdout, stdout_tx).await });
+    let stderr_task = tokio::spawn(async move { pump_to_channel(child_stderr, stderr_tx).await });
 
     loop {
         tokio::select! {
@@ -155,6 +168,57 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     Ok(())
 }
 
+fn build_command(session: &VsockSession, req: &ExecRequest, cwd: &std::path::Path) -> Result<Command, String> {
+    let use_sandbox = !session.profiles.is_empty();
+
+    if use_sandbox {
+        let mut cmd = Command::new(&session.sandbox_bin);
+        cmd.arg("--share");
+        cmd.arg(&session.share_dir);
+
+        for profile in session.profiles.iter() {
+            cmd.arg("--profile");
+            cmd.arg(profile);
+        }
+
+        cmd.arg("--cwd");
+        cmd.arg(cwd);
+
+        if session.env_mode == EnvMode::Relaxed {
+            for (key, val) in &req.env {
+                if key == "PATH" || key == "HOME" || key == "VSOCK_CID" || key.starts_with("BUNKERBOX_") || key.starts_with("XDG_") {
+                    continue;
+                }
+                cmd.arg("--env");
+                cmd.arg(format!("{key}={val}"));
+            }
+        }
+
+        cmd.arg("--");
+        cmd.arg(&req.command);
+        for arg in &req.args {
+            cmd.arg(arg);
+        }
+
+        Ok(cmd)
+    } else {
+        let mut cmd = Command::new(&req.command);
+        cmd.args(&req.args);
+        cmd.current_dir(cwd);
+
+        if session.env_mode == EnvMode::Relaxed {
+            for (key, val) in &req.env {
+                if key == "PATH" || key == "HOME" || key == "VSOCK_CID" || key.starts_with("BUNKERBOX_") || key.starts_with("XDG_") {
+                    continue;
+                }
+                cmd.env(key, val);
+            }
+        }
+
+        Ok(cmd)
+    }
+}
+
 fn is_allowed(passthrough: &[String], command: &str, args: &[String]) -> bool {
     for entry in passthrough {
         let entry = entry.trim();
@@ -174,7 +238,8 @@ async fn read_exec_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Ex
     reader.read_exact(&mut header).await.map_err(|e| format!("read header: {e}"))?;
 
     let frame_type_raw = u16::from_le_bytes([header[0], header[1]]);
-    let ft = FrameType::from_u16(frame_type_raw).ok_or_else(|| format!("unknown frame type: {frame_type_raw}"))?;
+    let ft = FrameType::from_u16(frame_type_raw)
+        .ok_or_else(|| format!("unknown frame type: {frame_type_raw}"))?;
 
     if !matches!(ft, FrameType::ExecReq) {
         return Err(format!("expected ExecReq, got {:?}", ft as u16));
@@ -189,7 +254,10 @@ async fn read_exec_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Ex
     ExecRequest::deserialize(&payload)
 }
 
-async fn pump_to_channel<R: AsyncReadExt + Unpin>(mut reader: R, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+async fn pump_to_channel<R: AsyncReadExt + Unpin>(
+    mut reader: R,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {

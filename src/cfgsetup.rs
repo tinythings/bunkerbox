@@ -26,7 +26,7 @@ pub fn run(runtime: Option<&RuntimeConfig>) -> Result<(), String> {
     let passthrough = build_passthrough(detected, env_mode)?;
     let overrides = pick_overrides(runtime)?;
 
-    let cfg = ProjectConfig { project: ProjectSection { env: env_mode, quota: Some(quota), exclude: Vec::new(), passthrough }, image: overrides };
+    let cfg = ProjectConfig { project: ProjectSection { env: env_mode, quota: Some(quota), exclude: Vec::new(), passthrough }, image: overrides, profiles: Vec::new() };
 
     let path = repo_root.join(ProjectConfig::PATH);
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("failed to create {}: {e}", path.parent().unwrap().display()))?;

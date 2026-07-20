@@ -1,0 +1,30 @@
+name: make
+
+binaries:
+  make: /usr/bin/make
+  cc: /usr/bin/cc
+  gcc: /usr/bin/gcc
+  g++: /usr/bin/g++
+  c++: /usr/bin/c++
+  ar: /usr/bin/ar
+  ld: /usr/bin/ld
+  as: /usr/bin/as
+  strip: /usr/bin/strip
+
+ro_dirs:
+  - /lib
+  - /lib64
+  - /usr/lib
+  - /usr/lib64
+  - /etc/ssl
+  - /etc/localtime
+  - /usr/share/zoneinfo
+  - /usr/lib/locale
+
+rw_dirs: []
+
+env:
+  TERM: "${TERM}"
+
+network: none
+shell: /bin/sh

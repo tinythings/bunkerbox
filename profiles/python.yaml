@@ -1,0 +1,28 @@
+name: python
+
+binaries:
+  python3: /usr/bin/python3
+  python: /usr/bin/python3
+  pip3: /usr/bin/pip3
+  pip: /usr/bin/pip3
+
+ro_dirs:
+  - /lib
+  - /lib64
+  - /usr/lib
+  - /usr/lib64
+  - /etc/ssl
+  - /etc/localtime
+  - /usr/share/zoneinfo
+  - /usr/lib/locale
+  - /usr/share/python3
+
+rw_dirs:
+  - "${HOME}/.cache/pip"
+
+env:
+  PIP_CACHE_DIR: "${HOME}/.cache/pip"
+  TERM: "${TERM}"
+
+network: none
+shell: /bin/sh

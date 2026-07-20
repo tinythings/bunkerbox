@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help ensure-toolchain dev release check test setup image install-image prepare config docs docs-clean musl-vscomm
+.PHONY: help ensure-toolchain dev release check test integration-test setup image install-image prepare config docs docs-clean musl-vscomm
 
 DOCS_VENV := .venv-docs
 DOCS_MKDOCS := $(DOCS_VENV)/bin/mkdocs
@@ -13,6 +13,7 @@ help:
 	@printf "  %-24s %s\n"    "  release" "Build optimized release binaries"
 	@printf "  %-24s %s\n"    "  check" "Format and lint"
 	@printf "  %-24s %s\n"    "  test" "Run tests (requires cargo-nextest)"
+	@printf "  %-24s %s\n"    "  integration-test" "Run sandbox integration tests"
 	@printf "  %-24s %s\n"    "  docs" "Build documentation site"
 	@printf "  %-24s %s\n"    "" ""
 	@printf "  %-24s %s\n"    "Toolchain" ""
@@ -50,6 +51,9 @@ check:
 
 test:
 	cargo nextest run
+
+integration-test: dev
+	cargo nextest run --test test_base --test test_sandbox
 
 setup: dev
 	target/debug/bunkerbox setup

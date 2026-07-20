@@ -19,6 +19,8 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "io-util", "process"] }
 tokio-vsock = "0.7"
+nix = { version = "0.31", features = ["mount", "sched", "user", "process", "fs"] }
+caps = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
@@ -37,3 +39,7 @@ path = "src/main.rs"
 [[bin]]
 name = "bunkerbox-vscomm"
 path = "src/bin/bunkerbox-vscomm.rs"
+
+[[bin]]
+name = "bunkerbox-sandbox"
+path = "src/bin/bunkerbox-sandbox.rs"

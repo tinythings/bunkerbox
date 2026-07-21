@@ -204,7 +204,8 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
                     extra_paths.push(dir);
                 }
             }
-            cmd.arg("--ro-bind").arg(&resolved).arg(&resolved);
+            let real = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+            cmd.arg("--ro-bind").arg(&real).arg(&resolved);
         }
 
         for dir in &merged.ro_dirs {

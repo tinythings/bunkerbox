@@ -1,6 +1,7 @@
 use crate::cfg::EnvMode;
+use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
 use crate::vscomm::{ExecRequest, Frame, FrameType, VSOCK_PORT};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,9 +11,7 @@ struct VsockSession {
     passthrough: Arc<Vec<String>>,
     env_mode: EnvMode,
     workspace: PathBuf,
-    profiles: Arc<Vec<String>>,
-    share_dir: PathBuf,
-    sandbox_bin: PathBuf,
+    merged_profile: Option<Arc<MergedProfile>>,
 }
 
 pub struct VsockDaemon {
@@ -30,17 +29,31 @@ impl VsockDaemon {
     ) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-        let sandbox_bin = std::env::current_exe()
-            .map_err(|e| format!("current_exe: {e}"))?
-            .with_file_name("bunkerbox-sandbox");
+        let merged_profile = if profiles.is_empty() {
+            None
+        } else {
+            let loaded: Vec<_> = profiles
+                .iter()
+                .map(|p| resolve_profile(p, &share_dir))
+                .collect::<Result<Vec<_>, _>>()?;
+            let merged = MergedProfile::from_profiles(&loaded);
+
+            let check = std::process::Command::new("bwrap")
+                .arg("--version")
+                .output()
+                .map_err(|e| format!("bwrap not found: {e}"))?;
+            if !check.status.success() {
+                return Err("bwrap is not functional. Install bubblewrap to use sandbox profiles.".into());
+            }
+
+            Some(Arc::new(merged))
+        };
 
         let session = Arc::new(VsockSession {
             passthrough: Arc::new(passthrough),
             env_mode,
             workspace,
-            profiles: Arc::new(profiles),
-            share_dir,
-            sandbox_bin,
+            merged_profile,
         });
 
         let join_handle = tokio::spawn(async move {
@@ -115,7 +128,8 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let cwd = if req.cwd.starts_with("/workspace") {
+    let sandbox_cwd = req.cwd.clone();
+    let host_cwd = if req.cwd.starts_with("/workspace") {
         session
             .workspace
             .join(req.cwd.strip_prefix("/workspace").unwrap_or(&req.cwd).trim_start_matches('/'))
@@ -123,7 +137,7 @@ async fn handle_connection(
         PathBuf::from(&req.cwd)
     };
 
-    let mut cmd = build_command(session, &req, &cwd)?;
+    let mut cmd = build_command(session, &req, &host_cwd, &sandbox_cwd)?;
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -168,29 +182,84 @@ async fn handle_connection(
     Ok(())
 }
 
-fn build_command(session: &VsockSession, req: &ExecRequest, cwd: &std::path::Path) -> Result<Command, String> {
-    let use_sandbox = !session.profiles.is_empty();
+fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, sandbox_cwd: &str) -> Result<Command, String> {
+    if let Some(ref merged) = session.merged_profile {
+        let mut cmd = Command::new("bwrap");
 
-    if use_sandbox {
-        let mut cmd = Command::new(&session.sandbox_bin);
-        cmd.arg("--share");
-        cmd.arg(&session.share_dir);
+        cmd.arg("--bind").arg(&session.workspace).arg("/workspace");
 
-        for profile in session.profiles.iter() {
-            cmd.arg("--profile");
-            cmd.arg(profile);
+        let mut extra_paths: Vec<String> = Vec::new();
+        for (name, host_path) in &merged.binaries {
+            let resolved = if host_path.exists() {
+                host_path.clone()
+            } else if let Some(found) = find_in_path(name) {
+                found
+            } else {
+                eprintln!("bunkerbox: warning: binary '{name}' not found, skipping");
+                continue;
+            };
+            if let Some(parent) = resolved.parent() {
+                let dir = parent.to_string_lossy().to_string();
+                if !extra_paths.contains(&dir) {
+                    extra_paths.push(dir);
+                }
+            }
+            cmd.arg("--ro-bind").arg(&resolved).arg(&resolved);
         }
 
-        cmd.arg("--cwd");
-        cmd.arg(cwd);
+        for dir in &merged.ro_dirs {
+            let p = Path::new(dir);
+            if p.exists() {
+                cmd.arg("--ro-bind").arg(dir).arg(dir);
+            }
+        }
+
+        for dir in &merged.rw_dirs {
+            let p = Path::new(dir);
+            if p.exists() {
+                cmd.arg("--bind").arg(dir).arg(dir);
+            }
+        }
+
+        if let Ok(resolved) = which_sh(&merged.shell) {
+            cmd.arg("--ro-bind").arg(&resolved).arg("/bin/sh");
+        }
+
+        if matches!(merged.network, NetworkMode::None) {
+            cmd.arg("--unshare-net");
+        }
+
+        cmd.arg("--proc").arg("/proc");
+        cmd.arg("--dev").arg("/dev");
+        cmd.arg("--tmpfs").arg("/tmp");
+        cmd.arg("--tmpfs").arg("/home");
+
+        if !sandbox_cwd.is_empty() && sandbox_cwd != "/" {
+            cmd.arg("--dir").arg(sandbox_cwd);
+        }
+        cmd.arg("--chdir").arg(sandbox_cwd);
+
+        cmd.arg("--clearenv");
+        let mut sandbox_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string();
+        for extra in &extra_paths {
+            if !sandbox_path.split(':').any(|p| p == extra) {
+                sandbox_path.push(':');
+                sandbox_path.push_str(extra);
+            }
+        }
+        cmd.arg("--setenv").arg("PATH").arg(&sandbox_path);
+        cmd.arg("--setenv").arg("HOME").arg("/home");
+
+        for (key, val) in &merged.env {
+            cmd.arg("--setenv").arg(key).arg(val);
+        }
 
         if session.env_mode == EnvMode::Relaxed {
             for (key, val) in &req.env {
                 if key == "PATH" || key == "HOME" || key == "VSOCK_CID" || key.starts_with("BUNKERBOX_") || key.starts_with("XDG_") {
                     continue;
                 }
-                cmd.arg("--env");
-                cmd.arg(format!("{key}={val}"));
+                cmd.arg("--setenv").arg(key).arg(val);
             }
         }
 
@@ -204,7 +273,7 @@ fn build_command(session: &VsockSession, req: &ExecRequest, cwd: &std::path::Pat
     } else {
         let mut cmd = Command::new(&req.command);
         cmd.args(&req.args);
-        cmd.current_dir(cwd);
+        cmd.current_dir(host_cwd);
 
         if session.env_mode == EnvMode::Relaxed {
             for (key, val) in &req.env {
@@ -219,6 +288,27 @@ fn build_command(session: &VsockSession, req: &ExecRequest, cwd: &std::path::Pat
     }
 }
 
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join(name);
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
+fn which_sh(shell: &Path) -> Result<PathBuf, String> {
+    if shell.exists() {
+        return Ok(shell.to_path_buf());
+    }
+    if let Some(name) = shell.file_name().and_then(|n| n.to_str()) {
+        if let Some(found) = find_in_path(name) {
+            return Ok(found);
+        }
+    }
+    Err(format!("shell not found: {}", shell.display()))
+}
+
 fn is_allowed(passthrough: &[String], command: &str, args: &[String]) -> bool {
     for entry in passthrough {
         let entry = entry.trim();
@@ -226,8 +316,15 @@ fn is_allowed(passthrough: &[String], command: &str, args: &[String]) -> bool {
             if cmd.trim() == command {
                 return true;
             }
-        } else if entry == command && args.is_empty() {
-            return true;
+        } else {
+            let full = if args.is_empty() {
+                command.to_string()
+            } else {
+                format!("{} {}", command, args.join(" "))
+            };
+            if entry == full {
+                return true;
+            }
         }
     }
     false

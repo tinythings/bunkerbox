@@ -31,6 +31,8 @@ const DEFAULT_SESSION_CLEANUP: &[&str] = &[
     ".local/share/kilo/log",
     ".local/share/opencode/log",
     ".local/share/crush/log",
+    ".local/share/kilo/snapshot",
+    ".local/share/kilo/storage/session_diff",
     ".cache",
 ];
 

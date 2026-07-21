@@ -5,6 +5,7 @@ mod cmdrun;
 mod daemon;
 mod kata;
 mod overlay;
+mod sandbox;
 mod vscomm;
 mod workspace;
 

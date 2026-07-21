@@ -3,10 +3,6 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-pub mod ns;
-pub mod mount;
-pub mod exec;
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Profile {
     pub name: String,

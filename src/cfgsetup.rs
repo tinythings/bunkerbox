@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 
 use crate::cfg::{EnvMode, ImageOverrides, ProjectConfig, ProjectSection, RuntimeConfig, WorkspaceMode};
@@ -22,11 +23,12 @@ pub fn run(runtime: Option<&RuntimeConfig>) -> Result<(), String> {
 
     let quota = pick_quota()?;
     let env_mode = pick_env_mode()?;
-    let detected = if env_mode == EnvMode::Paranoid { buildsys::scan(&repo_root, buildsys::PassthroughMode::Paranoid) } else { detected_relaxed };
+    let detected = if env_mode == EnvMode::Paranoid { buildsys::scan(&repo_root, buildsys::PassthroughMode::Paranoid) } else { detected_relaxed.clone() };
     let passthrough = build_passthrough(detected, env_mode)?;
+    let profiles = pick_profiles(&detected_relaxed)?;
     let overrides = pick_overrides(runtime)?;
 
-    let cfg = ProjectConfig { project: ProjectSection { env: env_mode, quota: Some(quota), exclude: Vec::new(), passthrough }, image: overrides, profiles: Vec::new() };
+    let cfg = ProjectConfig { project: ProjectSection { env: env_mode, quota: Some(quota), exclude: Vec::new(), passthrough }, image: overrides, profiles };
 
     let path = repo_root.join(ProjectConfig::PATH);
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("failed to create {}: {e}", path.parent().unwrap().display()))?;
@@ -109,6 +111,119 @@ fn build_passthrough(detected: Vec<String>, env_mode: EnvMode) -> Result<Vec<Str
     Ok(entries)
 }
 
+fn pick_profiles(detected: &[String]) -> Result<Vec<String>, String> {
+    let suggested: BTreeSet<String> = detected
+        .iter()
+        .filter_map(|e| {
+            let cmd = e.strip_suffix(" *").unwrap_or(e);
+            system_to_profile(cmd)
+        })
+        .map(String::from)
+        .collect();
+
+    if suggested.is_empty() {
+        println!();
+        let key = key_press("  Sandbox profiles: none detected. Add one? [y/N]", &['y', 'n'], 'n')?;
+        if key == 'n' {
+            return Ok(Vec::new());
+        }
+        return add_profile_loop(Vec::new());
+    }
+
+    println!();
+    println!("  Sandbox profiles (suggested):");
+    let sugg_list: Vec<&String> = suggested.iter().collect();
+    for (i, p) in sugg_list.iter().enumerate() {
+        println!("    [{}] {p}", i + 1);
+    }
+    println!();
+
+    let mut chosen: Vec<String> = sugg_list.iter().map(|s| s.to_string()).collect();
+
+    loop {
+        println!("    [a] accept suggestions  (default)");
+        println!("    [n] none");
+        println!("    [+] add another profile");
+        println!("    [-] remove one");
+        println!();
+        let key = key_press("  Pick [a]", &['a', 'n', '+', '-'], 'a')?;
+        match key {
+            'a' => break,
+            'n' => {
+                chosen.clear();
+                break;
+            }
+            '+' => {
+                chosen = add_profile_loop(chosen)?;
+                continue;
+            }
+            '-' => {
+                if chosen.is_empty() {
+                    continue;
+                }
+                println!("    Remove which?");
+                for (i, p) in chosen.iter().enumerate() {
+                    println!("      [{i}] {p}");
+                }
+                let idx = pick_num("  Pick [skip]", 0, chosen.len() - 1)?;
+                chosen.remove(idx);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(chosen)
+}
+
+fn system_to_profile(name: &str) -> Option<&'static str> {
+    match name {
+        "cargo" => Some("rust"),
+        "make" => Some("make"),
+        "npm" => Some("node"),
+        "go" => Some("go"),
+        "python" => Some("python"),
+        _ => None,
+    }
+}
+
+fn add_profile_loop(current: Vec<String>) -> Result<Vec<String>, String> {
+    let mut chosen = current;
+    let builtins = ["rust", "make", "node", "go", "python"];
+    loop {
+        println!();
+        println!("    Available built-in profiles:");
+        for (i, name) in builtins.iter().enumerate() {
+            let already = if chosen.contains(&name.to_string()) { " (selected)" } else { "" };
+            println!("      [{i}] {name}{already}");
+        }
+        println!("      [c] custom path");
+        println!("      [d] done");
+        println!();
+        let key = key_press("  Pick [d]", &['0', '1', '2', '3', '4', 'c', 'd'], 'd')?;
+        match key {
+            'd' => break,
+            'c' => {
+                print!("  Path: ");
+                io::stdout().flush().map_err(|e| format!("flush: {e}"))?;
+                let path = read_line()?;
+                if !path.is_empty() && !chosen.contains(&path) {
+                    chosen.push(path);
+                }
+            }
+            _ => {
+                let idx = key.to_digit(10).unwrap() as usize;
+                let name = builtins[idx].to_string();
+                if chosen.contains(&name) {
+                    chosen.retain(|p| p != &name);
+                } else {
+                    chosen.push(name);
+                }
+            }
+        }
+    }
+    Ok(chosen)
+}
+
 fn pick_overrides(runtime: Option<&RuntimeConfig>) -> Result<ImageOverrides, String> {
     println!();
     println!("  ══ Runtime overrides (optional) ═══");
@@ -147,21 +262,19 @@ fn pick_workspace_override(runtime: Option<&RuntimeConfig>) -> Result<Option<Wor
 }
 
 fn pick_session_override(runtime: Option<&RuntimeConfig>) -> Result<Option<u32>, String> {
-    let current = runtime.map(|r| r.session_mb()).unwrap_or(50);
+    let current = runtime.map(|r| r.session_mb()).unwrap_or(512);
     println!("  Session size (current: {current} MB):");
-    println!("    [1] 50 MB");
-    println!("    [2] 100 MB");
-    println!("    [3] 200 MB");
-    println!("    [4] 500 MB");
+    println!("    [1] 512 MB (default)");
+    println!("    [2] 1024 MB");
+    println!("    [3] 2048 MB");
     println!("    [c] custom");
     println!();
 
-    let key = key_press("  Pick [skip]", &['1', '2', '3', '4', 'c'], 's')?;
+    let key = key_press("  Pick [skip]", &['1', '2', '3', 'c'], 's')?;
     Ok(match key {
-        '1' => Some(50),
-        '2' => Some(100),
-        '3' => Some(200),
-        '4' => Some(500),
+        '1' => Some(512),
+        '2' => Some(1024),
+        '3' => Some(2048),
         'c' => {
             print!("  Size in MB: ");
             io::stdout().flush().map_err(|e| format!("flush: {e}"))?;

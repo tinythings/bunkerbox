@@ -1,215 +1,164 @@
 mod common;
 use common::*;
 
-fn require_sandbox() {
-    let sandbox = sandbox_bin();
-    assert!(
-        sandbox.exists(),
-        "bunkerbox-sandbox binary not found at {}. Build with: cargo build --bin bunkerbox-sandbox",
-        sandbox.display()
-    );
+fn wrap(extra: &[&str], cmd: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+    args.push("--proc".into());
+    args.push("/proc".into());
+    args.push("--dev".into());
+    args.push("/dev".into());
+    args.push("--tmpfs".into());
+    args.push("/tmp".into());
+    args.push("--".into());
+    for c in cmd {
+        args.push(c.to_string());
+    }
+    args
 }
 
-const SYSTEM_LIBS: &[&str] = &["/lib", "/lib64", "/usr/lib"];
+fn call(extra: &[&str], cmd: &[&str]) -> std::process::Output {
+    let args = wrap(extra, cmd);
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run_bwrap(&refs)
+}
 
 #[test]
-fn sandbox_runs_sh_through_make_profile() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
+fn bwrap_runs_true() {
+    if !require_bwrap() { return; }
+    let output = call(
+        &["--ro-bind", "/usr/bin/true", "/usr/bin/true",
+          "--ro-bind", "/lib", "/lib",
+          "--ro-bind", "/lib64", "/lib64",
+          "--ro-bind", "/usr/lib", "/usr/lib"],
+        &["/usr/bin/true"],
+    );
+    assert_success(&output);
+}
 
-    let output = run_sandbox_named("make", &["/bin/sh", "-c", "echo ok"]);
+#[test]
+fn bwrap_exit_code_propagated() {
+    if !require_bwrap() { return; }
+    let output = call(
+        &["--ro-bind", "/usr/bin/sh", "/usr/bin/sh",
+          "--ro-bind", "/lib", "/lib",
+          "--ro-bind", "/lib64", "/lib64",
+          "--ro-bind", "/usr/lib", "/usr/lib"],
+        &["/usr/bin/sh", "-c", "exit 42"],
+    );
+    assert_eq!(output.status.code(), Some(42));
+}
+
+#[test]
+fn bwrap_blocks_unlisted_binary() {
+    if !require_bwrap() { return; }
+    let output = call(&[], &["/usr/bin/env"]);
+    assert_failure(&output);
+}
+
+#[test]
+fn bwrap_network_blocked() {
+    if !require_bwrap() { return; }
+    let output = call(
+        &["--ro-bind", "/usr/bin/ping", "/usr/bin/ping",
+          "--ro-bind", "/lib", "/lib",
+          "--ro-bind", "/lib64", "/lib64",
+          "--ro-bind", "/usr/lib", "/usr/lib",
+          "--unshare-net"],
+        &["/usr/bin/ping", "-c", "1", "1.1.1.1"],
+    );
+    assert_failure(&output);
+}
+
+#[test]
+fn bwrap_ro_bind_works() {
+    if !require_bwrap() { return; }
+    let output = call(
+        &["--ro-bind", "/usr/bin/sh", "/usr/bin/sh",
+          "--ro-bind", "/usr/bin/echo", "/usr/bin/echo",
+          "--ro-bind", "/lib", "/lib",
+          "--ro-bind", "/lib64", "/lib64",
+          "--ro-bind", "/usr/lib", "/usr/lib"],
+        &["/usr/bin/sh", "-c", "echo ok"],
+    );
     assert_success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
 }
 
 #[test]
-fn sandbox_blocks_unlisted_binary() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
+fn bwrap_rw_bind_works() {
+    if !require_bwrap() { return; }
+    let output = call(
+        &["--ro-bind", "/usr/bin/sh", "/usr/bin/sh",
+          "--ro-bind", "/usr/bin/touch", "/usr/bin/touch",
+          "--ro-bind", "/lib", "/lib",
+          "--ro-bind", "/lib64", "/lib64",
+          "--ro-bind", "/usr/lib", "/usr/lib",
+          "--bind", "/tmp", "/tmp"],
+        &["/usr/bin/sh", "-c", "touch /tmp/test_bwrap_rw && echo done"],
+    );
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("done"));
+}
 
-    let profile = write_temp_profile(&[("ls", "/usr/bin/ls")], SYSTEM_LIBS, &[]);
-    let output = run_sandbox(&profile, &["/bin/true"]);
+#[test]
+fn bwrap_command_with_args() {
+    if !require_bwrap() { return; }
+    let output = call(
+        &["--ro-bind", "/usr/bin/sh", "/usr/bin/sh",
+          "--ro-bind", "/lib", "/lib",
+          "--ro-bind", "/lib64", "/lib64",
+          "--ro-bind", "/usr/lib", "/usr/lib"],
+        &["/usr/bin/sh", "-c", "echo hello world"],
+    );
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("hello world"));
+}
+
+#[test]
+fn bwrap_not_found_binary_fails() {
+    if !require_bwrap() { return; }
+    let output = call(&[], &["/usr/bin/doesnotexist"]);
     assert_failure(&output);
 }
 
 #[test]
-fn sandbox_blocks_absolute_path_gimp() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let output = run_sandbox_named("make", &["/usr/bin/gimp"]);
-    assert_failure(&output);
+fn bwrap_clearenv_works() {
+    if !require_bwrap() { return; }
+    let output = call(
+        &["--ro-bind", "/usr/bin/env", "/usr/bin/env",
+          "--ro-bind", "/lib", "/lib",
+          "--ro-bind", "/lib64", "/lib64",
+          "--ro-bind", "/usr/lib", "/usr/lib",
+          "--clearenv",
+          "--setenv", "FOO", "bar"],
+        &["/usr/bin/env"],
+    );
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FOO=bar"));
+    assert!(!stdout.contains("USER="));
 }
 
 #[test]
-fn sandbox_blocks_arbitrary_host_usr_bin() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let output = run_sandbox_named("make", &["/bin/ls", "/usr/bin"]);
-    assert_failure(&output);
-}
-
-#[test]
-fn sandbox_only_sees_root_contents() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let output = run_sandbox_named("make", &["/bin/ls", "/"]);
+fn bwrap_only_sees_mounted_paths() {
+    if !require_bwrap() { return; }
+    let output = call(
+        &["--ro-bind", "/usr/bin/ls", "/usr/bin/ls",
+          "--ro-bind", "/lib", "/lib",
+          "--ro-bind", "/lib64", "/lib64",
+          "--ro-bind", "/usr/lib", "/usr/lib"],
+        &["/usr/bin/ls", "/"],
+    );
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("dev"));
     assert!(stdout.contains("proc"));
-    assert!(!stdout.contains("etc/resolv.conf"));
+    assert!(!stdout.contains("boot"));
 }
 
 #[test]
-fn sandbox_network_is_blocked() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let profile = write_temp_profile(&[("ping", "/usr/bin/ping")], SYSTEM_LIBS, &[]);
-    let output = run_sandbox(&profile, &["ping", "-c", "1", "1.1.1.1"]);
+fn bwrap_missing_args_fails() {
+    if !require_bwrap() { return; }
+    let output = run_bwrap(&["--nonexistent"]);
     assert_failure(&output);
-}
-
-#[test]
-fn sandbox_custom_profile_runs_allowed_binary() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let profile = write_temp_profile(&[("sh", "/usr/bin/sh")], SYSTEM_LIBS, &[]);
-    let output = run_sandbox(&profile, &["sh", "-c", "echo allowed"]);
-    assert_success(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("allowed"));
-}
-
-#[test]
-fn sandbox_custom_profile_blocks_unrelated_binary() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let profile = write_temp_profile(&[("sh", "/usr/bin/sh")], SYSTEM_LIBS, &[]);
-    let output = run_sandbox(&profile, &["/usr/bin/env"]);
-    assert_failure(&output);
-}
-
-#[test]
-fn sandbox_not_found_binary_fails() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let profile = write_temp_profile(&[("sh", "/usr/bin/sh")], SYSTEM_LIBS, &[]);
-    let output = run_sandbox(&profile, &["/usr/bin/doesnotexist"]);
-    assert_failure(&output);
-}
-
-#[test]
-fn sandbox_command_with_args_works() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let profile = write_temp_profile(&[("sh", "/usr/bin/sh")], SYSTEM_LIBS, &[]);
-    let output = run_sandbox(&profile, &["sh", "-c", "echo hello world && echo ok"]);
-    assert_success(&output);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("hello world"));
-    assert!(stdout.contains("ok"));
-}
-
-#[test]
-fn sandbox_fails_without_profiles() {
-    require_sandbox();
-
-    let output = run_sandbox_raw(&[
-        "--share", "/usr/share/bunkerbox",
-        "--", "/bin/true",
-    ]);
-    assert_failure(&output);
-}
-
-#[test]
-fn sandbox_merges_two_profiles() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let p1 = write_temp_profile(&[("sh", "/usr/bin/sh")], SYSTEM_LIBS, &[]);
-    let p2 = write_temp_profile(&[("true", "/usr/bin/true")], SYSTEM_LIBS, &[]);
-
-    let sandbox = sandbox_bin();
-    let output = std::process::Command::new(&sandbox)
-        .arg("--share").arg("/usr/share/bunkerbox")
-        .arg("--profile").arg(&p1)
-        .arg("--profile").arg(&p2)
-        .arg("--")
-        .arg("sh")
-        .arg("-c")
-        .arg("true && echo merged")
-        .output()
-        .expect("spawn sandbox");
-
-    assert_success(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("merged"));
-}
-
-#[test]
-fn sandbox_ro_dir_is_accessible() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let profile = write_temp_profile(
-        &[("sh", "/usr/bin/sh")],
-        SYSTEM_LIBS,
-        &[],
-    );
-    let output = run_sandbox(&profile, &["sh", "-c", "ls /lib64/ld-linux-x86-64.so.2"]);
-    assert_success(&output);
-}
-
-#[test]
-fn sandbox_exit_code_is_propagated() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let profile = write_temp_profile(&[("sh", "/usr/bin/sh")], SYSTEM_LIBS, &[]);
-    let output = run_sandbox(&profile, &["sh", "-c", "exit 42"]);
-    assert_eq!(output.status.code(), Some(42));
-}
-
-#[test]
-fn sandbox_binary_symlink_resolves() {
-    require_sandbox();
-    if !require_user_ns() {
-        return;
-    }
-
-    let output = run_sandbox_named("make", &["/bin/sh", "-c", "echo symlink_ok"]);
-    assert_success(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("symlink_ok"));
 }

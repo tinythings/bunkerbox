@@ -188,7 +188,6 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
 
         cmd.arg("--bind").arg(&session.workspace).arg("/workspace");
 
-        let mut extra_paths: Vec<String> = Vec::new();
         for (name, host_path) in &merged.binaries {
             let resolved = if host_path.exists() {
                 host_path.clone()
@@ -198,14 +197,8 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
                 eprintln!("bunkerbox: warning: binary '{name}' not found, skipping");
                 continue;
             };
-            if let Some(parent) = resolved.parent() {
-                let dir = parent.to_string_lossy().to_string();
-                if !extra_paths.contains(&dir) {
-                    extra_paths.push(dir);
-                }
-            }
-            let real = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
-            cmd.arg("--ro-bind").arg(&real).arg(&resolved);
+            let dest = PathBuf::from("/usr/bin").join(name);
+            cmd.arg("--ro-bind").arg(&resolved).arg(&dest);
         }
 
         for dir in &merged.ro_dirs {
@@ -241,14 +234,7 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
         cmd.arg("--chdir").arg(sandbox_cwd);
 
         cmd.arg("--clearenv");
-        let mut sandbox_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string();
-        for extra in &extra_paths {
-            if !sandbox_path.split(':').any(|p| p == extra) {
-                sandbox_path.push(':');
-                sandbox_path.push_str(extra);
-            }
-        }
-        cmd.arg("--setenv").arg("PATH").arg(&sandbox_path);
+        cmd.arg("--setenv").arg("PATH").arg("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
         cmd.arg("--setenv").arg("HOME").arg("/home");
 
         for (key, val) in &merged.env {

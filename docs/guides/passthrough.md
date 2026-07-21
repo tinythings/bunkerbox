@@ -137,6 +137,27 @@ host's real `HOME`, so caches like `~/.cargo/registry`, `~/.cache/go-build`, and
 size is controlled by the `quota` setting in `project.conf`. The default auto-quota
 is 5 GB. Set `quota: 20G` or higher if your builds produce large artifacts.
 
+## Sandboxed execution
+
+When you configure [sandbox profiles](profiles.md) in your `project.conf`, the
+host daemon wraps every passthrough command inside a
+[bubblewrap](https://github.com/containers/bubblewrap) sandbox before
+spawning it.
+
+Bubblewrap uses Linux user namespaces to build a thin, unprivileged container
+around the command. The daemon reads the profile and translates it into
+filesystem and network boundaries: only the binaries you allowed are visible,
+only the directories you declared are accessible, and the network is blocked
+unless you opened it. The command gets a clean environment and a scratch home
+directory — it cannot read your SSH keys, your AWS tokens, or anything else on
+your host.
+
+When profiles are empty (the default), passthrough commands run directly on
+the host with no sandbox wrapping.
+
+See the [Profiles guide](profiles.md) for the format and available built-in
+profiles.
+
 ## Requirements
 
 The host needs the `vhost_vsock` kernel module. Most distributions include it by

@@ -84,6 +84,59 @@ repository for known build system files (`Cargo.toml`, `Makefile`,
 `package.json`, `go.mod`, `CMakeLists.txt`, `pyproject.toml`, `pom.xml`,
 `build.gradle`, `meson.build`) and pre-fills the list automatically.
 
+### `profiles`
+
+Sandbox profiles that govern how passthrough commands are isolated on the
+host. Each entry is either a built-in profile name or an absolute path to a
+custom profile YAML file.
+
+```yaml
+profiles:
+  - rust
+  - make
+  - /home/bo/.config/bunkerbox/profiles/custom-toolchain.yaml
+```
+
+**What profiles do.** When at least one profile is configured, every
+passthrough command runs inside a [bubblewrap](https://github.com/containers/bubblewrap)
+sandbox. The host daemon constructs a minimal Linux namespace from the profile
+rules before spawning the real command.
+
+- Only the binaries listed in the profile are visible inside the sandbox.
+  They are bind-mounted read-only at the paths where the command expects them.
+- Filesystem access is limited to the directories the profile declares.
+  Everything else is invisible.
+- The network is isolated (`--unshare-net`) unless a profile explicitly
+  allows it.
+- The command inherits a clean environment. Only the variables listed in the
+  profile (and a safe subset of the guest VM's environment in `relaxed` mode) are
+  passed through.
+
+**Built-in profiles.** Bunkerbox ships five profiles you can use by name:
+
+| Profile | Provides | For projects with |
+|---------|----------|-------------------|
+| `rust` | `cargo`, `rustc`, `rustfmt`, `cc` | `Cargo.toml` |
+| `make` | `make`, `gcc`, `g++`, `ar`, `ld`, `as`, `strip` | `Makefile` |
+| `go` | `go`, `gofmt` | `go.mod` |
+| `node` | `node`, `npm`, `npx` | `package.json` |
+| `python` | `python3`, `pip3` | `pyproject.toml` |
+
+Built-in profiles are embedded in the Bunkerbox binary — no files needed.
+
+**Custom profiles.** Write your own profile YAML and reference it by absolute
+path. The format is the same as the built-ins. See the [Profiles
+guide](../guides/profiles.md) for the full reference.
+
+**Merging.** When multiple profiles are configured, their rules are merged.
+The union of all binaries, read-only directories, writable directories, and
+environment variables is available to the sandboxed command.
+
+**When profiles are empty** (the default), passthrough commands run directly
+on the host with no sandbox — the pre-bwrap legacy behavior. This is useful
+when you trust the tool completely or are debugging, but it offers no
+additional isolation beyond the vsock whitelist.
+
 ### `image`
 
 Overrides that change how the shared runtime config applies to *this* project.

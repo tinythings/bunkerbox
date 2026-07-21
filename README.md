@@ -13,6 +13,8 @@ It is built for the world where developer tools are becoming more capable, more 
 
 A tool launched through Bunkerbox sees the project workspace it needs, but not the whole host. Its application state can be persisted between runs without exposing the real user home. Its image is built ahead of time from a reproducible config. Its runtime behavior is described separately, so packaging a tool is a matter of pairing an OCI image with a small runtime config.
 
+When the agent runs a build command like `cargo build`, that command executes on your host — but not freely. Bunkerbox wraps it in a bubblewrap sandbox that strips the environment, blocks the network, and exposes only the tools and directories declared in a sandbox profile. The agent can compile your code. It cannot read your SSH keys, curl a payload, or peek at host processes.
+
 The result is a workflow where tools still feel like normal commands, but run with a stronger boundary around them.
 
 ## How it feels

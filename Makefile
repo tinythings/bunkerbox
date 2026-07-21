@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help ensure-toolchain dev release check test integration-test setup image install-image prepare config docs docs-clean musl-vscomm
+.PHONY: help ensure-toolchain dev release check test integration-test setup image install-image prepare config docs docs-clean musl-vscomm clean
 
 DOCS_VENV := .venv-docs
 DOCS_MKDOCS := $(DOCS_VENV)/bin/mkdocs
@@ -30,6 +30,7 @@ help:
 	@printf "  %-24s %s\n"    "  config" "Configure project interactively"
 	@printf "  %-24s %s\n"    "" ""
 	@printf "  %-24s %s\n"    "Cleanup" ""
+	@printf "  %-24s %s\n"    "  clean" "Remove build artifacts (cargo clean)"
 	@printf "  %-24s %s\n"    "  docs-clean" "Remove docs build artifacts"
 
 ensure-toolchain:
@@ -84,3 +85,6 @@ docs: $(DOCS_MKDOCS)
 
 docs-clean:
 	rm -rf target/site-docs $(DOCS_VENV)
+
+clean: docs-clean
+	cargo clean

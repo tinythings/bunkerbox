@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help ensure-toolchain dev release check test integration-test setup image install-image prepare config docs docs-clean musl-vscomm clean
+.PHONY: help ensure-toolchain dev release check test integration-test setup image install-image prepare config docs docs-dev docs-clean musl-vscomm clean
 
 DOCS_VENV := .venv-docs
 DOCS_MKDOCS := $(DOCS_VENV)/bin/mkdocs
@@ -14,7 +14,6 @@ help:
 	@printf "  %-24s %s\n"    "  check" "Format and lint"
 	@printf "  %-24s %s\n"    "  test" "Run tests (requires cargo-nextest)"
 	@printf "  %-24s %s\n"    "  integration-test" "Run sandbox integration tests"
-	@printf "  %-24s %s\n"    "  docs" "Build documentation site"
 	@printf "  %-24s %s\n"    "" ""
 	@printf "  %-24s %s\n"    "Toolchain" ""
 	@printf "  %-24s %s\n"    "  ensure-toolchain" "Install/update Rust stable and musl target"
@@ -29,9 +28,13 @@ help:
 	@printf "  %-24s %s\n"    "  prepare" "Prepare workspace overlay layers"
 	@printf "  %-24s %s\n"    "  config" "Configure project interactively"
 	@printf "  %-24s %s\n"    "" ""
+	@printf "  %-24s %s\n"    "Documentation" ""
+	@printf "  %-24s %s\n"    "  docs" "Build documentation site"
+	@printf "  %-24s %s\n"    "  docs-dev" "Serve docs locally with live reload"
+	@printf "  %-24s %s\n"    "  docs-clean" "Remove docs build artifacts"
+	@printf "  %-24s %s\n"    "" ""
 	@printf "  %-24s %s\n"    "Cleanup" ""
 	@printf "  %-24s %s\n"    "  clean" "Remove build artifacts (cargo clean)"
-	@printf "  %-24s %s\n"    "  docs-clean" "Remove docs build artifacts"
 
 ensure-toolchain:
 	@command -v rustup >/dev/null 2>&1 || { echo "rustup is required: https://rustup.rs" >&2; exit 1; }
@@ -83,8 +86,11 @@ $(DOCS_MKDOCS): docs/requirements.txt
 docs: $(DOCS_MKDOCS)
 	$(DOCS_MKDOCS) build --strict
 
+docs-dev: $(DOCS_MKDOCS)
+	$(DOCS_MKDOCS) serve
+
 docs-clean:
 	rm -rf target/site-docs $(DOCS_VENV)
 
-clean: docs-clean
+clean:
 	cargo clean

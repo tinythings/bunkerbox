@@ -7,5 +7,6 @@ pub mod kata;
 pub mod overlay;
 pub mod proxy;
 pub mod sandbox;
+pub mod tui;
 pub mod vscomm;
 pub mod workspace;

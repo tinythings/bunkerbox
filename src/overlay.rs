@@ -344,6 +344,11 @@ fn sync_upper_dir(
     base: &Path, current: &Path, repo_root: &Path, count_add: &mut usize, count_del: &mut usize, _manifest_old: &BTreeSet<String>,
     manifest_new: &mut BTreeSet<String>,
 ) -> Result<(), String> {
+    let rel_current = current.strip_prefix(base).map_err(|e| format!("strip prefix: {e}"))?;
+    if rel_current.starts_with(".bunkerbox") {
+        return Ok(());
+    }
+
     let mut has_opq = false;
 
     for entry in fs::read_dir(current).map_err(|e| format!("failed to read {}: {e}", current.display()))? {

@@ -15,9 +15,15 @@ impl FilterProxy {
     }
 
     pub async fn bind(self) -> Result<tokio::task::JoinHandle<()>, String> {
-        let addr: SocketAddr = format!("{BIND_ADDR}:{PORT}").parse().map_err(|e| format!("invalid proxy bind address: {e}"))?;
+        let (handle, _) = self.bind_on(PORT).await?;
+        Ok(handle)
+    }
+
+    pub async fn bind_on(self, port: u16) -> Result<(tokio::task::JoinHandle<()>, u16), String> {
+        let addr: SocketAddr = format!("{BIND_ADDR}:{port}").parse().map_err(|e| format!("invalid proxy bind address: {e}"))?;
 
         let listener = TcpListener::bind(addr).await.map_err(|e| format!("failed to bind proxy on {addr}: {e}"))?;
+        let bound_port = listener.local_addr().map_err(|e| format!("get local addr: {e}"))?.port();
 
         let allow = self.allow;
 
@@ -38,7 +44,7 @@ impl FilterProxy {
             }
         });
 
-        Ok(handle)
+        Ok((handle, bound_port))
     }
 }
 
@@ -66,7 +72,9 @@ async fn handle_client(mut client: TcpStream, allow: &[String]) -> Result<(), St
         (h, p, true)
     } else if target.starts_with("http://") {
         let url = target.strip_prefix("http://").ok_or_else(|| format!("malformed URL: {target}"))?;
-        let (h, p) = url.split_once('/').map_or_else(|| (url, "80"), |(hp, _)| hp.split_once(':').unwrap_or((hp, "80")));
+        let (h, p) = url.split_once('/').map_or_else(|| (url, "80"), |(hp, _)| {
+            hp.split_once(':').unwrap_or((hp, "80"))
+        });
         (h.to_string(), p.to_string(), false)
     } else {
         return Err(format!("unsupported request: {first_line}"));
@@ -79,7 +87,9 @@ async fn handle_client(mut client: TcpStream, allow: &[String]) -> Result<(), St
     }
 
     let upstream_addr = format!("{host}:{port}");
-    let mut upstream = TcpStream::connect(&upstream_addr).await.map_err(|e| format!("connect to {upstream_addr}: {e}"))?;
+    let mut upstream = TcpStream::connect(&upstream_addr)
+        .await
+        .map_err(|e| format!("connect to {upstream_addr}: {e}"))?;
 
     if is_connect {
         let established = b"HTTP/1.1 200 Connection Established\r\n\r\n";

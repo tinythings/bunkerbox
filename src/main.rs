@@ -1,16 +1,5 @@
-mod cfg;
-mod cfgsetup;
-mod clidef;
-mod cmdrun;
-mod daemon;
-mod kata;
-mod overlay;
-mod proxy;
-mod sandbox;
-mod vscomm;
-mod workspace;
-
-use cfg::{ProjectConfig, WorkspaceMode};
+use bunkerbox::cfg::{ProjectConfig, WorkspaceMode};
+use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, overlay, workspace};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 

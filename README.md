@@ -6,8 +6,8 @@
 [![CI](https://github.com/tinythings/bunkerbox/actions/workflows/ci.yml/badge.svg)](https://github.com/tinythings/bunkerbox/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.97.1-orange)](https://www.rust-lang.org)
 [![License](https://img.shields.io/github/license/tinythings/bunkerbox)](https://github.com/tinythings/bunkerbox/blob/main/LICENSE)
-[![Docs](https://github.com/tinythings/bunkerbox/actions/workflows/docs.yml/badge.svg)](https://github.com/tinythings/bunkerbox/actions/workflows/docs.yml)
 [![Release](https://img.shields.io/github/v/release/tinythings/bunkerbox)](https://github.com/tinythings/bunkerbox/releases)
+[![Docs](https://github.com/tinythings/bunkerbox/actions/workflows/docs.yml/badge.svg)](https://github.com/tinythings/bunkerbox/actions/workflows/docs.yml)
 
 **Run powerful development agents without handing them your whole machine.**
 

@@ -11,16 +11,14 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Terminal;
 
-// ---------------------------------------------------------------------------
-// Terminal emulator wrapper around vt100::Parser
-// ---------------------------------------------------------------------------
-
 static RESIZED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigwinch(_: libc::c_int) {
     RESIZED.store(true, Ordering::SeqCst);
 }
 
+/// Terminal emulator wrapper around [`vt100::Parser`] with DEC Special Graphics
+/// character set translation and HVP-to-CUP normalization.
 struct Term {
     parser: vt100::Parser,
     escape_state: EscapeState,
@@ -40,6 +38,7 @@ enum EscapeState {
 }
 
 impl Term {
+    /// Creates a new terminal of the given rows and columns.
     fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, 0),
@@ -50,14 +49,17 @@ impl Term {
         }
     }
 
+    /// Returns a reference to the vt100 screen grid for rendering.
     fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }
 
+    /// Resizes the terminal grid after a window resize event.
     fn set_size(&mut self, rows: u16, cols: u16) {
         self.parser.set_size(rows, cols);
     }
 
+    /// Feeds raw bytes through DEC translation then into the vt100 parser.
     fn process(&mut self, bytes: &[u8]) {
         let translated = self.translate_dec_special_graphics(bytes);
         self.parser.process(&translated);
@@ -71,6 +73,8 @@ impl Term {
         }
     }
 
+    /// Translates `\e(0` DEC Special Graphics characters to Unicode
+    /// box-drawing glyphs and normalizes HVP (`CSI … f`) to CUP (`CSI … H`).
     fn translate_dec_special_graphics(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut translated = Vec::with_capacity(bytes.len());
 
@@ -150,6 +154,8 @@ impl Term {
     }
 }
 
+/// Converts a single byte from the DEC Special Graphics table to its Unicode
+/// equivalent (e.g. `x` → `│`, `q` → `─`). Appends the UTF-8 bytes to `out`.
 fn push_dec_special_graphic(out: &mut Vec<u8>, byte: u8) {
     let mapped = match byte {
         b'`' => '◆',
@@ -192,10 +198,15 @@ fn push_dec_special_graphic(out: &mut Vec<u8>, byte: u8) {
     out.extend_from_slice(mapped.encode_utf8(&mut buf).as_bytes());
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
+/// Renders PTY output through ratatui until the child process exits.
+///
+/// Forwards real keystrokes to the PTY master, parses terminal output through
+/// [`vt100::Parser`], and draws each frame with full 24-bit color plus a
+/// floating "Bunkerbox" overlay in the top-right corner.
+///
+/// If `setup_fd` is provided, the loop also polls it for a single message;
+/// when readable, all bytes are read, the fd is closed, and `on_setup` is
+/// called once with the received data before polling continues.
 pub fn event_loop<F>(master_fd: RawFd, rows: u16, cols: u16, setup_fd: Option<RawFd>, on_setup: Option<F>) -> Result<(), String>
 where
     F: FnOnce(Vec<u8>) -> Result<(), String>,
@@ -309,10 +320,8 @@ where
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
-
+/// Converts a [`vt100::Color`] to a [`ratatui::style::Color`], preserving
+/// 24-bit RGB, 256-color indexed palette, and terminal default.
 fn to_ratatui_color(c: vt100::Color) -> Color {
     match c {
         vt100::Color::Default => Color::Reset,
@@ -321,6 +330,9 @@ fn to_ratatui_color(c: vt100::Color) -> Color {
     }
 }
 
+/// Renders one frame: writes every vt100 screen cell to the ratatui buffer
+/// with full color and attributes, draws the floating "Bunkerbox" overlay,
+/// and positions the cursor.
 fn render_frame(f: &mut Frame, screen: &vt100::Screen) {
     let area = f.area();
     let (rows, cols) = screen.size();

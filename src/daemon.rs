@@ -223,6 +223,11 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
             cmd.arg("--unshare-net");
         }
 
+        cmd.arg("--unshare-pid");
+        cmd.arg("--unshare-user");
+        cmd.arg("--uid").arg("0");
+        cmd.arg("--gid").arg("0");
+
         cmd.arg("--proc").arg("/proc");
         cmd.arg("--dev").arg("/dev");
         cmd.arg("--tmpfs").arg("/tmp");

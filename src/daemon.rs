@@ -1,4 +1,5 @@
 use crate::cfg::EnvMode;
+use crate::proxy::FilterProxy;
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
 use crate::vscomm::{ExecRequest, Frame, FrameType, VSOCK_PORT};
 use std::path::{Path, PathBuf};
@@ -12,36 +13,28 @@ struct VsockSession {
     env_mode: EnvMode,
     workspace: PathBuf,
     merged_profile: Option<Arc<MergedProfile>>,
+    has_proxy: bool,
 }
 
 pub struct VsockDaemon {
     join_handle: tokio::task::JoinHandle<()>,
     shutdown: tokio::sync::oneshot::Sender<()>,
+    proxy_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl VsockDaemon {
     pub fn start(
-        passthrough: Vec<String>,
-        env_mode: EnvMode,
-        workspace: PathBuf,
-        profiles: Vec<String>,
-        share_dir: PathBuf,
+        passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, profiles: Vec<String>, share_dir: PathBuf, allow: Vec<String>,
     ) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         let merged_profile = if profiles.is_empty() {
             None
         } else {
-            let loaded: Vec<_> = profiles
-                .iter()
-                .map(|p| resolve_profile(p, &share_dir))
-                .collect::<Result<Vec<_>, _>>()?;
+            let loaded: Vec<_> = profiles.iter().map(|p| resolve_profile(p, &share_dir)).collect::<Result<Vec<_>, _>>()?;
             let merged = MergedProfile::from_profiles(&loaded);
 
-            let check = std::process::Command::new("bwrap")
-                .arg("--version")
-                .output()
-                .map_err(|e| format!("bwrap not found: {e}"))?;
+            let check = std::process::Command::new("bwrap").arg("--version").output().map_err(|e| format!("bwrap not found: {e}"))?;
             if !check.status.success() {
                 return Err("bwrap is not functional. Install bubblewrap to use sandbox profiles.".into());
             }
@@ -49,12 +42,18 @@ impl VsockDaemon {
             Some(Arc::new(merged))
         };
 
-        let session = Arc::new(VsockSession {
-            passthrough: Arc::new(passthrough),
-            env_mode,
-            workspace,
-            merged_profile,
-        });
+        let has_proxy = !allow.is_empty();
+        let proxy_handle = if has_proxy {
+            let rt = tokio::runtime::Handle::current();
+            Some(rt.block_on(async {
+                let proxy = FilterProxy::new(allow);
+                proxy.bind().await
+            })?)
+        } else {
+            None
+        };
+
+        let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), env_mode, workspace, merged_profile, has_proxy });
 
         let join_handle = tokio::spawn(async move {
             let result = daemon_loop(session, shutdown_rx).await;
@@ -63,25 +62,26 @@ impl VsockDaemon {
             }
         });
 
-        Ok(Self { join_handle, shutdown: shutdown_tx })
+        Ok(Self { join_handle, shutdown: shutdown_tx, proxy_handle })
     }
 
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
         let _ = self.join_handle.await;
+        if let Some(handle) = self.proxy_handle {
+            handle.abort();
+        }
     }
 }
 
-async fn daemon_loop(
-    session: Arc<VsockSession>,
-    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-) -> Result<(), String> {
+async fn daemon_loop(session: Arc<VsockSession>, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
     use tokio_vsock::VsockListener;
 
     let listener = match VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, VSOCK_PORT)) {
         Ok(l) => l,
-        Err(e) => {
-            eprintln!("bunkerbox: vsock unavailable (passthrough disabled): {e}");
+        Err(_e) => {
+            // TODO: route to log socket
+            // eprintln!("bunkerbox: vsock unavailable (passthrough disabled): {e}");
             let _ = shutdown_rx.await;
             return Ok(());
         }
@@ -94,8 +94,9 @@ async fn daemon_loop(
                     Ok((stream, _peer)) => {
                         let session = session.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_connection(stream, &session).await {
-                                eprintln!("bunkerbox: vsock session error: {err}");
+                            if let Err(_err) = handle_connection(stream, &session).await {
+                                // TODO: route to log socket
+                                // eprintln!("bunkerbox: vsock session error: {err}");
                             }
                         });
                     }
@@ -113,10 +114,7 @@ async fn daemon_loop(
     Ok(())
 }
 
-async fn handle_connection(
-    stream: tokio_vsock::VsockStream,
-    session: &VsockSession,
-) -> Result<(), String> {
+async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSession) -> Result<(), String> {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let req = read_exec_request(&mut reader).await?;
@@ -130,9 +128,7 @@ async fn handle_connection(
 
     let sandbox_cwd = req.cwd.clone();
     let host_cwd = if req.cwd.starts_with("/workspace") {
-        session
-            .workspace
-            .join(req.cwd.strip_prefix("/workspace").unwrap_or(&req.cwd).trim_start_matches('/'))
+        session.workspace.join(req.cwd.strip_prefix("/workspace").unwrap_or(&req.cwd).trim_start_matches('/'))
     } else {
         PathBuf::from(&req.cwd)
     };
@@ -219,7 +215,7 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
             cmd.arg("--ro-bind").arg(&resolved).arg("/bin/sh");
         }
 
-        if matches!(merged.network, NetworkMode::None) {
+        if !session.has_proxy && matches!(merged.network, NetworkMode::None) {
             cmd.arg("--unshare-net");
         }
 
@@ -242,13 +238,30 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
         cmd.arg("--setenv").arg("PATH").arg("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
         cmd.arg("--setenv").arg("HOME").arg("/home");
 
+        if session.has_proxy {
+            let proxy_url = "http://127.0.0.1:20000";
+            cmd.arg("--setenv").arg("HTTP_PROXY").arg(proxy_url);
+            cmd.arg("--setenv").arg("HTTPS_PROXY").arg(proxy_url);
+            cmd.arg("--setenv").arg("http_proxy").arg(proxy_url);
+            cmd.arg("--setenv").arg("https_proxy").arg(proxy_url);
+        }
+
         for (key, val) in &merged.env {
             cmd.arg("--setenv").arg(key).arg(val);
         }
 
         if session.env_mode == EnvMode::Relaxed {
             for (key, val) in &req.env {
-                if key == "PATH" || key == "HOME" || key == "VSOCK_CID" || key.starts_with("BUNKERBOX_") || key.starts_with("XDG_") {
+                if key == "PATH"
+                    || key == "HOME"
+                    || key == "VSOCK_CID"
+                    || key == "HTTP_PROXY"
+                    || key == "HTTPS_PROXY"
+                    || key == "http_proxy"
+                    || key == "https_proxy"
+                    || key.starts_with("BUNKERBOX_")
+                    || key.starts_with("XDG_")
+                {
                     continue;
                 }
                 cmd.arg("--setenv").arg(key).arg(val);
@@ -269,7 +282,16 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
 
         if session.env_mode == EnvMode::Relaxed {
             for (key, val) in &req.env {
-                if key == "PATH" || key == "HOME" || key == "VSOCK_CID" || key.starts_with("BUNKERBOX_") || key.starts_with("XDG_") {
+                if key == "PATH"
+                    || key == "HOME"
+                    || key == "VSOCK_CID"
+                    || key == "HTTP_PROXY"
+                    || key == "HTTPS_PROXY"
+                    || key == "http_proxy"
+                    || key == "https_proxy"
+                    || key.starts_with("BUNKERBOX_")
+                    || key.starts_with("XDG_")
+                {
                     continue;
                 }
                 cmd.env(key, val);
@@ -309,11 +331,7 @@ fn is_allowed(passthrough: &[String], command: &str, args: &[String]) -> bool {
                 return true;
             }
         } else {
-            let full = if args.is_empty() {
-                command.to_string()
-            } else {
-                format!("{} {}", command, args.join(" "))
-            };
+            let full = if args.is_empty() { command.to_string() } else { format!("{} {}", command, args.join(" ")) };
             if entry == full {
                 return true;
             }
@@ -327,8 +345,7 @@ async fn read_exec_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Ex
     reader.read_exact(&mut header).await.map_err(|e| format!("read header: {e}"))?;
 
     let frame_type_raw = u16::from_le_bytes([header[0], header[1]]);
-    let ft = FrameType::from_u16(frame_type_raw)
-        .ok_or_else(|| format!("unknown frame type: {frame_type_raw}"))?;
+    let ft = FrameType::from_u16(frame_type_raw).ok_or_else(|| format!("unknown frame type: {frame_type_raw}"))?;
 
     if !matches!(ft, FrameType::ExecReq) {
         return Err(format!("expected ExecReq, got {:?}", ft as u16));
@@ -343,10 +360,7 @@ async fn read_exec_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Ex
     ExecRequest::deserialize(&payload)
 }
 
-async fn pump_to_channel<R: AsyncReadExt + Unpin>(
-    mut reader: R,
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-) {
+async fn pump_to_channel<R: AsyncReadExt + Unpin>(mut reader: R, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {

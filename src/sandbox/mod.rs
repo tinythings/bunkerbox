@@ -98,15 +98,13 @@ pub fn parse_profile_yaml(yaml: &str) -> Result<Profile, String> {
 
 pub fn resolve_profile(name_or_path: &str, share_dir: &std::path::Path) -> Result<Profile, String> {
     if name_or_path.starts_with('/') {
-        let contents = std::fs::read_to_string(name_or_path)
-            .map_err(|e| format!("failed to read profile {}: {e}", name_or_path))?;
+        let contents = std::fs::read_to_string(name_or_path).map_err(|e| format!("failed to read profile {}: {e}", name_or_path))?;
         return parse_profile_yaml(&contents);
     }
 
     let share_path = share_dir.join("profiles").join(format!("{name_or_path}.yaml"));
     if share_path.exists() {
-        let contents = std::fs::read_to_string(&share_path)
-            .map_err(|e| format!("failed to read profile {}: {e}", share_path.display()))?;
+        let contents = std::fs::read_to_string(&share_path).map_err(|e| format!("failed to read profile {}: {e}", share_path.display()))?;
         return parse_profile_yaml(&contents);
     }
 
@@ -131,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_parse_profile() {
-            let yaml = r#"
+        let yaml = r#"
 name: test
 bin:
   ls: /usr/bin/ls
@@ -144,11 +142,11 @@ env:
 network: none
 shell: /bin/sh
 "#;
-            let profile = parse_profile_yaml(yaml).unwrap();
-            assert_eq!(profile.name, "test");
-            assert_eq!(profile.bin.get("ls").unwrap(), &std::path::PathBuf::from("/usr/bin/ls"));
-            assert_eq!(profile.ro.len(), 1);
-            assert_eq!(profile.rw.len(), 1);
+        let profile = parse_profile_yaml(yaml).unwrap();
+        assert_eq!(profile.name, "test");
+        assert_eq!(profile.bin.get("ls").unwrap(), &std::path::PathBuf::from("/usr/bin/ls"));
+        assert_eq!(profile.ro.len(), 1);
+        assert_eq!(profile.rw.len(), 1);
         assert!(matches!(profile.network, NetworkMode::None));
     }
 
@@ -163,7 +161,11 @@ shell: /bin/sh
             },
             ro: vec!["/lib".into()],
             rw: vec!["/cache".into()],
-            env: { let mut m = BTreeMap::new(); m.insert("A".into(), "1".into()); m },
+            env: {
+                let mut m = BTreeMap::new();
+                m.insert("A".into(), "1".into());
+                m
+            },
             network: NetworkMode::None,
             shell: "/bin/sh".into(),
         };
@@ -176,7 +178,11 @@ shell: /bin/sh
             },
             ro: vec!["/usr/lib".into()],
             rw: vec!["/other".into()],
-            env: { let mut m = BTreeMap::new(); m.insert("B".into(), "2".into()); m },
+            env: {
+                let mut m = BTreeMap::new();
+                m.insert("B".into(), "2".into());
+                m
+            },
             network: NetworkMode::None,
             shell: "/bin/dash".into(),
         };

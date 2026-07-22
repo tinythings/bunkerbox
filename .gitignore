@@ -1,6 +1,7 @@
 target/
 .bunker/
 .*
+!.github/
 
 # Documentation
 .venv-docs/

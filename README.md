@@ -3,6 +3,10 @@
 
 # Bunkerbox
 
+[![CI](https://github.com/anomalyco/bunkerbox/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/bunkerbox/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-1.97.1-orange)](https://www.rust-lang.org)
+[![License](https://img.shields.io/github/license/anomalyco/bunkerbox)](https://github.com/anomalyco/bunkerbox/blob/main/LICENSE)
+
 **Run powerful development agents without handing them your whole machine.**
 
 Bunkerbox is an isolation layer for coding agents, CLIs, and other developer tools that need to work inside a project directory. Instead of running those tools directly on the host, Bunkerbox runs them inside a Kata-backed container with a controlled workspace, controlled home directory, and explicit runtime configuration.

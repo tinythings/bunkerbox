@@ -314,10 +314,9 @@ fn find_vscomm_binary() -> Result<PathBuf, String> {
         }
     }
 
-    Err(format!(
-        "musl-static bunkerbox-vscomm not found in target/x86_64-unknown-linux-musl/{{release,debug}}/\n\
+    Err("musl-static bunkerbox-vscomm not found in target/x86_64-unknown-linux-musl/{release,debug}/\n\
          build it first: make musl-vscomm"
-    ))
+        .to_string())
 }
 
 fn podman_build(config: &ImageConfig, build_dir: &Path) -> Result<(), String> {

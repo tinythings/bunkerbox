@@ -1,6 +1,7 @@
 use bunkerbox::cfg::{ProjectConfig, WorkspaceMode};
-use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, overlay, workspace};
+use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, overlay, tui, workspace};
 use std::ffi::OsString;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -175,13 +176,47 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
         None
     };
 
-    let result = kata::run(&config, ws, &container_name, share_dir, &name, daemon.is_some());
+    let vsock_enabled = daemon.is_some();
+
+    let (cols, rows) = crossterm::terminal::size().map_err(|e| format!("terminal size: {e}"))?;
+
+    let winsize = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+
+    let mut master: RawFd = -1;
+    let pid = unsafe { libc::forkpty(&mut master, std::ptr::null_mut(), std::ptr::null(), &winsize) };
+
+    if pid == -1 {
+        return Err("forkpty failed".to_string());
+    }
+
+    if pid == 0 {
+        let code = match kata::run(&config, ws, &container_name, share_dir, &name, vsock_enabled) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("bunkerbox: {e}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
+    let tui_result = tui::event_loop(master, rows, cols);
+
+    let mut status: i32 = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    unsafe { libc::close(master) };
 
     if let Some(d) = daemon {
         tokio::runtime::Handle::current().block_on(d.shutdown());
     }
 
-    result
+    tui_result?;
+
+    if status != 0 {
+        return Err(format!("child exited with status {status}"));
+    }
+
+    Ok(())
 }
 
 fn print_subcommand_help(name: &str) -> Result<(), String> {

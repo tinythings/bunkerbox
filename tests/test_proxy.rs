@@ -13,19 +13,11 @@ async fn proxy_allows_connect_to_allowed_host() {
         sock.write_all(&buf[..n]).await.unwrap();
     });
 
-    let (handle, proxy_port) = FilterProxy::new(vec!["localhost".into()])
-        .bind_on(0)
-        .await
-        .unwrap();
+    let (handle, proxy_port) = FilterProxy::new(vec!["localhost".into()]).bind_on(0).await.unwrap();
 
-    let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
 
-    client
-        .write_all(format!("CONNECT localhost:{echo_port} HTTP/1.1\r\n\r\n").as_bytes())
-        .await
-        .unwrap();
+    client.write_all(format!("CONNECT localhost:{echo_port} HTTP/1.1\r\n\r\n").as_bytes()).await.unwrap();
 
     let mut response = [0u8; 256];
     let n = client.read(&mut response).await.unwrap();
@@ -42,19 +34,11 @@ async fn proxy_allows_connect_to_allowed_host() {
 
 #[tokio::test]
 async fn proxy_blocks_connect_to_denied_host() {
-    let (handle, proxy_port) = FilterProxy::new(vec!["only.this.host".into()])
-        .bind_on(0)
-        .await
-        .unwrap();
+    let (handle, proxy_port) = FilterProxy::new(vec!["only.this.host".into()]).bind_on(0).await.unwrap();
 
-    let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
 
-    client
-        .write_all(b"CONNECT evil.com:443 HTTP/1.1\r\n\r\n")
-        .await
-        .unwrap();
+    client.write_all(b"CONNECT evil.com:443 HTTP/1.1\r\n\r\n").await.unwrap();
 
     let mut response = [0u8; 256];
     let n = client.read(&mut response).await.unwrap();
@@ -70,27 +54,14 @@ async fn proxy_forwards_plain_http_to_allowed_host() {
     let srv_port = srv.local_addr().unwrap().port();
     tokio::spawn(async move {
         let (mut sock, _) = srv.accept().await.unwrap();
-        sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nworld")
-            .await
-            .unwrap();
+        sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nworld").await.unwrap();
     });
 
-    let (handle, proxy_port) = FilterProxy::new(vec!["localhost".into()])
-        .bind_on(0)
-        .await
-        .unwrap();
+    let (handle, proxy_port) = FilterProxy::new(vec!["localhost".into()]).bind_on(0).await.unwrap();
 
-    let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
 
-    client
-        .write_all(
-            format!("GET http://localhost:{srv_port}/items HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                .as_bytes(),
-        )
-        .await
-        .unwrap();
+    client.write_all(format!("GET http://localhost:{srv_port}/items HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes()).await.unwrap();
 
     let mut response = Vec::new();
     let mut buf = [0u8; 512];

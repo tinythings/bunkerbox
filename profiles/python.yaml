@@ -1,12 +1,12 @@
 name: python
 
-binaries:
+bin:
   python3: /usr/bin/python3
   python: /usr/bin/python3
   pip3: /usr/bin/pip3
   pip: /usr/bin/pip3
 
-ro_dirs:
+ro:
   - /lib
   - /lib64
   - /usr/lib
@@ -17,7 +17,7 @@ ro_dirs:
   - /usr/lib/locale
   - /usr/share/python3
 
-rw_dirs:
+rw:
   - "${HOME}/.cache/pip"
 
 env:

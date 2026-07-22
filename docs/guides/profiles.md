@@ -77,17 +77,17 @@ structure as the built-ins:
 ```yaml
 name: my-toolchain
 
-binaries:
+bin:
   my-compiler: /opt/toolchain/bin/my-compiler
   my-linker: /opt/toolchain/bin/my-linker
 
-ro_dirs:
+ro:
   - /lib
   - /lib64
   - /usr/lib
   - /opt/toolchain/lib
 
-rw_dirs:
+rw:
   - "${HOME}/.cache/my-toolchain"
 
 env:
@@ -109,17 +109,17 @@ profiles:
 
 **`name`** — a human-readable label. Used for logging and debugging.
 
-**`binaries`** — the host executables the sandboxed command may access. Each
+**`bin`** — the host executables the sandboxed command may access. Each
 entry maps a command name to its absolute path on the host. The daemon
 resolves the path against your `PATH` before mounting, so you can write
 `cargo: /usr/bin/cargo` and it will still work if cargo lives at
 `~/.cargo/bin/cargo` — the daemon finds it for you.
 
-**`ro_dirs`** — directories mounted read-only inside the sandbox. Use these
+**`ro`** — directories mounted read-only inside the sandbox. Use these
 for system libraries, toolchain directories, SSL certificates, timezone data,
 and anything else the tools need to read but should never modify.
 
-**`rw_dirs`** — directories mounted read-write inside the sandbox. Use these
+**`rw`** — directories mounted read-write inside the sandbox. Use these
 for caches, build artifacts that should persist between runs, and any
 directory the toolchain needs to write to. The `${HOME}` variable expands to
 your host home directory.

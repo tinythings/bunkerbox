@@ -188,7 +188,7 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
 
         cmd.arg("--bind").arg(&session.workspace).arg("/workspace");
 
-        for (name, host_path) in &merged.binaries {
+        for (name, host_path) in &merged.bin {
             let resolved = if host_path.exists() {
                 host_path.clone()
             } else if let Some(found) = find_in_path(name) {
@@ -201,14 +201,14 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
             cmd.arg("--ro-bind").arg(&resolved).arg(&dest);
         }
 
-        for dir in &merged.ro_dirs {
+        for dir in &merged.ro {
             let p = Path::new(dir);
             if p.exists() {
                 cmd.arg("--ro-bind").arg(dir).arg(dir);
             }
         }
 
-        for dir in &merged.rw_dirs {
+        for dir in &merged.rw {
             let p = Path::new(dir);
             if p.exists() {
                 cmd.arg("--bind").arg(dir).arg(dir);

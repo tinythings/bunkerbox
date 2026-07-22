@@ -1,11 +1,11 @@
 name: node
 
-binaries:
+bin:
   node: /usr/bin/node
   npm: /usr/bin/npm
   npx: /usr/bin/npx
 
-ro_dirs:
+ro:
   - /lib
   - /lib64
   - /usr/lib
@@ -15,7 +15,7 @@ ro_dirs:
   - /usr/share/zoneinfo
   - /usr/lib/locale
 
-rw_dirs:
+rw:
   - "${HOME}/.npm"
   - "${HOME}/.node-gyp"
 

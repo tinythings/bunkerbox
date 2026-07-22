@@ -7,11 +7,12 @@ use serde::Deserialize;
 pub struct Profile {
     pub name: String,
     #[serde(default)]
-    pub binaries: BTreeMap<String, PathBuf>,
-    #[serde(default)]
-    pub ro_dirs: Vec<String>,
-    #[serde(default)]
-    pub rw_dirs: Vec<String>,
+    #[serde(alias = "binaries")]
+    pub bin: BTreeMap<String, PathBuf>,
+    #[serde(default, alias = "ro_dirs")]
+    pub ro: Vec<String>,
+    #[serde(default, alias = "rw_dirs")]
+    pub rw: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -34,9 +35,9 @@ pub enum NetworkMode {
 #[derive(Debug, Clone, Default)]
 pub struct MergedProfile {
     pub name: String,
-    pub binaries: BTreeMap<String, PathBuf>,
-    pub ro_dirs: Vec<String>,
-    pub rw_dirs: Vec<String>,
+    pub bin: BTreeMap<String, PathBuf>,
+    pub ro: Vec<String>,
+    pub rw: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub network: NetworkMode,
     pub shell: PathBuf,
@@ -52,19 +53,19 @@ impl MergedProfile {
         }
         merged.name = profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join("+");
         for p in profiles {
-            for (k, v) in &p.binaries {
-                merged.binaries.entry(k.clone()).or_insert_with(|| v.clone());
+            for (k, v) in &p.bin {
+                merged.bin.entry(k.clone()).or_insert_with(|| v.clone());
             }
-            for d in &p.ro_dirs {
+            for d in &p.ro {
                 let expanded = expand_vars(d);
-                if !merged.ro_dirs.contains(&expanded) {
-                    merged.ro_dirs.push(expanded);
+                if !merged.ro.contains(&expanded) {
+                    merged.ro.push(expanded);
                 }
             }
-            for d in &p.rw_dirs {
+            for d in &p.rw {
                 let expanded = expand_vars(d);
-                if !merged.rw_dirs.contains(&expanded) {
-                    merged.rw_dirs.push(expanded);
+                if !merged.rw.contains(&expanded) {
+                    merged.rw.push(expanded);
                 }
             }
             for (k, v) in &p.env {
@@ -130,24 +131,24 @@ mod tests {
 
     #[test]
     fn test_parse_profile() {
-        let yaml = r#"
+            let yaml = r#"
 name: test
-binaries:
+bin:
   ls: /usr/bin/ls
-ro_dirs:
+ro:
   - /lib
-rw_dirs:
+rw:
   - "${HOME}/.cache"
 env:
   FOO: bar
 network: none
 shell: /bin/sh
 "#;
-        let profile = parse_profile_yaml(yaml).unwrap();
-        assert_eq!(profile.name, "test");
-        assert_eq!(profile.binaries.get("ls").unwrap(), &std::path::PathBuf::from("/usr/bin/ls"));
-        assert_eq!(profile.ro_dirs.len(), 1);
-        assert_eq!(profile.rw_dirs.len(), 1);
+            let profile = parse_profile_yaml(yaml).unwrap();
+            assert_eq!(profile.name, "test");
+            assert_eq!(profile.bin.get("ls").unwrap(), &std::path::PathBuf::from("/usr/bin/ls"));
+            assert_eq!(profile.ro.len(), 1);
+            assert_eq!(profile.rw.len(), 1);
         assert!(matches!(profile.network, NetworkMode::None));
     }
 
@@ -155,34 +156,34 @@ shell: /bin/sh
     fn test_merge_profiles() {
         let p1 = Profile {
             name: "a".into(),
-            binaries: {
+            bin: {
                 let mut m = BTreeMap::new();
                 m.insert("cmd1".into(), "/usr/bin/cmd1".into());
                 m
             },
-            ro_dirs: vec!["/lib".into()],
-            rw_dirs: vec!["/cache".into()],
+            ro: vec!["/lib".into()],
+            rw: vec!["/cache".into()],
             env: { let mut m = BTreeMap::new(); m.insert("A".into(), "1".into()); m },
             network: NetworkMode::None,
             shell: "/bin/sh".into(),
         };
         let p2 = Profile {
             name: "b".into(),
-            binaries: {
+            bin: {
                 let mut m = BTreeMap::new();
                 m.insert("cmd2".into(), "/usr/bin/cmd2".into());
                 m
             },
-            ro_dirs: vec!["/usr/lib".into()],
-            rw_dirs: vec!["/other".into()],
+            ro: vec!["/usr/lib".into()],
+            rw: vec!["/other".into()],
             env: { let mut m = BTreeMap::new(); m.insert("B".into(), "2".into()); m },
             network: NetworkMode::None,
             shell: "/bin/dash".into(),
         };
         let merged = MergedProfile::from_profiles(&[p1, p2]);
-        assert_eq!(merged.binaries.len(), 2);
-        assert_eq!(merged.ro_dirs.len(), 2);
-        assert_eq!(merged.rw_dirs.len(), 2);
+        assert_eq!(merged.bin.len(), 2);
+        assert_eq!(merged.ro.len(), 2);
+        assert_eq!(merged.rw.len(), 2);
         assert_eq!(merged.env.len(), 2);
         assert_eq!(merged.shell, PathBuf::from("/bin/dash"));
         assert_eq!(merged.name, "a+b");
@@ -192,7 +193,7 @@ shell: /bin/sh
     fn test_resolve_builtin() {
         let profile = resolve_profile("make", std::path::Path::new("/nonexistent")).unwrap();
         assert_eq!(profile.name, "make");
-        assert!(profile.binaries.contains_key("make"));
-        assert!(profile.binaries.contains_key("gcc"));
+        assert!(profile.bin.contains_key("make"));
+        assert!(profile.bin.contains_key("gcc"));
     }
 }

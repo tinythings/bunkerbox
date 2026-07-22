@@ -1,6 +1,6 @@
 name: make
 
-binaries:
+bin:
   make: /usr/bin/make
   cc: /usr/bin/cc
   gcc: /usr/bin/gcc
@@ -11,7 +11,7 @@ binaries:
   as: /usr/bin/as
   strip: /usr/bin/strip
 
-ro_dirs:
+ro:
   - /lib
   - /lib64
   - /usr/lib
@@ -21,7 +21,7 @@ ro_dirs:
   - /usr/share/zoneinfo
   - /usr/lib/locale
 
-rw_dirs: []
+rw: []
 
 env:
   TERM: "${TERM}"

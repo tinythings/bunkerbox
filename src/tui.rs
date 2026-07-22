@@ -196,7 +196,10 @@ fn push_dec_special_graphic(out: &mut Vec<u8>, byte: u8) {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16) -> Result<(), String> {
+pub fn event_loop<F>(master_fd: RawFd, rows: u16, cols: u16, setup_fd: Option<RawFd>, on_setup: Option<F>) -> Result<(), String>
+where
+    F: FnOnce(Vec<u8>) -> Result<(), String>,
+{
     let stdin_fd = io::stdin().as_raw_fd();
 
     let mut stdout = io::stdout();
@@ -214,6 +217,9 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16) -> Result<(), String> 
 
     let mut last_rows = rows;
     let mut last_cols = cols;
+
+    let mut setup_fd = setup_fd;
+    let mut on_setup = on_setup;
 
     unsafe {
         libc::signal(libc::SIGWINCH, handle_sigwinch as *const () as libc::sighandler_t);
@@ -234,10 +240,14 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16) -> Result<(), String> 
             }
         }
 
-        let mut fds =
-            [libc::pollfd { fd: master_fd, events: libc::POLLIN, revents: 0 }, libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 }];
+        let nfds: libc::c_ulong = if setup_fd.is_some() { 3 } else { 2 };
+        let mut fds = [
+            libc::pollfd { fd: master_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: setup_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+        ];
 
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 16) };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), nfds, 16) };
 
         if ret == -1 {
             let err = io::Error::last_os_error();
@@ -263,6 +273,26 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16) -> Result<(), String> 
             if n > 0 {
                 unsafe {
                     libc::write(master_fd, stdin_buf.as_ptr() as *const libc::c_void, 1usize);
+                }
+            }
+        }
+
+        if let Some(fd) = setup_fd {
+            if fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 256];
+                loop {
+                    let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+                    if n > 0 {
+                        buf.extend_from_slice(&chunk[..n as usize]);
+                    } else {
+                        break;
+                    }
+                }
+                unsafe { libc::close(fd) };
+                setup_fd = None;
+                if let Some(cb) = on_setup.take() {
+                    cb(buf)?;
                 }
             }
         }

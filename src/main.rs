@@ -1,8 +1,10 @@
 use bunkerbox::cfg::{ProjectConfig, WorkspaceMode};
 use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, overlay, tui, workspace};
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 fn main() {
     if let Err(err) = run() {
@@ -152,31 +154,27 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
     let workspace_mode = workspace_override.or(config.workspace).unwrap_or_default();
     let quota = config.workspace_quota_bytes();
+    let exclude = config.workspace_exclude.clone();
     let name = cfg::RuntimeConfig::invoked_name()?;
     let container_name = format!("bunkerbox-{name}");
-
-    let ws = workspace::resolve(workspace_mode, quota, config.workspace_exclude.as_deref(), &name)?;
-    let workspace_path = ws.path().to_path_buf();
 
     let repo_root = workspace::project_root()?;
     let env = ProjectConfig::load_or_create(&repo_root)?;
 
     let merged_allow: Vec<String> = config.allow.clone().unwrap_or_default().into_iter().chain(env.image.allow.clone().unwrap_or_default()).collect();
 
-    let daemon = if !env.project.passthrough.is_empty() {
-        Some(daemon::VsockDaemon::start(
-            env.project.passthrough.clone(),
-            env.project.env,
-            workspace_path,
-            env.profiles.clone(),
-            share_dir.to_path_buf(),
-            merged_allow,
-        )?)
-    } else {
-        None
-    };
+    let passthrough = env.project.passthrough.clone();
+    let env_mode = env.project.env;
+    let profiles = env.profiles.clone();
+    let share_dir_owned = share_dir.to_path_buf();
+    let daemon_holder = Rc::new(RefCell::new(None));
+    let daemon_clone = daemon_holder.clone();
 
-    let vsock_enabled = daemon.is_some();
+    let mut pipe_fds = [-1i32, -1];
+    unsafe {
+        libc::pipe(pipe_fds.as_mut_ptr());
+    }
+    let (pipe_r, pipe_w) = (pipe_fds[0], pipe_fds[1]);
 
     let (cols, rows) = crossterm::terminal::size().map_err(|e| format!("terminal size: {e}"))?;
 
@@ -190,6 +188,17 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     }
 
     if pid == 0 {
+        unsafe { libc::close(pipe_r) };
+
+        let ws = workspace::resolve(workspace_mode, quota, exclude.as_deref(), &name)?;
+        let wp = ws.path().to_path_buf();
+        let path_bytes = wp.to_string_lossy();
+        unsafe {
+            libc::write(pipe_w, path_bytes.as_bytes().as_ptr() as *const libc::c_void, path_bytes.len());
+            libc::close(pipe_w);
+        }
+
+        let vsock_enabled = !passthrough.is_empty();
         let code = match kata::run(&config, ws, &container_name, share_dir, &name, vsock_enabled) {
             Ok(()) => 0,
             Err(e) => {
@@ -200,13 +209,27 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
         std::process::exit(code);
     }
 
-    let tui_result = tui::event_loop(master, rows, cols);
+    unsafe { libc::close(pipe_w) };
+
+    let tui_result = tui::event_loop(
+        master,
+        rows,
+        cols,
+        Some(pipe_r),
+        Some(|path_bytes: Vec<u8>| {
+            let wp = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
+            if !passthrough.is_empty() {
+                *daemon_clone.borrow_mut() = Some(daemon::VsockDaemon::start(passthrough, env_mode, wp, profiles, share_dir_owned, merged_allow)?);
+            }
+            Ok(())
+        }),
+    );
 
     let mut status: i32 = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
     unsafe { libc::close(master) };
 
-    if let Some(d) = daemon {
+    if let Some(d) = daemon_holder.borrow_mut().take() {
         tokio::runtime::Handle::current().block_on(d.shutdown());
     }
 

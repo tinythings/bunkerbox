@@ -78,6 +78,8 @@ pub fn run(
     let passphrase = if !encrypt_patterns.is_empty() {
         if let Ok(key) = std::env::var("BUNKERBOX_ENCRYPT_KEY") {
             key
+        } else if crate::ui::is_launch_mode() {
+            crate::ui::tui::prompt_password("bunkerbox passphrase:").unwrap_or_default()
         } else {
             read_passphrase()?
         }
@@ -114,6 +116,10 @@ pub fn run(
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err("setup thread panicked".to_string()),
+    }
+
+    if crate::ui::is_launch_mode() {
+        crate::ui::tui::progress(2, 4, "Container runtime ready").ok();
     }
 
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
@@ -195,6 +201,12 @@ pub fn run(
 
     args.push(&config.image);
     args.push(container_name);
+
+    if crate::ui::is_launch_mode() {
+        crate::ui::tui::progress(3, 4, "Preparing environment...").ok();
+        crate::ui::tui::spinner("Launching environment").ok();
+        crate::ui::tui::hide().ok();
+    }
 
     let result = run_command("sudo", &args);
 

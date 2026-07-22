@@ -6,6 +6,7 @@ mod daemon;
 mod kata;
 mod overlay;
 mod sandbox;
+mod ui;
 mod vscomm;
 mod workspace;
 
@@ -166,6 +167,11 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
     let ws = workspace::resolve(workspace_mode, quota, config.workspace_exclude.as_deref(), &name)?;
     let workspace_path = ws.path().to_path_buf();
+
+    if crate::ui::is_launch_mode() {
+        crate::ui::tui::show().ok();
+        crate::ui::tui::progress(1, 4, "Workspace ready").ok();
+    }
 
     let repo_root = workspace::project_root()?;
     let env = ProjectConfig::load_or_create(&repo_root)?;

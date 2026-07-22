@@ -1,0 +1,29 @@
+name: rust
+
+bin:
+  cargo: /usr/bin/cargo
+  rustc: /usr/bin/rustc
+  rustfmt: /usr/bin/rustfmt
+  cc: /usr/bin/cc
+
+ro:
+  - /lib
+  - /lib64
+  - /usr/lib
+  - /usr/lib64
+  - /etc/ssl
+  - /etc/localtime
+  - /usr/share/zoneinfo
+  - /usr/lib/locale
+
+rw:
+  - "${HOME}/.cargo"
+  - "${HOME}/.rustup"
+
+env:
+  CARGO_HOME: "${HOME}/.cargo"
+  RUSTUP_HOME: "${HOME}/.rustup"
+  TERM: "${TERM}"
+
+network: none
+shell: /bin/sh

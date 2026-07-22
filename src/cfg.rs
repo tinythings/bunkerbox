@@ -31,6 +31,8 @@ const DEFAULT_SESSION_CLEANUP: &[&str] = &[
     ".local/share/kilo/log",
     ".local/share/opencode/log",
     ".local/share/crush/log",
+    ".local/share/kilo/snapshot",
+    ".local/share/kilo/storage/session_diff",
     ".cache",
 ];
 
@@ -176,6 +178,8 @@ pub struct ProjectConfig {
     pub project: ProjectSection,
     #[serde(default)]
     pub image: ImageOverrides,
+    #[serde(default)]
+    pub profiles: Vec<String>,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -232,6 +236,7 @@ impl ProjectConfig {
                 passthrough: buildsys::scan(repo_root, PassthroughMode::Relaxed),
             },
             image: ImageOverrides::default(),
+            profiles: Vec::new(),
         };
         cfg.validate()?;
         fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("failed to create {}: {e}", path.parent().unwrap().display()))?;
@@ -270,6 +275,7 @@ impl ProjectConfig {
         let cfg = ProjectConfig {
             project: ProjectSection { env: EnvMode::default(), quota: old.quota, exclude: old.exclude, passthrough: old.passthrough },
             image: ImageOverrides::default(),
+            profiles: Vec::new(),
         };
         cfg.validate()?;
 
@@ -360,6 +366,14 @@ impl ProjectConfig {
                 for host in allow {
                     y.push_str(&format!("    - {host}\n"));
                 }
+            }
+        }
+
+        if !self.profiles.is_empty() {
+            y.push('\n');
+            y.push_str("profiles:\n");
+            for p in &self.profiles {
+                y.push_str(&format!("  - {p}\n"));
             }
         }
 

@@ -72,6 +72,36 @@ repository.
 See the [Passthrough guide](guides/passthrough.md) for setup and
 configuration.
 
+## Sandbox
+
+Passthrough gets the command to your host — but what stops it from running wild
+once it's there? That's the sandbox.
+
+When profiles are configured in `project.conf`, the host daemon does not spawn
+passthrough commands directly. It wraps each one inside a
+[bubblewrap](https://github.com/containers/bubblewrap) sandbox. Bubblewrap uses
+Linux user namespaces to create a thin, unprivileged container around the
+command with exactly the capabilities it needs and nothing more.
+
+A sandbox profile is a small YAML file that declares:
+
+- Which exact host binaries the command may access (bind-mounted read-only)
+- Which directories are visible and whether they are writable
+- Whether network access is permitted
+- Which environment variables the command inherits
+
+Bunkerbox ships profiles for common build systems — `rust`, `make`, `go`,
+`node`, `python` — and you can write your own. When multiple profiles are
+active, they merge: the union of all binaries and directories is available to
+the sandboxed command.
+
+Inside the sandbox, the command sees a scratch `/home`, an empty `/tmp`, its
+own `/proc`, no network, and only the binaries you explicitly allowed. It
+cannot read your SSH keys, curl a payload, enumerate host processes, or write
+anywhere outside the overlay workspace.
+
+See the [Profiles guide](guides/profiles.md) for the full reference.
+
 ## Packaging
 
 Packaging makes a tool feel like a normal command. The package installs the Bunkerbox binary, an app command symlink, a runtime config, and the OCI archive.

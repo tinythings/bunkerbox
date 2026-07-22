@@ -80,6 +80,7 @@ fn to_yaml_produces_list_format() {
             ..Default::default()
         },
         image: ImageOverrides::default(),
+        profiles: Vec::new(),
     };
     let y = cfg.to_yaml();
     assert!(y.contains("project:"));

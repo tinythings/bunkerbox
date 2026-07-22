@@ -1,0 +1,27 @@
+name: node
+
+bin:
+  node: /usr/bin/node
+  npm: /usr/bin/npm
+  npx: /usr/bin/npx
+
+ro:
+  - /lib
+  - /lib64
+  - /usr/lib
+  - /usr/lib64
+  - /etc/ssl
+  - /etc/localtime
+  - /usr/share/zoneinfo
+  - /usr/lib/locale
+
+rw:
+  - "${HOME}/.npm"
+  - "${HOME}/.node-gyp"
+
+env:
+  npm_config_cache: "${HOME}/.npm"
+  TERM: "${TERM}"
+
+network: none
+shell: /bin/sh

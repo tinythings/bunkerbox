@@ -1,0 +1,28 @@
+name: go
+
+bin:
+  go: /usr/local/go/bin/go
+  gofmt: /usr/local/go/bin/gofmt
+
+ro:
+  - /lib
+  - /lib64
+  - /usr/lib
+  - /usr/lib64
+  - /etc/ssl
+  - /etc/localtime
+  - /usr/share/zoneinfo
+  - /usr/lib/locale
+  - /usr/local/go
+
+rw:
+  - "${HOME}/go"
+  - "${HOME}/.cache/go-build"
+
+env:
+  GOROOT: /usr/local/go
+  GOPATH: "${HOME}/go"
+  TERM: "${TERM}"
+
+network: none
+shell: /bin/sh

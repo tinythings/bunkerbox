@@ -135,11 +135,7 @@ impl RuntimeConfig {
 
     pub fn effective_session_cleanup(&self) -> Vec<String> {
         let user = self.session_cleanup.as_deref().unwrap_or(&[]);
-        DEFAULT_SESSION_CLEANUP
-            .iter()
-            .map(|s| s.to_string())
-            .chain(user.iter().cloned())
-            .collect()
+        DEFAULT_SESSION_CLEANUP.iter().map(|s| s.to_string()).chain(user.iter().cloned()).collect()
     }
 
     #[allow(dead_code)]

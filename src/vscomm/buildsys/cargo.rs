@@ -14,16 +14,16 @@ impl super::BuildSystem for Cargo {
     fn passthrough(&self, mode: PassthroughMode, _root: &Path) -> Vec<String> {
         match mode {
             PassthroughMode::Relaxed => vec!["cargo *".into()],
-        PassthroughMode::Paranoid => vec![
-            "cargo".into(),
-            "cargo check".into(),
-            "cargo build".into(),
-            "cargo test".into(),
-            "cargo clippy".into(),
-            "cargo fmt".into(),
-            "cargo doc".into(),
-            "cargo run".into(),
-        ],
+            PassthroughMode::Paranoid => vec![
+                "cargo".into(),
+                "cargo check".into(),
+                "cargo build".into(),
+                "cargo test".into(),
+                "cargo clippy".into(),
+                "cargo fmt".into(),
+                "cargo doc".into(),
+                "cargo run".into(),
+            ],
         }
     }
 }

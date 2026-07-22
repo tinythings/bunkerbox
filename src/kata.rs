@@ -704,11 +704,7 @@ fn setup_session(home_path: &Path, session_mb: u32, uid: &str, gid: &str) -> Res
     let home_size = dir_size(home_path);
     let max_size = (session_mb as u64) * 1024 * 1024;
     if home_size > max_size {
-        eprintln!(
-            "bunkerbox: warning: home directory is {} MB but session is only {} MB - copy may fail",
-            home_size / (1024 * 1024),
-            session_mb
-        );
+        eprintln!("bunkerbox: warning: home directory is {} MB but session is only {} MB - copy may fail", home_size / (1024 * 1024), session_mb);
     }
 
     let cp_status = run_command_quiet("cp", &["-a", &format!("{}/.", home_path.display()), &format!("{}/", session_dir.display())]);

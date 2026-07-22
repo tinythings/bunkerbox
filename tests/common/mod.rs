@@ -1,11 +1,7 @@
 use std::process::{Command, Output};
 
 pub fn has_bwrap() -> bool {
-    Command::new("bwrap")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    Command::new("bwrap").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 pub fn require_bwrap() -> bool {
@@ -18,10 +14,7 @@ pub fn require_bwrap() -> bool {
 }
 
 pub fn run_bwrap(args: &[&str]) -> Output {
-    Command::new("bwrap")
-        .args(args)
-        .output()
-        .expect("spawn bwrap")
+    Command::new("bwrap").args(args).output().expect("spawn bwrap")
 }
 
 pub fn assert_success(output: &Output) {

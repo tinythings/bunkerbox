@@ -281,11 +281,16 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
     fs::copy(&vscomm_path, &dest).map_err(|err| format!("failed to copy vscomm binary {}: {err}", dest.display()))?;
     fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
 
+    let status_path = find_status_binary()?;
+    let dest = build_dir.join("bunkerbox-status");
+    fs::copy(&status_path, &dest).map_err(|err| format!("failed to copy status binary {}: {err}", dest.display()))?;
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
+
     for file in &config.files {
         if file.path.is_absolute() || file.path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
             return Err(format!("unsafe build file path: {}", file.path.display()));
         }
-        if file.path == Path::new("bunker-entrypoint") || file.path == Path::new("bunkerbox-vscomm") {
+        if file.path == Path::new("bunker-entrypoint") || file.path == Path::new("bunkerbox-vscomm") || file.path == Path::new("bunkerbox-status") {
             return Err(format!("image config files must not override reserved file: {}", file.path.display()));
         }
 
@@ -315,6 +320,23 @@ fn find_vscomm_binary() -> Result<PathBuf, String> {
     }
 
     Err("musl-static bunkerbox-vscomm not found in target/x86_64-unknown-linux-musl/{release,debug}/\n\
+         build it first: make musl-vscomm"
+        .to_string())
+}
+
+fn find_status_binary() -> Result<PathBuf, String> {
+    let exe = env::current_exe().map_err(|e| format!("failed to locate self: {e}"))?;
+    let parent = exe.parent().ok_or_else(|| "failed to determine parent directory".to_string())?;
+    let target_dir = parent.parent().ok_or_else(|| "failed to determine target directory".to_string())?;
+
+    for profile in &["release", "debug"] {
+        let musl_candidate = target_dir.join("x86_64-unknown-linux-musl").join(profile).join("bunkerbox-status");
+        if musl_candidate.is_file() {
+            return Ok(musl_candidate);
+        }
+    }
+
+    Err("musl-static bunkerbox-status not found in target/x86_64-unknown-linux-musl/{release,debug}/\n\
          build it first: make musl-vscomm"
         .to_string())
 }

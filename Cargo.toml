@@ -44,3 +44,7 @@ path = "src/main.rs"
 [[bin]]
 name = "bunkerbox-vscomm"
 path = "src/bin/bunkerbox-vscomm.rs"
+
+[[bin]]
+name = "bunkerbox-status"
+path = "src/bin/bunkerbox-status.rs"

@@ -44,10 +44,12 @@ ensure-toolchain:
 dev: ensure-toolchain
 	cargo build
 	cargo build --bin bunkerbox-vscomm --target $(VSCOMM_TARGET)
+	cargo build --bin bunkerbox-status --target $(VSCOMM_TARGET)
 
 release: ensure-toolchain
 	cargo build --release
 	cargo build --bin bunkerbox-vscomm --target $(VSCOMM_TARGET) --release
+	cargo build --bin bunkerbox-status --target $(VSCOMM_TARGET) --release
 
 check:
 	cargo fmt --all
@@ -64,6 +66,7 @@ setup: dev
 
 musl-vscomm: ensure-toolchain
 	cargo build --bin bunkerbox-vscomm --target $(VSCOMM_TARGET)
+	cargo build --bin bunkerbox-status --target $(VSCOMM_TARGET)
 
 image: dev
 	@if [ -z "$(IMAGE)" ]; then echo "usage: make image IMAGE=images/name.conf" >&2; exit 1; fi

@@ -496,7 +496,7 @@ fn render_frame(f: &mut Frame, screen: &vt100::Screen, overlay: &OverlayState) {
         f.render_widget(gauge, inner);
     }
 
-    {
+    if !overlay.status_text.is_empty() {
         let title = format!(" {} ", overlay.status_text);
         let win_w = (title.len() as u16).max(15);
         let win_h = 3u16;

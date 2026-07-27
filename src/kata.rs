@@ -35,7 +35,9 @@ pub fn run(
     fn write_status(fd: RawFd, msg: &str) {
         let mut buf = msg.as_bytes().to_vec();
         buf.push(b'\n');
-        unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()); }
+        unsafe {
+            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len());
+        }
     }
 
     if !config.oci.is_file() {

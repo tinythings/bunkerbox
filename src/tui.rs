@@ -490,9 +490,8 @@ fn render_frame(f: &mut Frame, screen: &vt100::Screen, overlay: &OverlayState) {
             .title_style(Style::default().fg(Color::White));
         f.render_widget(block, rect);
 
-        let gauge = ratatui::widgets::Gauge::default()
-            .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
-            .percent((pct * 100.0) as u16);
+        let gauge =
+            ratatui::widgets::Gauge::default().gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray)).percent((pct * 100.0) as u16);
         let inner = Rect::new(bar_x + 1, bar_y + 1, bar_w.saturating_sub(2), 1);
         f.render_widget(gauge, inner);
     }

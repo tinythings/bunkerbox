@@ -1,10 +1,11 @@
 use bunkerbox::cfg::{ProjectConfig, WorkspaceMode};
-use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, overlay, tui, workspace};
+use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, overlay, tui, vscomm, workspace};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 fn main() {
     if let Err(err) = run() {
@@ -170,11 +171,11 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     let daemon_holder = Rc::new(RefCell::new(None));
     let daemon_clone = daemon_holder.clone();
 
-    let mut pipe_fds = [-1i32, -1];
+    let mut sock_fds = [-1i32, -1];
     unsafe {
-        libc::pipe(pipe_fds.as_mut_ptr());
+        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr());
     }
-    let (pipe_r, pipe_w) = (pipe_fds[0], pipe_fds[1]);
+    let (parent_fd, child_fd) = (sock_fds[0], sock_fds[1]);
 
     let (cols, rows) = crossterm::terminal::size().map_err(|e| format!("terminal size: {e}"))?;
 
@@ -188,41 +189,55 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     }
 
     if pid == 0 {
-        unsafe { libc::close(pipe_r) };
+        unsafe { libc::close(parent_fd) };
 
+        let status_fd = child_fd;
         let ws = workspace::resolve(workspace_mode, quota, exclude.as_deref(), &name)?;
         let wp = ws.path().to_path_buf();
-        let path_bytes = wp.to_string_lossy();
-        unsafe {
-            libc::write(pipe_w, path_bytes.as_bytes().as_ptr() as *const libc::c_void, path_bytes.len());
-            libc::close(pipe_w);
+        {
+            let mut msg = wp.to_string_lossy().into_owned().into_bytes();
+            msg.push(b'\n');
+            unsafe {
+                libc::write(status_fd, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
         }
 
         let vsock_enabled = !passthrough.is_empty();
-        let code = match kata::run(&config, ws, &container_name, share_dir, &name, vsock_enabled) {
+        let code = match kata::run(&config, ws, &container_name, share_dir, &name, vsock_enabled, status_fd) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("bunkerbox: {e}");
                 1
             }
         };
+        unsafe { libc::close(status_fd) };
         std::process::exit(code);
     }
 
-    unsafe { libc::close(pipe_w) };
+    unsafe { libc::close(child_fd) };
+
+    let overlay: Arc<Mutex<tui::OverlayState>> = Arc::new(Mutex::new(tui::OverlayState::new("Starting...".into())));
+    let overlay_clone = overlay.clone();
 
     let tui_result = tui::event_loop(
         master,
         rows,
         cols,
-        Some(pipe_r),
-        Some(|path_bytes: Vec<u8>| {
+        parent_fd,
+        move |path_bytes: Vec<u8>| {
             let wp = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
             if !passthrough.is_empty() {
                 *daemon_clone.borrow_mut() = Some(daemon::VsockDaemon::start(passthrough, env_mode, wp, profiles, share_dir_owned, merged_allow)?);
             }
+
+            let overlay = overlay_clone;
+            tokio::spawn(async move {
+                status_listener(overlay).await;
+            });
+
             Ok(())
-        }),
+        },
+        overlay,
     );
 
     let mut status: i32 = 0;
@@ -240,6 +255,51 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     }
 
     Ok(())
+}
+
+async fn status_listener(overlay: Arc<Mutex<tui::OverlayState>>) {
+    use tokio::io::AsyncReadExt;
+    use tokio_vsock::VsockListener;
+
+    let listener = match VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, vscomm::STATUS_PORT)) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+
+    loop {
+        let (mut stream, _peer) = match listener.accept().await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let overlay = overlay.clone();
+        tokio::spawn(async move {
+            let mut header = [0u8; 6];
+            if stream.read_exact(&mut header).await.is_err() {
+                return;
+            }
+
+            let frame_type_raw = u16::from_le_bytes([header[0], header[1]]);
+            let payload_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+
+            let Some(ft) = vscomm::FrameType::from_u16(frame_type_raw) else {
+                return;
+            };
+
+            if !matches!(ft, vscomm::FrameType::UiCommand) {
+                return;
+            }
+
+            let mut payload = vec![0u8; payload_len];
+            if payload_len > 0 && stream.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+
+            if let Some((widget, cmd, val)) = vscomm::decode_ui_payload(&payload) {
+                tui::dispatch_ui_command(&mut overlay.lock().unwrap(), widget, cmd, val);
+            }
+        });
+    }
 }
 
 fn print_subcommand_help(name: &str) -> Result<(), String> {

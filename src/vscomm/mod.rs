@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 
 pub mod buildsys;
 pub const VSOCK_PORT: u32 = 9999;
+pub const STATUS_PORT: u32 = 9998;
 pub const VSCOMM_BIN_DIR: &str = "/usr/local/bunkerbox/bin";
 
 #[repr(u16)]
@@ -15,6 +16,7 @@ pub enum FrameType {
     Stderr = 3,
     Exit = 4,
     Disconnect = 5,
+    UiCommand = 10,
 }
 
 impl FrameType {
@@ -25,6 +27,7 @@ impl FrameType {
             3 => Some(Self::Stderr),
             4 => Some(Self::Exit),
             5 => Some(Self::Disconnect),
+            10 => Some(Self::UiCommand),
             _ => None,
         }
     }
@@ -149,4 +152,23 @@ impl ExecRequest {
 
         Ok(Self { cwd, command, args, env })
     }
+}
+
+pub fn encode_ui_payload(widget: &str, command: &str, value: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(widget.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(command.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(value.as_bytes());
+    buf.push(0);
+    buf
+}
+
+pub fn decode_ui_payload(payload: &[u8]) -> Option<(&str, &str, &str)> {
+    let mut parts = payload.split(|&b| b == 0);
+    let widget = std::str::from_utf8(parts.next()?).ok()?;
+    let command = std::str::from_utf8(parts.next()?).ok()?;
+    let value = std::str::from_utf8(parts.next()?).ok()?;
+    Some((widget, command, value))
 }

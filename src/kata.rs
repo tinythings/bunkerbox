@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, ToSocketAddrs};
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -29,7 +30,14 @@ const BRIDGE_NAME: &str = "bunkerbox0";
 /// `Ok(())` on successful container execution, `Err(String)` on failure.
 pub fn run(
     config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, _share_dir: &Path, app_name: &str, vsock_enabled: bool,
+    status_fd: RawFd,
 ) -> Result<(), String> {
+    fn write_status(fd: RawFd, msg: &str) {
+        let mut buf = msg.as_bytes().to_vec();
+        buf.push(b'\n');
+        unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()); }
+    }
+
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
     }
@@ -37,6 +45,8 @@ pub fn run(
     check_containerd_version()?;
 
     let home_path = (config.home == Some(HomeMode::Persist)).then(|| config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)));
+
+    write_status(status_fd, "Preparing runtime...");
 
     let needs_bridge = config.network == Some(NetworkMode::Bridge);
     let ctr_name = container_name.to_string();
@@ -50,6 +60,8 @@ pub fn run(
     let runtime_dir = user_data_dir().join("bunkerbox/runtime");
     run_command_allow_failure("sudo", &["mkdir", "-p", &format!("{}", runtime_dir.display())])?;
     run_command_quiet("sudo", &["chown", &user, &format!("{}", runtime_dir.display())])?;
+
+    write_status(status_fd, "Starting containerd...");
 
     let setup_handle = std::thread::spawn(move || -> Result<(), String> {
         let active = Command::new("sudo")
@@ -88,6 +100,7 @@ pub fn run(
     if !passphrase.is_empty() {
         if let Some(ref hp) = home_path {
             if hp.is_dir() {
+                write_status(status_fd, "Unsealing home...");
                 unseal_home(hp, &passphrase)?;
             }
         }
@@ -96,12 +109,14 @@ pub fn run(
     let cleanup_patterns = config.effective_session_cleanup();
     if let Some(ref hp) = home_path {
         eprintln!("bunkerbox: cleaning up home directory...");
+        write_status(status_fd, "Cleaning home...");
         cleanup_home_junk(hp, &cleanup_patterns);
     }
 
     let session_mb = config.session_mb();
     let session_dir: Option<PathBuf> = if session_mb > 0 {
         if let Some(ref hp) = home_path {
+            write_status(status_fd, "Setting up session image...");
             Some(setup_session(hp, session_mb, uid, gid)?)
         } else {
             None
@@ -118,8 +133,14 @@ pub fn run(
 
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
 
-    let resolv_conf = if config.network.is_some() { Some(write_resolv_conf()?) } else { None };
+    let resolv_conf = if config.network.is_some() {
+        write_status(status_fd, "Writing resolv.conf...");
+        Some(write_resolv_conf()?)
+    } else {
+        None
+    };
     if bridge_firewall {
+        write_status(status_fd, "Applying firewall rules...");
         ensure_bridge_egress_firewall(config, resolv_conf.as_deref())?;
     }
     let resolv_conf_mount = resolv_conf.as_ref().map(|path| format!("type=bind,src={},dst=/etc/resolv.conf,options=rbind:ro", path.display()));
@@ -196,8 +217,10 @@ pub fn run(
     args.push(&config.image);
     args.push(container_name);
 
+    write_status(status_fd, "Starting container...");
     let result = run_command("sudo", &args);
 
+    write_status(status_fd, "Container stopped");
     if bridge_firewall {
         let _ = remove_bridge_egress_firewall();
     }
@@ -208,6 +231,7 @@ pub fn run(
 
     if let Some(ref sd) = session_dir {
         if let Some(ref hp) = home_path {
+            write_status(status_fd, "Saving session...");
             let cleanup = config.effective_session_cleanup();
             teardown_session(hp, sd, &cleanup);
         }
@@ -216,6 +240,7 @@ pub fn run(
     if !passphrase.is_empty() {
         if let Some(ref hp) = home_path {
             if hp.is_dir() {
+                write_status(status_fd, "Sealing home...");
                 seal_home(hp, encrypt_patterns, &passphrase)?;
             }
         }

@@ -295,8 +295,8 @@ async fn status_listener(overlay: Arc<Mutex<tui::OverlayState>>) {
                 return;
             }
 
-            if let Some((widget, cmd, val)) = vscomm::decode_ui_payload(&payload) {
-                tui::dispatch_ui_command(&mut overlay.lock().unwrap(), widget, cmd, val);
+            if let Some((widget, cmd, opts, val)) = vscomm::decode_ui_payload(&payload) {
+                tui::dispatch_ui_command(&mut overlay.lock().unwrap(), widget, cmd, opts, val);
             }
         });
     }

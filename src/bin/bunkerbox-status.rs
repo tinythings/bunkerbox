@@ -20,12 +20,13 @@ fn main() {
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
-    let widget = args.get(1).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [value]".to_string())?;
-    let command = args.get(2).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [value]".to_string())?;
-    let value = args.get(3).map(|s| s.as_str()).unwrap_or("");
+    let widget = args.get(1).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [options] [value]".to_string())?;
+    let command = args.get(2).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [options] [value]".to_string())?;
+    let options = args.get(3).map(|s| s.as_str()).unwrap_or("");
+    let value = args.get(4).map(|s| s.as_str()).unwrap_or("");
 
     if !widget.is_empty() && !command.is_empty() {
-        let payload = vscomm::encode_ui_payload(widget, command, value);
+        let payload = vscomm::encode_ui_payload(widget, command, options, value);
         let frame = Frame::new(FrameType::UiCommand, payload);
 
         let mut stream = vsock_connect(HOST_CID, STATUS_PORT).map_err(|e| format!("vsock connect: {e}"))?;

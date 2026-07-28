@@ -220,6 +220,17 @@ pub fn run(
     args.push(container_name);
 
     write_status(status_fd, "Starting container...");
+
+    write_status(status_fd, "Connected");
+
+    {
+        let payload = crate::vscomm::encode_ui_payload("status", "clear", "ON_PTY,SEC_3", "");
+        let mut buf = b"@".to_vec();
+        buf.extend_from_slice(&payload);
+        buf.push(b'\n');
+        unsafe { libc::write(status_fd, buf.as_ptr() as *const libc::c_void, buf.len()); }
+    }
+
     let result = run_command("sudo", &args);
 
     write_status(status_fd, "Container stopped");

@@ -3,6 +3,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crossterm::cursor;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -11,6 +12,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Terminal;
+
+use crate::vscomm::{self, Trigger, parse_triggers};
 
 static RESIZED: AtomicBool = AtomicBool::new(false);
 
@@ -27,20 +30,43 @@ const CMD_HIDE: &str = "hide";
 const CMD_SET: &str = "set";
 const CMD_CLEAR: &str = "clear";
 
+pub struct PendingAction {
+    pub widget: String,
+    pub command: String,
+    pub triggers: Vec<Trigger>,
+    pub value: String,
+    pub enqueued_at: Instant,
+    pub first_pty_at: Option<Instant>,
+}
+
 pub struct OverlayState {
     pub status_text: String,
     pub progress_percent: Option<f64>,
     pub progress_label: Option<String>,
     pub popup_text: Option<String>,
+    pub pending: Vec<PendingAction>,
 }
 
 impl OverlayState {
     pub fn new(status_text: String) -> Self {
-        Self { status_text, progress_percent: None, progress_label: None, popup_text: None }
+        Self { status_text, progress_percent: None, progress_label: None, popup_text: None, pending: Vec::new() }
     }
 }
 
-pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str, value: &str) {
+pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str, options: &str, value: &str) {
+    let triggers = parse_triggers(options);
+    if !triggers.is_empty() {
+        state.pending.push(PendingAction {
+            widget: widget.to_string(),
+            command: command.to_string(),
+            triggers,
+            value: value.to_string(),
+            enqueued_at: Instant::now(),
+            first_pty_at: None,
+        });
+        return;
+    }
+
     match (widget, command) {
         (WIDGET_PROGRESS, CMD_SET) => {
             if let Ok(pct) = value.parse::<f64>() {
@@ -332,10 +358,13 @@ where
             return Err(format!("poll: {err}"));
         }
 
+        let mut pty_output = false;
+
         if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let n = unsafe { libc::read(master_fd, pty_buf.as_mut_ptr() as *mut libc::c_void, pty_buf.len()) };
             if n > 0 {
                 term.process(&pty_buf[..n as usize]);
+                pty_output = true;
             } else {
                 break;
             }
@@ -361,15 +390,50 @@ where
                 status_buf.drain(..=pos);
                 if let Some(cb) = on_setup.take() {
                     cb(line.into_bytes())?;
+                } else if let Some(cmd) = line.strip_prefix('@') {
+                    if let Some((widget, cmd, opts, val)) = vscomm::decode_ui_payload(cmd.as_bytes()) {
+                        let mut state = overlay.lock().unwrap();
+                        dispatch_ui_command(&mut state, widget, cmd, opts, val);
+                    }
                 } else {
-                    let mut state = overlay.lock().unwrap();
-                    state.status_text = line;
+                    overlay.lock().unwrap().status_text = line;
                 }
             }
         }
 
         {
-            let state = overlay.lock().unwrap();
+            let mut state = overlay.lock().unwrap();
+            let now = Instant::now();
+
+            if pty_output {
+                for action in &mut state.pending {
+                    if action.first_pty_at.is_none() && action.triggers.iter().any(|t| matches!(t, Trigger::OnPty | Trigger::DelayMsAfterPty(_))) {
+                        action.first_pty_at = Some(now);
+                    }
+                }
+            }
+
+            let mut i = 0;
+            while i < state.pending.len() {
+                let fire = state.pending[i].triggers.iter().any(|t| match t {
+                    Trigger::OnPty => pty_output,
+                    Trigger::DelayMs(d) => (now - state.pending[i].enqueued_at).as_millis() as u64 >= *d,
+                    Trigger::DelayMsAfterPty(d) => {
+                        if let Some(first) = state.pending[i].first_pty_at {
+                            (now - first).as_millis() as u64 >= *d
+                        } else {
+                            false
+                        }
+                    }
+                });
+                if fire {
+                    let action = state.pending.remove(i);
+                    dispatch_ui_command(&mut state, &action.widget, &action.command, "", &action.value);
+                } else {
+                    i += 1;
+                }
+            }
+
             terminal.draw(|f| render_frame(f, term.screen(), &state)).map_err(|e| format!("draw: {e}"))?;
         }
     }

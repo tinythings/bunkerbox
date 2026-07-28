@@ -228,7 +228,9 @@ pub fn run(
         let mut buf = b"@".to_vec();
         buf.extend_from_slice(&payload);
         buf.push(b'\n');
-        unsafe { libc::write(status_fd, buf.as_ptr() as *const libc::c_void, buf.len()); }
+        unsafe {
+            libc::write(status_fd, buf.as_ptr() as *const libc::c_void, buf.len());
+        }
     }
 
     let result = run_command("sudo", &args);

@@ -13,7 +13,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Terminal;
 
-use crate::vscomm::{self, Trigger, parse_triggers};
+use crate::vscomm::{self, parse_triggers, Trigger};
 
 static RESIZED: AtomicBool = AtomicBool::new(false);
 

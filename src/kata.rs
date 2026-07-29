@@ -28,18 +28,20 @@ const BRIDGE_NAME: &str = "bunkerbox0";
 ///
 /// # Returns
 /// `Ok(())` on successful container execution, `Err(String)` on failure.
+fn cleanup_partial_session(session_dir: Option<&PathBuf>, home_path: Option<&PathBuf>) {
+    if let (Some(sd), Some(hp)) = (session_dir, home_path) {
+        let session_img = hp.parent().expect("home has parent").join(".bunker").join("session.img");
+        crate::logging::log("cleaning up partial session...");
+        let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", sd.display())]);
+        let _ = run_command_allow_failure("sudo", &["rmdir", &format!("{}", sd.display())]);
+        let _ = run_command_allow_failure("rm", &["-f", &format!("{}", session_img.display())]);
+    }
+}
+
 pub fn run(
     config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, _share_dir: &Path, app_name: &str, vsock_enabled: bool,
     status_fd: RawFd,
 ) -> Result<(), String> {
-    fn write_status(fd: RawFd, msg: &str) {
-        let mut buf = msg.as_bytes().to_vec();
-        buf.push(b'\n');
-        unsafe {
-            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len());
-        }
-    }
-
     fn write_ui_cmd(fd: RawFd, widget: &str, command: &str, options: &str, value: &str) {
         let payload = crate::vscomm::encode_ui_payload(widget, command, options, value);
         let mut buf = b"@".to_vec();
@@ -58,9 +60,7 @@ pub fn run(
 
     let home_path = (config.home == Some(HomeMode::Persist)).then(|| config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)));
 
-    write_ui_cmd(status_fd, "status", "phase", "", "Start");
-
-    write_status(status_fd, "Preparing runtime...");
+    crate::logging::log("Preparing runtime...");
 
     let needs_bridge = config.network == Some(NetworkMode::Bridge);
     let ctr_name = container_name.to_string();
@@ -75,7 +75,7 @@ pub fn run(
     run_command_allow_failure("sudo", &["mkdir", "-p", &format!("{}", runtime_dir.display())])?;
     run_command_quiet("sudo", &["chown", &user, &format!("{}", runtime_dir.display())])?;
 
-    write_status(status_fd, "Starting containerd...");
+    crate::logging::log("Starting containerd...");
 
     let setup_handle = std::thread::spawn(move || -> Result<(), String> {
         let active = Command::new("sudo")
@@ -114,7 +114,7 @@ pub fn run(
     if !passphrase.is_empty() {
         if let Some(ref hp) = home_path {
             if hp.is_dir() {
-                write_status(status_fd, "Unsealing home...");
+                crate::logging::log("Unsealing home...");
                 unseal_home(hp, &passphrase)?;
             }
         }
@@ -122,15 +122,24 @@ pub fn run(
 
     let cleanup_patterns = config.effective_session_cleanup();
     if let Some(ref hp) = home_path {
-        eprintln!("bunkerbox: cleaning up home directory...");
-        write_status(status_fd, "Cleaning home...");
+        crate::logging::log("Cleaning home...");
         cleanup_home_junk(hp, &cleanup_patterns);
     }
 
-    let session_mb = config.session_mb();
+    let mut session_mb = config.session_mb();
     let session_dir: Option<PathBuf> = if session_mb > 0 {
         if let Some(ref hp) = home_path {
-            write_status(status_fd, "Setting up session image...");
+            let home_size = dir_size(hp);
+            let measured_mb = ((home_size as f64 * 1.2) / (1024.0 * 1024.0)).ceil() as u32;
+            if config.session_mb.is_none() || measured_mb > session_mb {
+                session_mb = measured_mb.max(50);
+                crate::logging::log(&format!(
+                    "home dir is {} MB, auto-sized session to {} MB",
+                    home_size / (1024 * 1024),
+                    session_mb
+                ));
+            }
+            crate::logging::log("Setting up session image...");
             Some(setup_session(hp, session_mb, uid, gid)?)
         } else {
             None
@@ -141,20 +150,26 @@ pub fn run(
 
     match setup_handle.join() {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("setup thread panicked".to_string()),
+        Ok(Err(e)) => {
+            cleanup_partial_session(session_dir.as_ref(), home_path.as_ref());
+            return Err(e);
+        }
+        Err(_) => {
+            cleanup_partial_session(session_dir.as_ref(), home_path.as_ref());
+            return Err("setup thread panicked".to_string());
+        }
     }
 
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
 
     let resolv_conf = if config.network.is_some() {
-        write_status(status_fd, "Writing resolv.conf...");
+        crate::logging::log("Writing resolv.conf...");
         Some(write_resolv_conf()?)
     } else {
         None
     };
     if bridge_firewall {
-        write_status(status_fd, "Applying firewall rules...");
+        crate::logging::log("Applying firewall rules...");
         ensure_bridge_egress_firewall(config, resolv_conf.as_deref())?;
     }
     let resolv_conf_mount = resolv_conf.as_ref().map(|path| format!("type=bind,src={},dst=/etc/resolv.conf,options=rbind:ro", path.display()));
@@ -231,19 +246,15 @@ pub fn run(
     args.push(&config.image);
     args.push(container_name);
 
-    write_status(status_fd, "Starting container...");
+    crate::logging::log("Starting container...");
 
-    write_ui_cmd(status_fd, "status", "phase", "", "Environment");
+    crate::logging::log("Connected");
 
-    write_status(status_fd, "Connected");
-
-    write_ui_cmd(status_fd, "status", "clear", "ON_PTY,SEC_6", "");
+    write_ui_cmd(status_fd, "popup", "hide", "ON_PTY,SEC_6", "");
 
     let result = run_command("sudo", &args);
 
-    write_ui_cmd(status_fd, "status", "phase", "", "Shut down");
-
-    write_status(status_fd, "Container stopped");
+    crate::logging::log("Container stopped");
     if bridge_firewall {
         let _ = remove_bridge_egress_firewall();
     }
@@ -254,7 +265,7 @@ pub fn run(
 
     if let Some(ref sd) = session_dir {
         if let Some(ref hp) = home_path {
-            write_status(status_fd, "Saving session...");
+            crate::logging::log("Saving session...");
             let cleanup = config.effective_session_cleanup();
             teardown_session(hp, sd, &cleanup);
         }
@@ -263,7 +274,7 @@ pub fn run(
     if !passphrase.is_empty() {
         if let Some(ref hp) = home_path {
             if hp.is_dir() {
-                write_status(status_fd, "Sealing home...");
+                crate::logging::log("Sealing home...");
                 seal_home(hp, encrypt_patterns, &passphrase)?;
             }
         }
@@ -503,9 +514,17 @@ fn ensure_bridge_cni_config() -> Result<(), String> {
 
 /// Force-kills and removes a containerd task/container and its CNI state if left over from a prior run.
 fn remove_stale_container(container_name: &str) -> Result<(), String> {
-    let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "kill", "--signal", "SIGKILL", container_name]);
-    let _ = run_command_allow_failure("sudo", &["ctr", "tasks", "delete", "--force", container_name]);
-    let _ = run_command_allow_failure("sudo", &["ctr", "containers", "rm", container_name]);
+    crate::logging::log(&format!("remove_stale: checking for stale container '{container_name}'"));
+
+    if run_command_allow_failure("sudo", &["ctr", "tasks", "kill", "--signal", "SIGKILL", container_name]).is_ok() {
+        crate::logging::log(&format!("remove_stale: killed stale task for '{container_name}'"));
+    }
+    if run_command_allow_failure("sudo", &["ctr", "tasks", "delete", "--force", container_name]).is_ok() {
+        crate::logging::log(&format!("remove_stale: deleted stale task for '{container_name}'"));
+    }
+    if run_command_allow_failure("sudo", &["ctr", "containers", "rm", container_name]).is_ok() {
+        crate::logging::log(&format!("remove_stale: removed stale container '{container_name}'"));
+    }
     let _ = run_command_allow_failure("sudo", &["rm", "-f", &format!("/var/lib/cni/networks/{BRIDGE_NAME}/{container_name}")]);
     Ok(())
 }
@@ -716,12 +735,12 @@ fn seal_home(home: &Path, patterns: &[String], passphrase: &str) -> Result<(), S
 
 /// Creates and mounts an ext4 session image, copies the home contents, and recovers any leftover image.
 fn setup_session(home_path: &Path, session_mb: u32, uid: &str, gid: &str) -> Result<PathBuf, String> {
-    let bunker_dir = home_path.join(".bunker");
+    let bunker_dir = home_path.parent().expect("home has parent").join(".bunker");
     let session_img = bunker_dir.join("session.img");
     let session_dir = home_path.parent().ok_or("home path has no parent directory")?.join("session-mount");
 
     if session_img.exists() {
-        eprintln!("bunkerbox: found leftover session.img, recovering...");
+        crate::logging::log("found leftover session.img, recovering...");
         let _ = run_command_allow_failure("sudo", &["mkdir", "-p", session_dir.to_str().unwrap()]);
 
         let _ = run_command_quiet("sudo", &["e2fsck", "-p", &format!("{}", session_img.display())]);
@@ -732,16 +751,17 @@ fn setup_session(home_path: &Path, session_mb: u32, uid: &str, gid: &str) -> Res
             let _ = run_command_allow_failure("sudo", &["rm", "-rf", &format!("{}/lost+found", session_dir.display())]);
             let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
         } else {
-            eprintln!("bunkerbox: warning: could not mount leftover session.img, discarding");
+            crate::logging::log("warning: could not mount leftover session.img, discarding");
         }
 
         let _ = run_command_allow_failure("sudo", &["rm", "-rf", &format!("{}", session_dir.display())]);
         let _ = run_command_allow_failure("rm", &["-f", &format!("{}", session_img.display())]);
     }
 
-    eprintln!("bunkerbox: setting up session...");
+    crate::logging::log("setting up session...");
 
-    run_command_allow_failure("mkdir", &["-p", &format!("{}", bunker_dir.display())])?;
+    run_command_quiet("sudo", &["mkdir", "-p", &format!("{}", bunker_dir.display())])?;
+    run_command_quiet("sudo", &["chown", &format!("{}:{}", uid, gid), &format!("{}", bunker_dir.display())])?;
     run_command_quiet("dd", &["if=/dev/zero", &format!("of={}", session_img.display()), "bs=1M", &format!("count={}", session_mb)])?;
     run_command_quiet("mke2fs", &["-F", "-t", "ext4", &format!("{}", session_img.display())])?;
     run_command_allow_failure("sudo", &["mkdir", "-p", &format!("{}", session_dir.display())])?;
@@ -752,7 +772,11 @@ fn setup_session(home_path: &Path, session_mb: u32, uid: &str, gid: &str) -> Res
     let home_size = dir_size(home_path);
     let max_size = (session_mb as u64) * 1024 * 1024;
     if home_size > max_size {
-        eprintln!("bunkerbox: warning: home directory is {} MB but session is only {} MB - copy may fail", home_size / (1024 * 1024), session_mb);
+        crate::logging::log(&format!(
+            "warning: home directory ({} MB) exceeds session image ({} MB) — copy may fail",
+            home_size / (1024 * 1024),
+            session_mb
+        ));
     }
 
     let cp_status = run_command_quiet("cp", &["-a", &format!("{}/.", home_path.display()), &format!("{}/", session_dir.display())]);
@@ -768,14 +792,14 @@ fn setup_session(home_path: &Path, session_mb: u32, uid: &str, gid: &str) -> Res
 
 /// Copies session changes back to home, unmounts, and removes the session image and mount point.
 fn teardown_session(home_path: &Path, session_dir: &Path, cleanup_patterns: &[String]) {
-    eprintln!("bunkerbox: preparing to persist session...");
+    crate::logging::log("preparing to persist session...");
     cleanup_home_junk(session_dir, cleanup_patterns);
 
     let _ = run_command_quiet("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
 
     let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
 
-    let session_img = home_path.join(".bunker").join("session.img");
+    let session_img = home_path.parent().expect("home has parent").join(".bunker").join("session.img");
     let _ = run_command_allow_failure("rm", &["-f", &format!("{}", session_img.display())]);
     let _ = run_command_allow_failure("sudo", &["rmdir", &format!("{}", session_dir.display())]);
 }
@@ -864,7 +888,7 @@ fn cleanup_home_junk(path: &Path, patterns: &[String]) {
     for pattern in patterns {
         let target = path.join(pattern);
         if target.exists() {
-            eprintln!("bunkerbox: purging {pattern}");
+            crate::logging::log(&format!("purging {pattern}"));
             let _ = run_command_allow_failure("rm", &["-rf", &format!("{}", target.display())]);
         }
     }

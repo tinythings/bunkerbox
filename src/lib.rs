@@ -4,6 +4,7 @@ pub mod clidef;
 pub mod cmdrun;
 pub mod daemon;
 pub mod kata;
+pub mod logging;
 pub mod overlay;
 pub mod proxy;
 pub mod sandbox;

@@ -25,15 +25,21 @@ const DEFAULT_EXCLUDE: &[&str] = &[
 const DEFAULT_SESSION_CLEANUP: &[&str] = &[
     ".bunker",
     ".npm",
+    ".cache",
+    ".cargo/registry",
+    ".cargo/git",
+    ".rustup",
     ".config/kilo/node_modules",
+    ".config/kilo/target",
     ".config/opencode/node_modules",
+    ".config/opencode/target",
     ".config/crush/node_modules",
+    ".config/crush/target",
     ".local/share/kilo/log",
     ".local/share/opencode/log",
     ".local/share/crush/log",
     ".local/share/kilo/snapshot",
     ".local/share/kilo/storage/session_diff",
-    ".cache",
 ];
 
 const MIN_QUOTA: u64 = 5 * 1024 * 1024 * 1024;

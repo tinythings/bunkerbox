@@ -131,12 +131,22 @@ impl CowWorkspace {
 
     /// Unmounts stale overlay and loop mounts from previous runs, then detaches the loop device.
     fn cleanup_stale(mount_point: &Path, loop_mount: &Path, loopback: &Path) -> Result<(), String> {
-        Self::run_command_allow_failure("umount", &[&mount_point.to_string_lossy()])?;
+        match Self::run_command_allow_failure("umount", &[&mount_point.to_string_lossy()]) {
+            Ok(()) => crate::logging::log(&format!("cleanup_stale: unmounted overlay {}", mount_point.display())),
+            Err(e) => crate::logging::log(&format!("cleanup_stale: WARNING overlay umount {} failed: {e}", mount_point.display())),
+        }
 
-        Self::run_command_allow_failure("umount", &[&loop_mount.to_string_lossy()])?;
+        match Self::run_command_allow_failure("umount", &[&loop_mount.to_string_lossy()]) {
+            Ok(()) => crate::logging::log(&format!("cleanup_stale: unmounted loop mount {}", loop_mount.display())),
+            Err(e) => crate::logging::log(&format!("cleanup_stale: WARNING loop umount {} failed: {e}", loop_mount.display())),
+        }
 
         if loopback.exists() {
-            Self::run_command_allow_failure("losetup", &["-d", &Self::find_loop_device(loopback).unwrap_or_default()])?;
+            let dev = Self::find_loop_device(loopback).unwrap_or_default();
+            match Self::run_command_allow_failure("losetup", &["-d", &dev]) {
+                Ok(()) => crate::logging::log(&format!("cleanup_stale: detached loop device {dev}")),
+                Err(e) => crate::logging::log(&format!("cleanup_stale: WARNING losetup -d {dev} failed: {e}")),
+            }
         }
 
         Ok(())

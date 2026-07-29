@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossterm::cursor;
+use crossterm::event::{self, Event};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -60,9 +61,7 @@ impl Default for OverlayState {
 
 impl OverlayState {
     pub fn new() -> Self {
-        let mut popup = PopupWidget::new();
-        popup.show_info(Some("Start".into()), "Starting...", Some(palette::FG), Some(palette::ACCENT));
-        Self { status_text: String::new(), popup, popup_title: Some("Start".into()), pending: Vec::new() }
+        Self { status_text: String::new(), popup: PopupWidget::new(), popup_title: None, pending: Vec::new() }
     }
 }
 
@@ -110,6 +109,10 @@ pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str
         }
         (WIDGET_POPUP, CMD_SHOW) => {
             state.popup.show_info(None, value, None, None);
+        }
+        (WIDGET_POPUP, "info") => {
+            let title = if options.is_empty() { None } else { Some(options.to_string()) };
+            state.popup.show_info(title, value, Some(palette::FG), Some(palette::ACCENT));
         }
         (WIDGET_POPUP, CMD_HIDE) => {
             state.popup.hide();
@@ -311,6 +314,26 @@ fn push_dec_special_graphic(out: &mut Vec<u8>, byte: u8) {
     out.extend_from_slice(mapped.encode_utf8(&mut buf).as_bytes());
 }
 
+fn hold_error_popup(overlay: &Arc<Mutex<OverlayState>>, term: &mut Terminal<CrosstermBackend<io::Stdout>>, screen: &vt100::Screen) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        {
+            let state = overlay.lock().unwrap();
+            term.draw(|f| render_frame(f, screen, &state)).ok();
+        }
+
+        if Instant::now() >= deadline {
+            break;
+        }
+
+        if event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
+            if let Ok(Event::Key(_)) = event::read() {
+                break;
+            }
+        }
+    }
+}
+
 /// Renders PTY output through ratatui until the child process exits.
 ///
 /// Forwards real keystrokes to the PTY master, parses terminal output through
@@ -393,6 +416,7 @@ where
                 term.process(&pty_buf[..n as usize]);
                 pty_output = true;
             } else {
+                hold_error_popup(&overlay, &mut terminal, term.screen());
                 break;
             }
         }

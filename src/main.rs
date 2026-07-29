@@ -192,6 +192,8 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
         unsafe { libc::close(parent_fd) };
 
         let status_fd = child_fd;
+        bunkerbox::logging::set_status_fd(status_fd);
+        bunkerbox::logging::log("Starting...");
         let ws = workspace::resolve(workspace_mode, quota, exclude.as_deref(), &name)?;
         let wp = ws.path().to_path_buf();
         {
@@ -207,6 +209,17 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("bunkerbox: {e}");
+
+                let msg = e.to_string();
+                let payload = bunkerbox::vscomm::encode_ui_payload("popup", "info", "Error", &msg);
+                let mut buf = b"@".to_vec();
+                buf.extend_from_slice(&payload);
+                buf.push(b'\n');
+                unsafe {
+                    libc::write(status_fd, buf.as_ptr() as *const libc::c_void, buf.len());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
                 1
             }
         };

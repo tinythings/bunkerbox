@@ -10,7 +10,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear};
+
 use ratatui::Terminal;
 
 use crate::vscomm::{self, parse_triggers, Trigger};
@@ -48,12 +48,21 @@ pub struct PendingAction {
 pub struct OverlayState {
     pub status_text: String,
     pub popup: PopupWidget,
+    pub popup_title: Option<String>,
     pub pending: Vec<PendingAction>,
 }
 
+impl Default for OverlayState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OverlayState {
-    pub fn new(status_text: String) -> Self {
-        Self { status_text, popup: PopupWidget::new(), pending: Vec::new() }
+    pub fn new() -> Self {
+        let mut popup = PopupWidget::new();
+        popup.show_info(Some("Start".into()), "Starting...", Some(palette::FG), Some(palette::ACCENT));
+        Self { status_text: String::new(), popup, popup_title: Some("Start".into()), pending: Vec::new() }
     }
 }
 
@@ -88,11 +97,16 @@ pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str
         (WIDGET_PROGRESS, CMD_HIDE) => {
             state.popup.hide();
         }
+        (WIDGET_STATUS, "phase") => {
+            state.popup_title = if value.is_empty() { None } else { Some(value.to_string()) };
+        }
         (WIDGET_STATUS, CMD_SET) => {
-            state.status_text = value.to_string();
+            let title = state.popup_title.clone();
+            state.popup.show_info(title, value, Some(palette::FG), Some(palette::ACCENT));
         }
         (WIDGET_STATUS, CMD_CLEAR) => {
-            state.status_text.clear();
+            state.popup.hide();
+            state.popup_title = None;
         }
         (WIDGET_POPUP, CMD_SHOW) => {
             state.popup.show_info(None, value, None, None);
@@ -409,7 +423,9 @@ where
                         dispatch_ui_command(&mut state, widget, cmd, opts, val);
                     }
                 } else {
-                    overlay.lock().unwrap().status_text = line;
+                    let mut state = overlay.lock().unwrap();
+                    let title = state.popup_title.clone();
+                    state.popup.show_info(title, &line, Some(palette::FG), Some(palette::ACCENT));
                 }
             }
         }
@@ -541,23 +557,6 @@ fn render_frame(f: &mut Frame, screen: &vt100::Screen, overlay: &OverlayState) {
     {
         let buf = f.buffer_mut();
         overlay.popup.render(area, buf);
-    }
-
-    if !overlay.status_text.is_empty() {
-        let title = format!(" {} ", overlay.status_text);
-        let win_w = (title.len() as u16).max(15);
-        let win_h = 3u16;
-        let win_x = area.width.saturating_sub(win_w + 4);
-        let win_y = 2;
-        let rect = Rect::new(win_x, win_y, win_w, win_h);
-
-        f.render_widget(Clear, rect);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(title)
-            .title_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
-        f.render_widget(block, rect);
     }
 
     let (cursor_row, cursor_col) = screen.cursor_position();

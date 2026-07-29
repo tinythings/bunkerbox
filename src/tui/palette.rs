@@ -5,7 +5,6 @@ use ratatui::style::Color;
 // ---------------------------------------------------------------------------
 
 // ---- Neutral foundation ----
-
 pub const BG_0: Color = Color::Indexed(232);
 pub const BG_1: Color = Color::Indexed(233);
 pub const BG_2: Color = Color::Indexed(235);

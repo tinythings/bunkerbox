@@ -40,6 +40,16 @@ pub fn run(
         }
     }
 
+    fn write_ui_cmd(fd: RawFd, widget: &str, command: &str, options: &str, value: &str) {
+        let payload = crate::vscomm::encode_ui_payload(widget, command, options, value);
+        let mut buf = b"@".to_vec();
+        buf.extend_from_slice(&payload);
+        buf.push(b'\n');
+        unsafe {
+            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len());
+        }
+    }
+
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
     }
@@ -47,6 +57,8 @@ pub fn run(
     check_containerd_version()?;
 
     let home_path = (config.home == Some(HomeMode::Persist)).then(|| config.home_path.clone().unwrap_or_else(|| default_home_path(app_name)));
+
+    write_ui_cmd(status_fd, "status", "phase", "", "Start");
 
     write_status(status_fd, "Preparing runtime...");
 
@@ -221,19 +233,15 @@ pub fn run(
 
     write_status(status_fd, "Starting container...");
 
+    write_ui_cmd(status_fd, "status", "phase", "", "Environment");
+
     write_status(status_fd, "Connected");
 
-    {
-        let payload = crate::vscomm::encode_ui_payload("status", "clear", "ON_PTY,SEC_3", "");
-        let mut buf = b"@".to_vec();
-        buf.extend_from_slice(&payload);
-        buf.push(b'\n');
-        unsafe {
-            libc::write(status_fd, buf.as_ptr() as *const libc::c_void, buf.len());
-        }
-    }
+    write_ui_cmd(status_fd, "status", "clear", "ON_PTY,SEC_6", "");
 
     let result = run_command("sudo", &args);
+
+    write_ui_cmd(status_fd, "status", "phase", "", "Shut down");
 
     write_status(status_fd, "Container stopped");
     if bridge_firewall {

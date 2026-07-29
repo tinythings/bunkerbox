@@ -13,25 +13,10 @@ use super::palette;
 const SPINNER_FPS_MS: u64 = 83;
 
 pub enum PopupContent {
-    Spinner {
-        message: String,
-        model: spinner::Model,
-        last_tick: Instant,
-    },
-    Progress {
-        title: String,
-        percent: f64,
-        label: Option<String>,
-    },
-    Password {
-        title: String,
-        prompt: String,
-    },
-    Info {
-        title: Option<String>,
-        message: String,
-        fg: ratatui::style::Color,
-    },
+    Spinner { message: String, model: spinner::Model, last_tick: Instant },
+    Progress { title: String, percent: f64, label: Option<String> },
+    Password { title: String, prompt: String },
+    Info { title: Option<String>, message: String, fg: ratatui::style::Color },
 }
 
 pub struct PopupWidget {
@@ -45,11 +30,7 @@ impl PopupWidget {
     pub fn new() -> Self {
         Self {
             visible: false,
-            content: PopupContent::Info {
-                title: None,
-                message: String::new(),
-                fg: palette::FG,
-            },
+            content: PopupContent::Info { title: None, message: String::new(), fg: palette::FG },
             border_color: palette::BORDER,
             shadow: true,
         }
@@ -247,29 +228,20 @@ impl PopupWidget {
             .unwrap();
 
         let pct = (percent * 100.0) as u16;
-        Gauge::default()
-            .gauge_style(Style::default().fg(palette::ACCENT).bg(palette::BG_3))
-            .percent(pct)
-            .render(gauge_area, buf);
+        Gauge::default().gauge_style(Style::default().fg(palette::ACCENT).bg(palette::BG_3)).percent(pct).render(gauge_area, buf);
 
         if let Some(lbl) = label {
             let pct_text = format!(" {}  {}%", lbl, pct);
             let w = pct_text.len() as u16;
             let x = label_area.x + (label_area.width.saturating_sub(w)) / 2;
             let rect = Rect { x, y: label_area.y, width: w, height: 1 };
-            Paragraph::new(pct_text)
-                .style(Style::default().fg(palette::MUTED))
-                .alignment(Alignment::Center)
-                .render(rect, buf);
+            Paragraph::new(pct_text).style(Style::default().fg(palette::MUTED)).alignment(Alignment::Center).render(rect, buf);
         } else {
             let pct_text = format!("{}%", pct);
             let w = pct_text.len() as u16;
             let x = label_area.x + (label_area.width.saturating_sub(w)) / 2;
             let rect = Rect { x, y: label_area.y, width: w, height: 1 };
-            Paragraph::new(pct_text)
-                .style(Style::default().fg(palette::MUTED))
-                .alignment(Alignment::Center)
-                .render(rect, buf);
+            Paragraph::new(pct_text).style(Style::default().fg(palette::MUTED)).alignment(Alignment::Center).render(rect, buf);
         }
     }
 
@@ -292,19 +264,14 @@ impl PopupWidget {
         let mask = "\u{2022}".repeat(12);
         let mw = mask.len() as u16;
         let mx = input_area.x + (input_area.width.saturating_sub(mw)) / 2;
-        Paragraph::new(Line::from(vec![
-            Span::styled(mask, Style::default().fg(palette::MUTED).bg(palette::BG_3)),
-        ]))
-        .alignment(Alignment::Center)
-        .render(Rect { x: mx, y: input_area.y + 1, width: mw, height: 1 }, buf);
+        Paragraph::new(Line::from(vec![Span::styled(mask, Style::default().fg(palette::MUTED).bg(palette::BG_3))]))
+            .alignment(Alignment::Center)
+            .render(Rect { x: mx, y: input_area.y + 1, width: mw, height: 1 }, buf);
     }
 
     fn render_info(&self, inner: Rect, buf: &mut Buffer, message: &str, fg: ratatui::style::Color) {
         let text = format!("\n{}", message);
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(fg))
-            .render(inner, buf);
+        Paragraph::new(text).alignment(Alignment::Center).style(Style::default().fg(fg)).render(inner, buf);
     }
 
     fn draw_shadow(&self, canvas: Rect, height: u16, buf: &mut Buffer) {
@@ -342,5 +309,9 @@ impl PopupWidget {
 
 fn text_lines(text: &str) -> u16 {
     let count = text.lines().count();
-    if count == 0 { 0 } else { count as u16 }
+    if count == 0 {
+        0
+    } else {
+        count as u16
+    }
 }

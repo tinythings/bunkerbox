@@ -216,7 +216,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
     unsafe { libc::close(child_fd) };
 
-    let overlay: Arc<Mutex<tui::OverlayState>> = Arc::new(Mutex::new(tui::OverlayState::new("Starting...".into())));
+    let overlay: Arc<Mutex<tui::OverlayState>> = Arc::new(Mutex::new(tui::OverlayState::new()));
     let overlay_clone = overlay.clone();
 
     let tui_result = tui::event_loop(

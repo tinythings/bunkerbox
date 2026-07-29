@@ -122,13 +122,17 @@ pub fn run(
     let session_dir: Option<PathBuf> = if session_mb > 0 {
         if let Some(ref hp) = home_path {
             let home_size = dir_size(hp);
-            let measured_mb = ((home_size as f64 * 1.2) / (1024.0 * 1024.0)).ceil() as u32;
-            if config.session_mb.is_none() || measured_mb > session_mb {
-                session_mb = measured_mb.max(50);
-                crate::logging::log(&format!("home dir is {} MB, auto-sized session to {} MB", home_size / (1024 * 1024), session_mb));
+            if home_size == 0 {
+                None
+            } else {
+                let measured_mb = ((home_size as f64 * 1.2) / (1024.0 * 1024.0)).ceil() as u32;
+                if config.session_mb.is_none() || measured_mb > session_mb {
+                    session_mb = measured_mb.max(50);
+                    crate::logging::log(&format!("home dir is {} MB, auto-sized session to {} MB", home_size / (1024 * 1024), session_mb));
+                }
+                crate::logging::log("Setting up session image...");
+                Some(setup_session(hp, session_mb, uid, gid)?)
             }
-            crate::logging::log("Setting up session image...");
-            Some(setup_session(hp, session_mb, uid, gid)?)
         } else {
             None
         }

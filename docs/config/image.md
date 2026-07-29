@@ -1,18 +1,16 @@
 # Image config
 
-An image config tells Bunkerbox how to build an OCI archive for a tool.
+An image config is a YAML file that tells Bunkerbox how to package your tool into a container image. You put these under the `images/` directory.
 
-The config contains the image name, output archive name, app command, build arguments, hooks, optional extra files, and the container build recipe. You do not run the image builder directly. Use the Makefile:
+To build one:
 
 ```sh
-make image IMAGE=images/opencode.conf
+make image IMAGE=images/my-tool.conf
 ```
 
-The `IMAGE` parameter is the path to the image config. You can point it at any config file under `images/`.
+## A minimal example
 
-## Example
-
-This is the important top part of the OpenCode image config:
+Here is the top of the OpenCode image config:
 
 ```yaml
 name: opencode
@@ -26,38 +24,63 @@ build_args:
   OPENCODE_VERSION: "1.17.18"
 ```
 
-The `output` field decides the OCI archive name. After building this config, the archive is written as:
+The `output` field names the archive. After building, you get `bunkerbox-opencode-1.17.18.oci`.
 
-```text
-bunkerbox-opencode-1.17.18.oci
+## Required fields
+
+| Field | Purpose |
+|---|---|
+| `name` | Short name for the config |
+| `image` | Tag used during build and import |
+| `output` | Path to the OCI archive to create |
+| `command` | The command that runs inside the container |
+| `containerfile` | The Dockerfile/Podmanfile recipe |
+
+## Optional fields
+
+| Field | Purpose |
+|---|---|
+| `overwrite` | If `true`, replaces an existing archive instead of erroring |
+| `build_args` | Key-value pairs passed to the container build |
+| `hooks` | Shell commands that run at specific points (see [Hooks](hooks.md)) |
+| `files` | Extra files to copy into the build context |
+| `runtime` | Auto-generates a runtime config file |
+
+## Container recipe
+
+Your container recipe needs four things:
+
+**1. A musl base image:**
+
+```
+FROM docker.io/library/alpine:3.22
 ```
 
-## The generated entrypoint
+**2. The generated entrypoint script:**
 
-Every Bunkerbox image uses a generated entrypoint called:
-
-```text
-bunker-entrypoint
 ```
-
-Your container recipe must copy it into the image and use it as the entrypoint:
-
-```text
 COPY bunker-entrypoint /usr/local/bin/bunker-entrypoint
+RUN chmod 0755 /usr/local/bin/bunker-entrypoint
 ENTRYPOINT ["/usr/local/bin/bunker-entrypoint"]
 ```
 
-This generated entrypoint is important. It sets up the app home directory, runs hooks, starts the app command, and preserves the app exit status. All session management (loop mount, recovery, sync) happens on the host — the entrypoint itself is a thin wrapper.
+**3. The Bunkerbox helper binaries:**
 
-## Fields
+```
+COPY bunkerbox-vscomm /usr/local/bunkerbox/bin/bunkerbox-vscomm
+COPY bunkerbox-status /usr/local/bunkerbox/bin/bunkerbox-status
+```
 
-`name` is a short name for the image config. `image` is the local image tag used while building and importing. `output` is the OCI archive that will be written. `command` is the app command that runs inside the container. `containerfile` is the actual container build recipe.
+**4. A directory for the workspace and home:**
 
-Optional fields add behavior. `overwrite` allows replacing an existing archive. `build_args` passes values into the container build. `hooks` adds lifecycle shell snippets. `files` adds extra files to the build context. `runtime` auto-generates a runtime config file.
+```
+RUN mkdir -p /workspace /home/bunkerbox /usr/local/bunkerbox/bin \
+    && chmod 0777 /workspace /home/bunkerbox /usr/local/bunkerbox/bin
+```
 
-## Runtime section
+## Runtime settings
 
-The image author knows what runtime settings the tool needs (workspace mode, home persistence, network rules, and which files hold secrets). Define them once in the image config with the `runtime:` section, and the builder writes a runtime config automatically.
+Add a `runtime:` section to define how the tool should run on the user's machine:
 
 ```yaml
 runtime:
@@ -67,17 +90,14 @@ runtime:
   allow:
     - api.deepseek.com
   encrypt:
-    - ".local/share/opencode/auth.json"
-    - ".local/share/opencode/account.json"
+    - ".local/share/my-app/auth.json"
 ```
 
-When the builder finishes, it writes `<command>.conf` next to the OCI archive. The conf includes `oci` (the archive path) and `image` (the image tag) merged with everything from the `runtime:` section.
+The builder writes a `<command>.conf` file next to the archive, merging your `runtime:` settings with the archive path and image tag. For the OpenCode example above, you get:
 
-For the OpenCode config above, the builder would produce:
-
-```text
+```
 bunkerbox-opencode-1.17.18.oci
 opencode.conf
 ```
 
-The packager installs both files. The `opencode.conf` is ready to use — no hand-editing needed.
+Both files go into the package install. No hand-editing needed. See [Runtime config](runtime.md) for all options.

@@ -1,49 +1,81 @@
-# Custom images
+# Creating a custom image
 
-A custom image config lets you package another tool for Bunkerbox.
+Packaging a new tool for Bunkerbox means writing an image config. It's a YAML file that describes your tool, the container it runs in, and how it should behave at runtime.
 
-Start by adding a config file under `images/`. The existing `images/opencode.conf` is the best example to copy from because it shows the expected shape: image name, output archive, command, hooks section, and container recipe.
+## Start from an example
 
-Build a config with:
+Copy one of the existing configs from `images/`. The simplest one to start from is the kilocode config:
 
 ```sh
-make image IMAGE=images/opencode.conf
+cp images/kilocode.conf images/my-tool.conf
 ```
 
-For your own tool, replace the path with your new config file.
+## The config structure
 
-## What the config must do
+Every image config needs these parts:
 
-The config must define the command that should run inside the container. It must also provide a container recipe that installs the tool.
+| Section | What it does |
+|---|---|
+| `name`, `image`, `output` | Identifies the tool and names the output archive |
+| `command` | The command that runs inside the container |
+| `containerfile` | The recipe that installs your tool |
+| `runtime` | Settings for how the tool runs on the user's machine |
 
-The container recipe must copy the generated Bunkerbox entrypoint into the image:
+## The container recipe
 
-```text
+Your container recipe (`containerfile`) must install your tool and set up the Bunkerbox runtime. Here's the pattern every mature image uses:
+
+```dockerfile
+FROM docker.io/library/alpine:3.22
+
+ARG MY_TOOL_VERSION
+
+# Install your tool and its dependencies
+RUN apk add --no-cache bash ca-certificates curl git \
+      && curl -fsSL "https://example.com/my-tool-linux-musl.tar.gz" \
+        -o /tmp/my-tool.tar.gz \
+      && tar -xzf /tmp/my-tool.tar.gz -C /usr/local/bin \
+      && chmod 0755 /usr/local/bin/my-tool-app \
+      && rm -f /tmp/my-tool.tar.gz
+
+# Required Bunkerbox directories
+RUN mkdir -p /workspace /home/bunkerbox /usr/local/bunkerbox/bin \
+      && chmod 0777 /workspace /home/bunkerbox /usr/local/bunkerbox/bin
+
+# Required Bunkerbox files
 COPY bunker-entrypoint /usr/local/bin/bunker-entrypoint
-```
+RUN chmod 0755 /usr/local/bin/bunker-entrypoint
+COPY bunkerbox-vscomm /usr/local/bunkerbox/bin/bunkerbox-vscomm
+COPY bunkerbox-status /usr/local/bunkerbox/bin/bunkerbox-status
 
-It must then use that generated file as the entrypoint:
-
-```text
+ENV HOME=/home/bunkerbox
+WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/bunker-entrypoint"]
 ```
 
-That entrypoint is what makes persistence and hooks work.
+Key points:
+- Use an `x86_64` musl-based image like `alpine:3.22`
+- Copy `bunker-entrypoint` and set it as `ENTRYPOINT`
+- Copy `bunkerbox-vscomm` and `bunkerbox-status` — they go in `/usr/local/bunkerbox/bin/`
+- Create `/workspace` and `/home/bunkerbox` with write permissions
 
-## Hooks
+## Adding hooks
 
-If the tool needs setup or cleanup, add hooks to the image config.
+Hooks run shell commands at specific points during your tool's lifecycle:
 
 ```yaml
 hooks:
   before-app: |
-    echo "starting app"
+    bunkerbox-status status set 'Launching my-tool...'
+    bunkerbox-status popup hide "SEC_2"
 ```
 
-Hooks run inside the container, not on the host.
+During startup, the status overlay shows "Launching my-tool..." and then fades after 2 seconds while your tool is already running.
 
-## Packaging the tool
+For more details on hooks and what commands you can run, see [Hooks](../config/hooks.md).
 
-After the image exists, packaging needs a runtime config and an app command. The runtime config tells Bunkerbox where the OCI archive is and how to run it. The app command is usually a symlink to the Bunkerbox binary.
+## Packaging
 
-Read [Packaging](packaging.md) for the full model.
+After building, you'll have two files: the OCI archive and a runtime config. Both go into the system package. The runtime config tells Bunkerbox how to run your tool — workspace mode, network settings, which files to encrypt. Users invoke your tool through a symlink that points at the Bunkerbox binary.
+
+Read [Packaging](packaging.md) for the full distribution model.

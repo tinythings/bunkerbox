@@ -609,9 +609,9 @@ fn confirm(prompt: &str) -> bool {
     buf[0] == b'y' || buf[0] == b'Y'
 }
 
-/// Reads a passphrase from the terminal without echoing.
+/// Reads a passphrase from the terminal via the TUI password popup.
 fn read_passphrase() -> Result<String, String> {
-    rpassword::prompt_password("Bunkerbox passphrase: ").map_err(|err| format!("failed to read passphrase: {err}"))
+    crate::logging::prompt_password("Bunkerbox passphrase", "Enter passphrase")
 }
 
 /// Derives a 256-bit AES key from a passphrase and salt via PBKDF2-HMAC-SHA256 (100k iterations).

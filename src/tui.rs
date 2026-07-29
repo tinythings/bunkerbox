@@ -422,8 +422,28 @@ where
         if fds[1].revents & libc::POLLIN != 0 {
             let n = unsafe { libc::read(stdin_fd, stdin_buf.as_mut_ptr() as *mut libc::c_void, 1usize) };
             if n > 0 {
-                unsafe {
-                    libc::write(master_fd, stdin_buf.as_ptr() as *const libc::c_void, 1usize);
+                let byte = stdin_buf[0];
+                let is_password = overlay.lock().is_ok_and(|s| matches!(s.popup.content, popup::PopupContent::Password { .. }));
+                if is_password {
+                    let mut state = overlay.lock().unwrap();
+                    if byte == 0x0d {
+                        if let Some(password) = state.popup.take_password() {
+                            let mut response = password.into_bytes();
+                            response.push(b'\n');
+                            state.popup.hide();
+                            unsafe {
+                                libc::write(status_fd, response.as_ptr() as *const libc::c_void, response.len());
+                            }
+                        }
+                    } else if byte == 0x7f {
+                        state.popup.pop_char();
+                    } else if byte >= 0x20 && byte != 0x7f {
+                        state.popup.push_char(byte as char);
+                    }
+                } else {
+                    unsafe {
+                        libc::write(master_fd, stdin_buf.as_ptr() as *const libc::c_void, 1usize);
+                    }
                 }
             }
         }

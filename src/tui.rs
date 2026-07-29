@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossterm::cursor;
-use crossterm::event::{self, Event};
+use crossterm::event::{self};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -51,6 +51,7 @@ pub struct OverlayState {
     pub popup: PopupWidget,
     pub popup_title: Option<String>,
     pub pending: Vec<PendingAction>,
+    pub has_error: bool,
 }
 
 impl Default for OverlayState {
@@ -61,7 +62,7 @@ impl Default for OverlayState {
 
 impl OverlayState {
     pub fn new() -> Self {
-        Self { status_text: String::new(), popup: PopupWidget::new(), popup_title: None, pending: Vec::new() }
+        Self { status_text: String::new(), popup: PopupWidget::new(), popup_title: None, pending: Vec::new(), has_error: false }
     }
 }
 
@@ -112,6 +113,9 @@ pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str
         }
         (WIDGET_POPUP, "info") => {
             let title = if options.is_empty() { None } else { Some(options.to_string()) };
+            if title.as_deref() == Some("Error") {
+                state.has_error = true;
+            }
             state.popup.show_info(title, value, Some(palette::FG), Some(palette::ACCENT));
         }
         (WIDGET_POPUP, CMD_HIDE) => {
@@ -315,23 +319,17 @@ fn push_dec_special_graphic(out: &mut Vec<u8>, byte: u8) {
 }
 
 fn hold_error_popup(overlay: &Arc<Mutex<OverlayState>>, term: &mut Terminal<CrosstermBackend<io::Stdout>>, screen: &vt100::Screen) {
-    let deadline = Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        {
-            let state = overlay.lock().unwrap();
-            term.draw(|f| render_frame(f, screen, &state)).ok();
-        }
-
-        if Instant::now() >= deadline {
-            break;
-        }
-
-        if event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
-            if let Ok(Event::Key(_)) = event::read() {
-                break;
-            }
-        }
+    let is_error = overlay.lock().unwrap().has_error;
+    if !is_error {
+        return;
     }
+
+    {
+        let mut state = overlay.lock().unwrap();
+        state.popup.show_info(Some("Error".to_string()), "Press any key to exit", Some(palette::FG), Some(palette::ACCENT));
+    }
+    term.draw(|f| render_frame(f, screen, &overlay.lock().unwrap())).ok();
+    let _ = event::read();
 }
 
 /// Renders PTY output through ratatui until the child process exits.

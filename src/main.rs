@@ -224,7 +224,8 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
             }
         };
         unsafe { libc::close(status_fd) };
-        std::process::exit(code);
+        bunkerbox::logging::log("exiting");
+        unsafe { libc::exit(code) };
     }
 
     unsafe { libc::close(child_fd) };

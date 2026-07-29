@@ -133,11 +133,7 @@ pub fn run(
             let measured_mb = ((home_size as f64 * 1.2) / (1024.0 * 1024.0)).ceil() as u32;
             if config.session_mb.is_none() || measured_mb > session_mb {
                 session_mb = measured_mb.max(50);
-                crate::logging::log(&format!(
-                    "home dir is {} MB, auto-sized session to {} MB",
-                    home_size / (1024 * 1024),
-                    session_mb
-                ));
+                crate::logging::log(&format!("home dir is {} MB, auto-sized session to {} MB", home_size / (1024 * 1024), session_mb));
             }
             crate::logging::log("Setting up session image...");
             Some(setup_session(hp, session_mb, uid, gid)?)
@@ -268,6 +264,7 @@ pub fn run(
             crate::logging::log("Saving session...");
             let cleanup = config.effective_session_cleanup();
             teardown_session(hp, sd, &cleanup);
+            crate::logging::log("session persisted");
         }
     }
 
@@ -276,6 +273,7 @@ pub fn run(
             if hp.is_dir() {
                 crate::logging::log("Sealing home...");
                 seal_home(hp, encrypt_patterns, &passphrase)?;
+                crate::logging::log("home sealed");
             }
         }
     }
@@ -661,11 +659,12 @@ fn decrypt_from_slice(passphrase: &str, encoded: &[u8]) -> Result<Vec<u8>, Strin
 /// Recursively walks `dir`, calling `f` with the full path and the path relative to `base` for each file.
 fn walk_files(base: &Path, dir: &Path, f: &mut dyn FnMut(&Path, &Path) -> Result<(), String>) -> Result<(), String> {
     for entry in fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))? {
-        let path = entry.map_err(|e| format!("dir entry: {e}"))?.path();
-        if path.is_dir() {
-            walk_files(base, &path, f)?;
-        } else if path.is_file() {
-            f(&path, path.strip_prefix(base).unwrap_or(&path))?;
+        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
+        let ft = entry.file_type().map_err(|e| format!("file_type: {e}"))?;
+        if ft.is_dir() {
+            walk_files(base, &entry.path(), f)?;
+        } else if ft.is_file() {
+            f(&entry.path(), entry.path().strip_prefix(base).unwrap_or(&entry.path()))?;
         }
     }
     Ok(())
@@ -709,7 +708,11 @@ fn seal_home(home: &Path, patterns: &[String], passphrase: &str) -> Result<(), S
     let compiled: Vec<glob::Pattern> =
         patterns.iter().map(|p| glob::Pattern::new(p)).collect::<Result<Vec<_>, _>>().map_err(|e| format!("invalid glob pattern: {e}"))?;
 
+    crate::logging::log("seal: walking home tree...");
+
+    let scanned = std::cell::Cell::new(0u64);
     walk_files(home, home, &mut |path, rel| {
+        scanned.set(scanned.get() + 1);
         let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
             return Ok(());
         };
@@ -722,6 +725,9 @@ fn seal_home(home: &Path, patterns: &[String], passphrase: &str) -> Result<(), S
             return Ok(());
         }
 
+        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        crate::logging::log(&format!("sealing {} ({} bytes)", rel_str, size));
+
         let plaintext = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let encrypted = encrypt_to_vec(passphrase, &plaintext)?;
 
@@ -730,7 +736,10 @@ fn seal_home(home: &Path, patterns: &[String], passphrase: &str) -> Result<(), S
         fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))?;
 
         Ok(())
-    })
+    })?;
+
+    crate::logging::log(&format!("seal: walked {} files", scanned.get()));
+    Ok(())
 }
 
 /// Creates and mounts an ext4 session image, copies the home contents, and recovers any leftover image.
@@ -794,14 +803,18 @@ fn setup_session(home_path: &Path, session_mb: u32, uid: &str, gid: &str) -> Res
 fn teardown_session(home_path: &Path, session_dir: &Path, cleanup_patterns: &[String]) {
     crate::logging::log("preparing to persist session...");
     cleanup_home_junk(session_dir, cleanup_patterns);
+    crate::logging::log("teardown: cleanup done, copying session back...");
 
     let _ = run_command_quiet("cp", &["-Rup", &format!("{}/.", session_dir.display()), &format!("{}", home_path.display())]);
+    crate::logging::log("teardown: copy done, unmounting...");
 
     let _ = run_command_allow_failure("sudo", &["umount", &format!("{}", session_dir.display())]);
+    crate::logging::log("teardown: unmount done, removing image...");
 
     let session_img = home_path.parent().expect("home has parent").join(".bunker").join("session.img");
     let _ = run_command_allow_failure("rm", &["-f", &format!("{}", session_img.display())]);
     let _ = run_command_allow_failure("sudo", &["rmdir", &format!("{}", session_dir.display())]);
+    crate::logging::log("teardown: image removed");
 }
 
 /// Checks that containerd >= 2.2.5 is installed (required for Kata networking). Skippable via env var.
@@ -888,8 +901,9 @@ fn cleanup_home_junk(path: &Path, patterns: &[String]) {
     for pattern in patterns {
         let target = path.join(pattern);
         if target.exists() {
-            crate::logging::log(&format!("purging {pattern}"));
+            crate::logging::log(&format!("purging {pattern}..."));
             let _ = run_command_allow_failure("rm", &["-rf", &format!("{}", target.display())]);
+            crate::logging::log(&format!("purged {pattern}"));
         }
     }
 }
@@ -900,13 +914,13 @@ fn dir_size(path: &Path) -> u64 {
         return total;
     };
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
+        let Ok(ft) = entry.file_type() else {
             continue;
         };
-        if meta.is_dir() {
+        if ft.is_dir() {
             total = total.saturating_add(dir_size(&entry.path()));
-        } else if meta.is_file() {
-            total = total.saturating_add(meta.len());
+        } else if ft.is_file() {
+            total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
         }
     }
     total

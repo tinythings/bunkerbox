@@ -22,8 +22,17 @@ fn run() -> Result<(), String> {
 
     let widget = args.get(1).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [options] [value]".to_string())?;
     let command = args.get(2).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [options] [value]".to_string())?;
-    let options = args.get(3).map(|s| s.as_str()).unwrap_or("");
-    let value = args.get(4).map(|s| s.as_str()).unwrap_or("");
+    let (options, value) = match args.len() {
+        n if n >= 5 => (args[3].as_str(), args[4].as_str()),
+        4 => {
+            if args[3].starts_with("SEC_") || args[3] == "ON_PTY" {
+                (args[3].as_str(), "")
+            } else {
+                ("", args[3].as_str())
+            }
+        }
+        _ => ("", ""),
+    };
 
     if !widget.is_empty() && !command.is_empty() {
         let payload = vscomm::encode_ui_payload(widget, command, options, value);
@@ -38,6 +47,21 @@ fn run() -> Result<(), String> {
 }
 
 fn vsock_connect(cid: u32, port: u32) -> io::Result<VsockStream> {
+    let delays = [100u64, 500, 1000];
+    for (i, &ms) in delays.iter().enumerate() {
+        match try_connect(cid, port) {
+            Ok(s) => return Ok(s),
+            Err(e) if i < delays.len() - 1 => {
+                eprintln!("bunkerbox-status: vsock connect attempt {} failed: {e}", i + 1);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+fn try_connect(cid: u32, port: u32) -> io::Result<VsockStream> {
     unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
         if fd < 0 {

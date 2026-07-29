@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, ToSocketAddrs};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,17 +41,8 @@ fn cleanup_partial_session(session_dir: Option<&PathBuf>, home_path: Option<&Pat
 
 pub fn run(
     config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, _share_dir: &Path, app_name: &str, vsock_enabled: bool,
-    status_fd: RawFd,
+    _status_fd: RawFd,
 ) -> Result<(), String> {
-    fn write_ui_cmd(fd: RawFd, widget: &str, command: &str, options: &str, value: &str) {
-        let payload = crate::vscomm::encode_ui_payload(widget, command, options, value);
-        let mut buf = b"@".to_vec();
-        buf.extend_from_slice(&payload);
-        buf.push(b'\n');
-        unsafe {
-            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len());
-        }
-    }
 
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
@@ -171,6 +163,8 @@ pub fn run(
     let resolv_conf_mount = resolv_conf.as_ref().map(|path| format!("type=bind,src={},dst=/etc/resolv.conf,options=rbind:ro", path.display()));
     let workspace_mount = format!("type=bind,src={},dst=/workspace,options=rbind:rw", workspace.path().display());
     let mut container_env = Vec::new();
+    let mut tools_mount: Option<String> = None;
+    let init_cmd = String::from("/bunkerbox-tools/init.sh");
     let home_mount = if let Some(ref hp) = home_path {
         let src = if let Some(ref sd) = session_dir {
             sd.display().to_string()
@@ -190,6 +184,24 @@ pub fn run(
 
     if vsock_enabled {
         container_env.push(format!("BUNKERBOX_VSOCK_PORT={VSOCK_PORT}"));
+    }
+
+    if let Some(ref cmds) = config.command {
+        if !cmds.is_empty() {
+            let tools_dir = match std::env::var("BUNKERBOX_TOOLS_DIR") {
+                Ok(d) if !d.is_empty() => PathBuf::from(d),
+                _ => {
+                    let dir = std::env::temp_dir().join(format!("bunkerbox-tools-{}", std::process::id()));
+                    fs::create_dir_all(&dir).map_err(|e| format!("create tools dir: {e}"))?;
+                    let init = crate::wrap::generate_init_script(cmds);
+                    fs::write(dir.join("init.sh"), init.as_bytes()).map_err(|e| format!("write init.sh: {e}"))?;
+                    fs::set_permissions(dir.join("init.sh"), fs::Permissions::from_mode(0o755)).map_err(|e| format!("chmod init.sh: {e}"))?;
+                    dir
+                }
+            };
+
+            tools_mount = Some(format!("type=bind,src={},dst=/bunkerbox-tools,options=rbind:ro", tools_dir.display()));
+        }
     }
 
     let mut args = Vec::new();
@@ -233,6 +245,11 @@ pub fn run(
         args.push(mount.as_str());
     }
 
+    if let Some(mount) = &tools_mount {
+        args.push("--mount");
+        args.push(mount.as_str());
+    }
+
     match config.network {
         Some(NetworkMode::Bridge) => args.push("--cni"),
         Some(NetworkMode::Host) => args.push("--net-host"),
@@ -242,11 +259,14 @@ pub fn run(
     args.push(&config.image);
     args.push(container_name);
 
+    if tools_mount.is_some() {
+        crate::logging::log("Wrapping commands...");
+        args.push(&init_cmd);
+    }
+
     crate::logging::log("Starting container...");
 
     crate::logging::log("Connected");
-
-    write_ui_cmd(status_fd, "popup", "hide", "ON_PTY,SEC_6", "");
 
     let result = run_command("sudo", &args);
 

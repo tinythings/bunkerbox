@@ -97,6 +97,8 @@ pub struct RuntimeConfig {
     pub session_mb: Option<u32>,
     #[serde(default)]
     pub session_cleanup: Option<Vec<String>>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
 }
 
 impl RuntimeConfig {

@@ -11,3 +11,4 @@ pub mod sandbox;
 pub mod tui;
 pub mod vscomm;
 pub mod workspace;
+pub mod wrap;

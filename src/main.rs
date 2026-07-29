@@ -272,12 +272,18 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 }
 
 async fn status_listener(overlay: Arc<Mutex<tui::OverlayState>>) {
+    use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio_vsock::VsockListener;
 
-    let listener = match VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, vscomm::STATUS_PORT)) {
-        Ok(l) => l,
-        Err(_) => return,
+    let listener = loop {
+        match VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, vscomm::STATUS_PORT)) {
+            Ok(l) => break l,
+            Err(e) => {
+                eprintln!("bunkerbox: vsock status listener bind failed ({e}), retrying...");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
     };
 
     loop {

@@ -15,6 +15,10 @@ use ratatui::Terminal;
 
 use crate::vscomm::{self, parse_triggers, Trigger};
 
+mod palette;
+mod popup;
+use popup::PopupWidget;
+
 static RESIZED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigwinch(_: libc::c_int) {
@@ -24,6 +28,8 @@ extern "C" fn handle_sigwinch(_: libc::c_int) {
 const WIDGET_PROGRESS: &str = "progress";
 const WIDGET_STATUS: &str = "status";
 const WIDGET_POPUP: &str = "popup";
+const WIDGET_SPINNER: &str = "spinner";
+const WIDGET_PASSWORD: &str = "password";
 
 const CMD_SHOW: &str = "show";
 const CMD_HIDE: &str = "hide";
@@ -41,15 +47,13 @@ pub struct PendingAction {
 
 pub struct OverlayState {
     pub status_text: String,
-    pub progress_percent: Option<f64>,
-    pub progress_label: Option<String>,
-    pub popup_text: Option<String>,
+    pub popup: PopupWidget,
     pub pending: Vec<PendingAction>,
 }
 
 impl OverlayState {
     pub fn new(status_text: String) -> Self {
-        Self { status_text, progress_percent: None, progress_label: None, popup_text: None, pending: Vec::new() }
+        Self { status_text, popup: PopupWidget::new(), pending: Vec::new() }
     }
 }
 
@@ -70,22 +74,19 @@ pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str
     match (widget, command) {
         (WIDGET_PROGRESS, CMD_SET) => {
             if let Ok(pct) = value.parse::<f64>() {
-                state.progress_percent = Some(pct.clamp(0.0, 1.0));
+                state.popup.set_progress(pct.clamp(0.0, 1.0), None);
             }
         }
         (WIDGET_PROGRESS, CMD_SHOW) => {
             if let Some((pct, label)) = value.split_once(';') {
-                if let Ok(pct) = pct.trim().parse::<f64>() {
-                    state.progress_percent = Some(pct.clamp(0.0, 1.0));
-                }
-                state.progress_label = Some(label.trim().to_string());
+                let pct: f64 = pct.trim().parse().unwrap_or(0.0);
+                state.popup.show_progress("", pct.clamp(0.0, 1.0), Some(label.trim().to_string()));
             } else if let Ok(pct) = value.parse::<f64>() {
-                state.progress_percent = Some(pct.clamp(0.0, 1.0));
+                state.popup.show_progress("", pct.clamp(0.0, 1.0), None);
             }
         }
         (WIDGET_PROGRESS, CMD_HIDE) => {
-            state.progress_percent = None;
-            state.progress_label = None;
+            state.popup.hide();
         }
         (WIDGET_STATUS, CMD_SET) => {
             state.status_text = value.to_string();
@@ -94,10 +95,22 @@ pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str
             state.status_text.clear();
         }
         (WIDGET_POPUP, CMD_SHOW) => {
-            state.popup_text = Some(value.to_string());
+            state.popup.show_info(None, value, None, None);
         }
         (WIDGET_POPUP, CMD_HIDE) => {
-            state.popup_text = None;
+            state.popup.hide();
+        }
+        (WIDGET_SPINNER, CMD_SHOW) => {
+            state.popup.show_spinner(value);
+        }
+        (WIDGET_SPINNER, CMD_HIDE) => {
+            state.popup.hide();
+        }
+        (WIDGET_PASSWORD, CMD_SHOW) => {
+            state.popup.show_password(options, value);
+        }
+        (WIDGET_PASSWORD, CMD_HIDE) => {
+            state.popup.hide();
         }
         _ => {}
     }
@@ -434,6 +447,8 @@ where
                 }
             }
 
+            state.popup.tick();
+
             terminal.draw(|f| render_frame(f, term.screen(), &state)).map_err(|e| format!("draw: {e}"))?;
         }
     }
@@ -523,41 +538,9 @@ fn render_frame(f: &mut Frame, screen: &vt100::Screen, overlay: &OverlayState) {
         }
     }
 
-    if let Some(ref text) = overlay.popup_text {
-        let popup_w = (text.len() as u16 + 4).min(area.width.saturating_sub(4));
-        let popup_h = 3u16;
-        let popup_x = (area.width.saturating_sub(popup_w)) / 2;
-        let popup_y = (area.height.saturating_sub(popup_h)) / 2;
-        let rect = Rect::new(popup_x, popup_y, popup_w, popup_h);
-        f.render_widget(Clear, rect);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(format!(" {} ", text))
-            .title_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
-        f.render_widget(block, rect);
-    }
-
-    if let Some(pct) = overlay.progress_percent {
-        let bar_w = (area.width.saturating_sub(8)).min(60);
-        let bar_x = (area.width.saturating_sub(bar_w)) / 2;
-        let bar_y = area.height.saturating_sub(4);
-        let rect = Rect::new(bar_x, bar_y, bar_w, 3u16);
-        f.render_widget(Clear, rect);
-
-        let pct_label = format!(" {:.0}% ", pct * 100.0);
-        let label = overlay.progress_label.as_deref().unwrap_or("");
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!(" {label} {pct_label}"))
-            .title_style(Style::default().fg(Color::White));
-        f.render_widget(block, rect);
-
-        let gauge =
-            ratatui::widgets::Gauge::default().gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray)).percent((pct * 100.0) as u16);
-        let inner = Rect::new(bar_x + 1, bar_y + 1, bar_w.saturating_sub(2), 1);
-        f.render_widget(gauge, inner);
+    {
+        let buf = f.buffer_mut();
+        overlay.popup.render(area, buf);
     }
 
     if !overlay.status_text.is_empty() {

@@ -15,7 +15,7 @@ const SPINNER_FPS_MS: u64 = 83;
 pub enum PopupContent {
     Spinner { message: String, model: spinner::Model, last_tick: Instant },
     Progress { title: String, percent: f64, label: Option<String> },
-    Password { title: String, prompt: String },
+    Password { title: String, prompt: String, value: String },
     Info { title: Option<String>, message: String, fg: ratatui::style::Color },
 }
 
@@ -59,7 +59,7 @@ impl PopupWidget {
 
     pub fn show_password(&mut self, title: impl Into<String>, prompt: impl Into<String>) {
         self.border_color = palette::ACCENT;
-        self.content = PopupContent::Password { title: title.into(), prompt: prompt.into() };
+        self.content = PopupContent::Password { title: title.into(), prompt: prompt.into(), value: String::new() };
         self.visible = true;
     }
 
@@ -85,6 +85,29 @@ impl PopupWidget {
         self.visible = false;
     }
 
+    pub fn push_char(&mut self, c: char) {
+        if let PopupContent::Password { ref mut value, .. } = &mut self.content {
+            value.push(c);
+        }
+    }
+
+    pub fn pop_char(&mut self) {
+        if let PopupContent::Password { ref mut value, .. } = &mut self.content {
+            value.pop();
+        }
+    }
+
+    pub fn take_password(&mut self) -> Option<String> {
+        if matches!(self.content, PopupContent::Password { .. }) {
+            let old =
+                std::mem::replace(&mut self.content, PopupContent::Password { title: String::new(), prompt: String::new(), value: String::new() });
+            if let PopupContent::Password { value, .. } = old {
+                return Some(value);
+            }
+        }
+        None
+    }
+
     /// Compute the natural content dimensions (width, height) for the popup interior.
     fn content_size(&self) -> (u16, u16) {
         match &self.content {
@@ -97,7 +120,7 @@ impl PopupWidget {
                 let w = (title.len() as u16).max(label_w).max(40);
                 (w + 8, 7)
             }
-            PopupContent::Password { title: _, prompt } => {
+            PopupContent::Password { title: _, prompt, .. } => {
                 let w = (prompt.len() as u16 + 20).max(40);
                 (w, 7)
             }
@@ -149,8 +172,8 @@ impl PopupWidget {
             PopupContent::Progress { title: _, percent, label } => {
                 self.render_progress(inner, buf, *percent, label);
             }
-            PopupContent::Password { title: _, prompt } => {
-                self.render_password(inner, buf, prompt);
+            PopupContent::Password { title: _, prompt, value } => {
+                self.render_password(inner, buf, prompt, value);
             }
             PopupContent::Info { message, fg, .. } => {
                 self.render_info(inner, buf, message, *fg);
@@ -245,7 +268,7 @@ impl PopupWidget {
         }
     }
 
-    fn render_password(&self, inner: Rect, buf: &mut Buffer, prompt: &str) {
+    fn render_password(&self, inner: Rect, buf: &mut Buffer, prompt: &str, value: &str) {
         let [_, prompt_area, input_area, _]: [Rect; 4] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(1), Constraint::Length(2), Constraint::Min(0)])
@@ -261,7 +284,7 @@ impl PopupWidget {
             .alignment(Alignment::Center)
             .render(Rect { x: px, y: prompt_area.y, width: pw, height: 1 }, buf);
 
-        let mask = "\u{2022}".repeat(12);
+        let mask = "\u{2022}".repeat(if value.is_empty() { 12 } else { value.len() });
         let mw = mask.len() as u16;
         let mx = input_area.x + (input_area.width.saturating_sub(mw)) / 2;
         Paragraph::new(Line::from(vec![Span::styled(mask, Style::default().fg(palette::MUTED).bg(palette::BG_3))]))

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossterm::cursor;
-use crossterm::event::{self};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -147,6 +147,7 @@ struct Term {
     g1_dec_special_graphics: bool,
     using_g1_charset: bool,
     application_cursor_keys: bool,
+    csi_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -170,6 +171,7 @@ impl Term {
             g1_dec_special_graphics: false,
             using_g1_charset: false,
             application_cursor_keys: false,
+            csi_bytes: Vec::new(),
         }
     }
 
@@ -185,12 +187,7 @@ impl Term {
 
     /// Feeds raw bytes through DEC translation then into the vt100 parser.
     fn process(&mut self, bytes: &[u8]) {
-        if bytes.contains(&0x1b) {
-            self.handle_queries(bytes);
-            self.handle_cursor_mode(bytes);
-        }
-        let translated = self.translate_dec_special_graphics(bytes);
-        self.parser.process(&translated);
+        self.process_bytes(bytes);
     }
 
     fn drain_responses(&mut self) -> Vec<Vec<u8>> {
@@ -202,26 +199,6 @@ impl Term {
         self.application_cursor_keys
     }
 
-    fn handle_cursor_mode(&mut self, bytes: &[u8]) {
-        if bytes.windows(5).any(|w| w == b"\x1b[?1h") {
-            self.application_cursor_keys = true;
-        }
-        if bytes.windows(5).any(|w| w == b"\x1b[?1l") {
-            self.application_cursor_keys = false;
-        }
-    }
-
-    fn handle_queries(&mut self, bytes: &[u8]) {
-        if bytes.windows(4).any(|w| w == b"\x1b[6n") {
-            let (cur_row, cur_col) = self.parser.screen().cursor_position();
-            self.responses.push(format!("\x1b[{};{}R", cur_row + 1, cur_col + 1).into_bytes());
-        }
-        if bytes.windows(5).any(|w| w == b"\x1b[18t") {
-            let (rows, cols) = self.parser.screen().size();
-            self.responses.push(format!("\x1b[8;{};{}t", rows, cols).into_bytes());
-        }
-    }
-
     fn active_dec_special_graphics(&self) -> bool {
         if self.using_g1_charset {
             self.g1_dec_special_graphics
@@ -231,8 +208,10 @@ impl Term {
     }
 
     /// Translates `\e(0` DEC Special Graphics characters to Unicode
-    /// box-drawing glyphs and normalizes HVP (`CSI … f`) to CUP (`CSI … H`).
-    fn translate_dec_special_graphics(&mut self, bytes: &[u8]) -> Vec<u8> {
+    /// box-drawing glyphs, normalizes HVP (`CSI … f`) to CUP (`CSI … H`),
+    /// and answers stream-split terminal queries after preceding bytes have
+    /// been parsed.
+    fn process_bytes(&mut self, bytes: &[u8]) {
         let mut translated = Vec::with_capacity(bytes.len());
 
         for &byte in bytes {
@@ -260,6 +239,7 @@ impl Term {
                     }
                     b'[' => {
                         self.escape_state = EscapeState::Csi;
+                        self.csi_bytes.clear();
                         translated.push(0x1b);
                         translated.push(byte);
                     }
@@ -283,6 +263,7 @@ impl Term {
                     self.escape_state = EscapeState::Ground;
                 }
                 EscapeState::Csi => {
+                    self.csi_bytes.push(byte);
                     if byte == b'f' {
                         translated.push(b'H');
                     } else {
@@ -290,6 +271,10 @@ impl Term {
                     }
                     if (0x40..=0x7e).contains(&byte) {
                         self.escape_state = EscapeState::Ground;
+                        if self.handle_csi_complete(&mut translated) {
+                            translated.clear();
+                        }
+                        self.csi_bytes.clear();
                     }
                 }
                 EscapeState::String => {
@@ -307,7 +292,31 @@ impl Term {
             }
         }
 
-        translated
+        if !translated.is_empty() {
+            self.parser.process(&translated);
+        }
+    }
+
+    fn handle_csi_complete(&mut self, translated: &mut Vec<u8>) -> bool {
+        match self.csi_bytes.as_slice() {
+            b"?1h" => self.application_cursor_keys = true,
+            b"?1l" => self.application_cursor_keys = false,
+            b"6n" => {
+                self.parser.process(translated);
+                let (cur_row, cur_col) = self.parser.screen().cursor_position();
+                self.responses.push(format!("\x1b[{};{}R", cur_row + 1, cur_col + 1).into_bytes());
+                return true;
+            }
+            b"18t" => {
+                self.parser.process(translated);
+                let (rows, cols) = self.parser.screen().size();
+                self.responses.push(format!("\x1b[8;{};{}t", rows, cols).into_bytes());
+                return true;
+            }
+            _ => {}
+        }
+
+        false
     }
 }
 
@@ -398,7 +407,6 @@ where
     let mut terminal = Terminal::new(backend).map_err(|e| format!("terminal: {e}"))?;
 
     let mut pty_buf = [0u8; 4096];
-    let mut stdin_buf = [0u8; 1];
 
     let mut last_rows = rows;
     let mut last_cols = cols;
@@ -462,29 +470,17 @@ where
         }
 
         if fds[1].revents & libc::POLLIN != 0 {
-            let n = unsafe { libc::read(stdin_fd, stdin_buf.as_mut_ptr() as *mut libc::c_void, 1usize) };
-            if n > 0 {
-                let byte = stdin_buf[0];
+            if let Ok(Event::Key(key)) = event::read() {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
                 let is_password = overlay.lock().is_ok_and(|s| matches!(s.popup.content, popup::PopupContent::Password { .. }));
                 if is_password {
-                    let mut state = overlay.lock().unwrap();
-                    if byte == 0x0d {
-                        if let Some(password) = state.popup.take_password() {
-                            let mut response = password.into_bytes();
-                            response.push(b'\n');
-                            state.popup.hide();
-                            unsafe {
-                                libc::write(status_fd, response.as_ptr() as *const libc::c_void, response.len());
-                            }
-                        }
-                    } else if byte == 0x7f {
-                        state.popup.pop_char();
-                    } else if byte >= 0x20 && byte != 0x7f {
-                        state.popup.push_char(byte as char);
-                    }
-                } else {
+                    handle_password_key(&overlay, status_fd, key);
+                } else if let Some(bytes) = key_to_bytes(&key, term.application_cursor_keys()) {
                     unsafe {
-                        libc::write(master_fd, stdin_buf.as_ptr() as *const libc::c_void, 1usize);
+                        libc::write(master_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
                     }
                 }
             }
@@ -560,6 +556,132 @@ where
     }
 
     Ok(())
+}
+
+fn handle_password_key(overlay: &Arc<Mutex<OverlayState>>, status_fd: RawFd, key: KeyEvent) {
+    let mut state = overlay.lock().unwrap();
+    match key.code {
+        KeyCode::Enter => {
+            if let Some(password) = state.popup.take_password() {
+                let mut response = password.into_bytes();
+                response.push(b'\n');
+                state.popup.hide();
+                unsafe {
+                    libc::write(status_fd, response.as_ptr() as *const libc::c_void, response.len());
+                }
+            }
+        }
+        KeyCode::Backspace => state.popup.pop_char(),
+        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => state.popup.push_char(c),
+        _ => {}
+    }
+}
+
+fn key_to_bytes(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
+    match key.code {
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if c.is_ascii_alphabetic() {
+                    Some(vec![(c.to_ascii_lowercase() as u8) & 0x1f])
+                } else {
+                    None
+                }
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                let mut v = vec![0x1b];
+                let mut buf = [0u8; 4];
+                let len = c.encode_utf8(&mut buf).len();
+                v.extend_from_slice(&buf[..len]);
+                Some(v)
+            } else {
+                let mut buf = [0u8; 4];
+                let len = c.encode_utf8(&mut buf).len();
+                Some(buf[..len].to_vec())
+            }
+        }
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(if app_cursor { b"\x1bOA".to_vec() } else { b"\x1b[A".to_vec() }),
+        KeyCode::Down => Some(if app_cursor { b"\x1bOB".to_vec() } else { b"\x1b[B".to_vec() }),
+        KeyCode::Right => Some(if app_cursor { b"\x1bOC".to_vec() } else { b"\x1b[C".to_vec() }),
+        KeyCode::Left => Some(if app_cursor { b"\x1bOD".to_vec() } else { b"\x1b[D".to_vec() }),
+        KeyCode::Home => Some(if app_cursor { b"\x1bOH".to_vec() } else { b"\x1b[H".to_vec() }),
+        KeyCode::End => Some(if app_cursor { b"\x1bOF".to_vec() } else { b"\x1b[F".to_vec() }),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
+        KeyCode::F(n) => fn_key(n),
+        _ => None,
+    }
+}
+
+fn fn_key(n: u8) -> Option<Vec<u8>> {
+    match n {
+        1 => Some(b"\x1bOP".to_vec()),
+        2 => Some(b"\x1bOQ".to_vec()),
+        3 => Some(b"\x1bOR".to_vec()),
+        4 => Some(b"\x1bOS".to_vec()),
+        5 => Some(b"\x1b[15~".to_vec()),
+        6 => Some(b"\x1b[17~".to_vec()),
+        7 => Some(b"\x1b[18~".to_vec()),
+        8 => Some(b"\x1b[19~".to_vec()),
+        9 => Some(b"\x1b[20~".to_vec()),
+        10 => Some(b"\x1b[21~".to_vec()),
+        11 => Some(b"\x1b[23~".to_vec()),
+        12 => Some(b"\x1b[24~".to_vec()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Term;
+
+    #[test]
+    fn cursor_report_uses_position_after_prior_bytes_in_same_chunk() {
+        let mut term = Term::new(24, 80);
+
+        term.process(b"\x1b[10;20H\x1b[6n");
+
+        assert_eq!(term.drain_responses(), vec![b"\x1b[10;20R".to_vec()]);
+    }
+
+    #[test]
+    fn cursor_report_handles_split_query() {
+        let mut term = Term::new(24, 80);
+
+        term.process(b"\x1b[10;20H\x1b[");
+        assert!(term.drain_responses().is_empty());
+        term.process(b"6n");
+
+        assert_eq!(term.drain_responses(), vec![b"\x1b[10;20R".to_vec()]);
+    }
+
+    #[test]
+    fn cursor_mode_handles_split_sequences() {
+        let mut term = Term::new(24, 80);
+
+        term.process(b"\x1b[?");
+        term.process(b"1h");
+        assert!(term.application_cursor_keys());
+
+        term.process(b"\x1b[?1");
+        term.process(b"l");
+        assert!(!term.application_cursor_keys());
+    }
+
+    #[test]
+    fn window_size_report_handles_split_query() {
+        let mut term = Term::new(24, 80);
+
+        term.process(b"\x1b[18");
+        assert!(term.drain_responses().is_empty());
+        term.process(b"t");
+
+        assert_eq!(term.drain_responses(), vec![b"\x1b[8;24;80t".to_vec()]);
+    }
 }
 
 /// Converts a [`vt100::Color`] to a [`ratatui::style::Color`], preserving

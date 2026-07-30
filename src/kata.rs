@@ -271,7 +271,7 @@ pub fn run(
 
     crate::logging::log("Connected");
 
-    let result = run_command("sudo", &args);
+    let result = run_command_interactive("sudo", &args);
 
     crate::logging::log("Container stopped");
     if bridge_firewall {
@@ -579,6 +579,25 @@ fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
 
     let status = child.wait().map_err(|err| format!("failed to wait for {program}: {err}"))?;
     stderr_thread.join().map_err(|_| format!("stderr filter thread panicked for {program}"))??;
+
+    if !status.success() {
+        return Err(format!("command failed with status {status}: {program}"));
+    }
+
+    Ok(())
+}
+
+/// Runs an interactive command with all stdio attached to the terminal.
+/// Full-screen TUIs can write control sequences to stderr, so this path must
+/// not line-buffer or re-emit stderr.
+fn run_command_interactive(program: &str, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|err| format!("failed to run {program}: {err}"))?;
 
     if !status.success() {
         return Err(format!("command failed with status {status}: {program}"));

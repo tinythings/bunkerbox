@@ -114,6 +114,7 @@ files:
 
       echo "Interactive shell."
       echo
+      echo "To test TUI rendering: btop  or  htop"
       echo "To test VSOCK: bunkerbox-status popup info \"\" \"hello from vm\""
       exec /bin/sh
 
@@ -122,13 +123,18 @@ containerfile: |
 
   RUN apk add --no-cache \
         bind-tools \
+        btop \
         busybox-extras \
         ca-certificates \
         curl \
+        htop \
         iproute2 \
         iputils \
         netcat-openbsd \
+        musl-locales \
         openssl
+
+  ENV LANG=C.UTF-8
 
   RUN mkdir -p /workspace /usr/local/bunkerbox/bin \
       && chmod 0777 /workspace

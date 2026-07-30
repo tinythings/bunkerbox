@@ -297,7 +297,7 @@ impl Term {
         }
     }
 
-    fn handle_csi_complete(&mut self, translated: &mut Vec<u8>) -> bool {
+    fn handle_csi_complete(&mut self, translated: &mut [u8]) -> bool {
         match self.csi_bytes.as_slice() {
             b"?1h" => self.application_cursor_keys = true,
             b"?1l" => self.application_cursor_keys = false,

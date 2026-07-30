@@ -43,7 +43,6 @@ pub fn run(
     config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, _share_dir: &Path, app_name: &str, vsock_enabled: bool,
     _status_fd: RawFd,
 ) -> Result<(), String> {
-
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
     }

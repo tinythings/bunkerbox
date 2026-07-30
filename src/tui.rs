@@ -141,10 +141,12 @@ pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str
 /// character set translation and HVP-to-CUP normalization.
 struct Term {
     parser: vt100::Parser,
+    responses: Vec<Vec<u8>>,
     escape_state: EscapeState,
     g0_dec_special_graphics: bool,
     g1_dec_special_graphics: bool,
     using_g1_charset: bool,
+    application_cursor_keys: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -162,10 +164,12 @@ impl Term {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, 0),
+            responses: Vec::new(),
             escape_state: EscapeState::Ground,
             g0_dec_special_graphics: false,
             g1_dec_special_graphics: false,
             using_g1_charset: false,
+            application_cursor_keys: false,
         }
     }
 
@@ -176,13 +180,46 @@ impl Term {
 
     /// Resizes the terminal grid after a window resize event.
     fn set_size(&mut self, rows: u16, cols: u16) {
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
     }
 
     /// Feeds raw bytes through DEC translation then into the vt100 parser.
     fn process(&mut self, bytes: &[u8]) {
+        if bytes.contains(&0x1b) {
+            self.handle_queries(bytes);
+            self.handle_cursor_mode(bytes);
+        }
         let translated = self.translate_dec_special_graphics(bytes);
         self.parser.process(&translated);
+    }
+
+    fn drain_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.responses)
+    }
+
+    #[allow(dead_code)]
+    fn application_cursor_keys(&self) -> bool {
+        self.application_cursor_keys
+    }
+
+    fn handle_cursor_mode(&mut self, bytes: &[u8]) {
+        if bytes.windows(5).any(|w| w == b"\x1b[?1h") {
+            self.application_cursor_keys = true;
+        }
+        if bytes.windows(5).any(|w| w == b"\x1b[?1l") {
+            self.application_cursor_keys = false;
+        }
+    }
+
+    fn handle_queries(&mut self, bytes: &[u8]) {
+        if bytes.windows(4).any(|w| w == b"\x1b[6n") {
+            let (cur_row, cur_col) = self.parser.screen().cursor_position();
+            self.responses.push(format!("\x1b[{};{}R", cur_row + 1, cur_col + 1).into_bytes());
+        }
+        if bytes.windows(5).any(|w| w == b"\x1b[18t") {
+            let (rows, cols) = self.parser.screen().size();
+            self.responses.push(format!("\x1b[8;{};{}t", rows, cols).into_bytes());
+        }
     }
 
     fn active_dec_special_graphics(&self) -> bool {
@@ -412,6 +449,11 @@ where
             let n = unsafe { libc::read(master_fd, pty_buf.as_mut_ptr() as *mut libc::c_void, pty_buf.len()) };
             if n > 0 {
                 term.process(&pty_buf[..n as usize]);
+                for response in term.drain_responses() {
+                    unsafe {
+                        libc::write(master_fd, response.as_ptr() as *const libc::c_void, response.len());
+                    }
+                }
                 pty_output = true;
             } else {
                 hold_error_popup(&overlay, &mut terminal, term.screen());
@@ -556,6 +598,9 @@ fn render_frame(f: &mut Frame, screen: &vt100::Screen, overlay: &OverlayState) {
 
                 if cell.bold() {
                     style = style.add_modifier(Modifier::BOLD);
+                }
+                if cell.dim() {
+                    style = style.add_modifier(Modifier::DIM);
                 }
                 if cell.italic() {
                     style = style.add_modifier(Modifier::ITALIC);

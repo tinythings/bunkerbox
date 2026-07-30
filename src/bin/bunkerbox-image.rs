@@ -320,12 +320,20 @@ fn dist_dir() -> Result<PathBuf, String> {
 
 fn find_vscomm_binary() -> Result<PathBuf, String> {
     let path = dist_dir()?.join("bunkerbox-vscomm");
-    if path.is_file() { Ok(path) } else { Err("bunkerbox-vscomm not found in target/dist/. Run: make dev".into()) }
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err("bunkerbox-vscomm not found in target/dist/. Run: make dev".into())
+    }
 }
 
 fn find_status_binary() -> Result<PathBuf, String> {
     let path = dist_dir()?.join("bunkerbox-status");
-    if path.is_file() { Ok(path) } else { Err("bunkerbox-status not found in target/dist/. Run: make dev".into()) }
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err("bunkerbox-status not found in target/dist/. Run: make dev".into())
+    }
 }
 
 fn podman_build(config: &ImageConfig, build_dir: &Path) -> Result<(), String> {

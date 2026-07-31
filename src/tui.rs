@@ -85,6 +85,7 @@ pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str
         } else {
             state.hide_on_content = Some(value.to_string());
         }
+        return;
     }
 
     let triggers = parse_triggers(options);
@@ -403,20 +404,18 @@ fn screen_contains(screen: &vt100::Screen, pattern: &str) -> bool {
         return false;
     }
     let (rows, cols) = screen.size();
+    let mut buf = String::with_capacity((rows * cols) as usize);
     for row in 0..rows {
         for col in 0..cols {
             if let Some(cell) = screen.cell(row, col) {
                 if cell.is_wide_continuation() {
                     continue;
                 }
-                let contents = cell.contents();
-                if contents.contains(pattern) {
-                    return true;
-                }
+                buf.push_str(cell.contents());
             }
         }
     }
-    false
+    buf.contains(pattern)
 }
 
 fn screen_has_ascii_alphanumeric(screen: &vt100::Screen) -> bool {

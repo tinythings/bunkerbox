@@ -112,8 +112,10 @@ impl PopupWidget {
     /// Compute the natural content dimensions (width, height) for the popup interior.
     fn content_size(&self) -> (u16, u16) {
         match &self.content {
-            PopupContent::Spinner { message, .. } => {
-                let w = (message.len() as u16 + 6).max(30);
+            PopupContent::Spinner { message, model, .. } => {
+                let frame = model.view();
+                let text = format!("{}  {}", frame, message);
+                let w = (text.len() as u16 + 8).max(30);
                 (w, 5)
             }
             PopupContent::Progress { title, label, .. } => {

@@ -21,7 +21,7 @@ tokio-vsock = "0.7"
 ratatui = "0.30"
 crossterm = "0.28"
 vt100 = "0.16"
-ratatui-glamour = { git = "https://github.com/tinythings/ratatui-glamour.git", rev = "1545394" }
+ratatui-glamour = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

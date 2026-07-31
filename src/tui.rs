@@ -632,20 +632,17 @@ where
 
 fn handle_password_key(overlay: &Arc<Mutex<OverlayState>>, status_fd: RawFd, key: KeyEvent) {
     let mut state = overlay.lock().unwrap();
-    match key.code {
-        KeyCode::Enter => {
-            if let Some(password) = state.popup.take_password() {
-                let mut response = password.into_bytes();
-                response.push(b'\n');
-                state.popup.hide();
-                unsafe {
-                    libc::write(status_fd, response.as_ptr() as *const libc::c_void, response.len());
-                }
+    if key.code == KeyCode::Enter {
+        if let Some(password) = state.popup.password_value() {
+            let mut response = password.into_bytes();
+            response.push(b'\n');
+            state.popup.hide();
+            unsafe {
+                libc::write(status_fd, response.as_ptr() as *const libc::c_void, response.len());
             }
         }
-        KeyCode::Backspace => state.popup.pop_char(),
-        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => state.popup.push_char(c),
-        _ => {}
+    } else {
+        state.popup.handle_password_key(&key);
     }
 }
 

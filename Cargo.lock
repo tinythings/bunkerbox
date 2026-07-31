@@ -1408,8 +1408,9 @@ dependencies = [
 
 [[package]]
 name = "ratatui-glamour"
-version = "0.2.0"
-source = "git+https://github.com/tinythings/ratatui-glamour.git?rev=1545394#1545394cc3481bd5595f5a1f1e1eec3287ccb2a6"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "839e8afaa7fa994cceed3814118e22fa56fbc62be71db1506b8d88825a039691"
 dependencies = [
  "crossterm 0.28.1",
  "ratatui",

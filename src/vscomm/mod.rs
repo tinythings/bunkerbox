@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 
 pub mod buildsys;
 pub const VSOCK_PORT: u32 = 9999;
+pub const STATUS_PORT: u32 = 9998;
 pub const VSCOMM_BIN_DIR: &str = "/usr/local/bunkerbox/bin";
 
 #[repr(u16)]
@@ -15,6 +16,7 @@ pub enum FrameType {
     Stderr = 3,
     Exit = 4,
     Disconnect = 5,
+    UiCommand = 10,
 }
 
 impl FrameType {
@@ -25,6 +27,7 @@ impl FrameType {
             3 => Some(Self::Stderr),
             4 => Some(Self::Exit),
             5 => Some(Self::Disconnect),
+            10 => Some(Self::UiCommand),
             _ => None,
         }
     }
@@ -148,5 +151,66 @@ impl ExecRequest {
         }
 
         Ok(Self { cwd, command, args, env })
+    }
+}
+
+pub fn encode_ui_payload(widget: &str, command: &str, options: &str, value: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(widget.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(command.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(options.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(value.as_bytes());
+    buf.push(0);
+    buf
+}
+
+pub fn decode_ui_payload(payload: &[u8]) -> Option<(&str, &str, &str, &str)> {
+    let mut parts = payload.split(|&b| b == 0);
+    let widget = std::str::from_utf8(parts.next()?).ok()?;
+    let command = std::str::from_utf8(parts.next()?).ok()?;
+    let options = std::str::from_utf8(parts.next()?).ok()?;
+    let value = std::str::from_utf8(parts.next()?).ok()?;
+    Some((widget, command, options, value))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Trigger {
+    OnPty,
+    DelayMs(u64),
+    DelayMsAfterPty(u64),
+}
+
+pub fn parse_triggers(options: &str) -> Vec<Trigger> {
+    if options.is_empty() {
+        return Vec::new();
+    }
+
+    let mut has_on_pty = false;
+    let mut delay_ms: Option<u64> = None;
+
+    for s in options.split(',') {
+        let s = s.trim();
+        if s == "ON_PTY" {
+            has_on_pty = true;
+        } else if let Some(secs) = s.strip_prefix("SEC_") {
+            if let Ok(secs) = secs.parse::<f64>() {
+                delay_ms = Some((secs * 1000.0) as u64);
+            }
+        }
+    }
+
+    if has_on_pty {
+        if let Some(ms) = delay_ms {
+            vec![Trigger::DelayMsAfterPty(ms)]
+        } else {
+            vec![Trigger::OnPty]
+        }
+    } else if let Some(ms) = delay_ms {
+        vec![Trigger::DelayMs(ms)]
+    } else {
+        Vec::new()
     }
 }

@@ -1,63 +1,84 @@
 # Image hooks
 
-Image hooks are small shell scripts stored in an image config. They run inside the container.
+Hooks let you run shell commands at specific points during your app's lifecycle inside the container. They're defined in your image config.
 
-Hooks are useful when a tool needs a little setup before it starts or cleanup after it exits. For example, a hook can create config directories, mark the workspace as safe for Git, print diagnostics when the app fails, or remove cache before state is saved.
+## When hooks run
 
-Build an image with hooks the same way you build any image config:
+Hooks fire in this order:
 
-```sh
-make image IMAGE=images/opencode.conf
 ```
-
-## Hook order
-
-The generated entrypoint runs hooks in this order:
-
-```text
 container starts
-before-home-load
-before-app
-run app
-after-app
-app-error, only if app failed
-after-home-save
-container exits
+├─ before-home-load   ← before loading your saved home directory
+├─ before-app         ← right before your app starts
+├─ your app runs
+├─ after-app          ← after your app exits (always)
+├─ app-error          ← only if your app failed (exit code ≠ 0)
+├─ after-home-save    ← before saving your home directory
+container stops
 ```
 
-All session management (creating the loop-mounted ext4 image, populating it from the persist home, recovering from crashes, syncing back on exit) happens on the host before the container starts and after it exits. The entrypoint inside the container is trivial — it just sets `HOME` and runs the app.
+## Showing status messages
 
-`before-home-load` runs before the app starts but after the session home is bind-mounted. `before-app` runs right before the app command starts. `after-app` runs after the app exits, whether it succeeded or failed. `app-error` only runs when the app exits with a non-zero status. `after-home-save` runs before the container exits (before the host-side sync back to the persist home).
+During startup, Bunkerbox shows a status overlay while the container boots. You can update what it says from inside a hook using the `bunkerbox-status` command:
 
-## Example
+```yaml
+hooks:
+  before-home-load: |
+    bunkerbox-status status set 'Loading saved state...'
+
+  before-app: |
+    bunkerbox-status status set 'Starting my-app...'
+```
+
+The overlay hides automatically when your app produces its first output. If you want it to fade with a delay instead, use the `popup hide` command with a `SEC_` argument:
+
+```yaml
+hooks:
+  before-app: |
+    bunkerbox-status status set 'Launching my-app...'
+    bunkerbox-status popup hide "SEC_2"
+```
+
+This shows "Launching my-app..." and then fades the overlay after 2 seconds, while your app is already running.
+
+## Practical examples
+
+Set up Git for the workspace:
 
 ```yaml
 hooks:
   before-app: |
     git config --global --add safe.directory /workspace
+```
 
+Clean up cache after the app exits:
+
+```yaml
+hooks:
   after-app: |
     rm -rf "$HOME/.cache"
+```
 
+Show an error message when the app crashes:
+
+```yaml
+hooks:
   app-error: |
-    echo "app failed with status $BUNKERBOX_APP_STATUS"
+    bunkerbox-status popup info 'Error' 'The app exited unexpectedly'
 ```
 
-The app exit code is available as:
+## Available paths
 
-```text
-BUNKERBOX_APP_STATUS
+When persistent home is enabled, your hooks can use these paths:
+
 ```
-
-When persistent home is enabled, hooks can reference these paths:
-
-```text
-BUNKERBOX_PERSIST_HOME=/bunkerbox-persist-home
 HOME=/bunkerbox-persist-home
-XDG_CONFIG_HOME=/bunkerbox-persist-home/.config
-XDG_DATA_HOME=/bunkerbox-persist-home/.local/share
-XDG_STATE_HOME=/bunkerbox-persist-home/.local/state
-XDG_CACHE_HOME=/bunkerbox-persist-home/.cache
+XDG_CONFIG_HOME=$HOME/.config
+XDG_DATA_HOME=$HOME/.local/share
+XDG_STATE_HOME=$HOME/.local/state
+XDG_CACHE_HOME=$HOME/.cache
 ```
 
-Empty hooks do nothing. Hooks use `/bin/sh`.
+The app's exit code is available in the `BUNKERBOX_APP_STATUS` variable inside `after-app` and `app-error` hooks.
+
+Empty hooks are fine — they simply do nothing. Hooks use `/bin/sh`.

@@ -16,6 +16,7 @@ struct ImageConfig {
     name: String,
     image: String,
     output: PathBuf,
+    #[serde(default)]
     command: Vec<String>,
     #[serde(default)]
     overwrite: bool,
@@ -127,8 +128,8 @@ fn build_image(config: &ImageConfig) -> Result<(), String> {
         return Err("image config name is required".to_string());
     }
 
-    if config.command.is_empty() || config.command.iter().any(|part| part.trim().is_empty()) {
-        return Err("image config command is required".to_string());
+    if !config.command.is_empty() && config.command.iter().any(|part| part.trim().is_empty()) {
+        return Err("image config command must not contain empty strings".to_string());
     }
 
     if config.output.exists() {
@@ -224,6 +225,16 @@ run_app() {{
   return "$status"
 }}
 
+VSCOMM_BIN="/usr/local/bunkerbox/bin"
+if [ -x "$VSCOMM_BIN/bunkerbox-vscomm" ]; then
+  "$VSCOMM_BIN/bunkerbox-vscomm" install
+  export PATH="$VSCOMM_BIN:$PATH"
+fi
+
+if ! command -v bunkerbox-status >/dev/null 2>&1; then
+  bunkerbox-status() {{ :; }}
+fi
+
 if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
   hook_before_home_load
 
@@ -232,12 +243,6 @@ if [ -n "${{BUNKERBOX_PERSIST_HOME:-}}" ]; then
   export XDG_DATA_HOME="$HOME/.local/share"
   export XDG_STATE_HOME="$HOME/.local/state"
   export XDG_CACHE_HOME="$HOME/.cache"
-fi
-
-VSCOMM_BIN="/usr/local/bunkerbox/bin"
-if [ -x "$VSCOMM_BIN/bunkerbox-vscomm" ]; then
-  "$VSCOMM_BIN/bunkerbox-vscomm" install
-  export PATH="$VSCOMM_BIN:$PATH"
 fi
 
 set +e
@@ -281,11 +286,16 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
     fs::copy(&vscomm_path, &dest).map_err(|err| format!("failed to copy vscomm binary {}: {err}", dest.display()))?;
     fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
 
+    let status_path = find_status_binary()?;
+    let dest = build_dir.join("bunkerbox-status");
+    fs::copy(&status_path, &dest).map_err(|err| format!("failed to copy status binary {}: {err}", dest.display()))?;
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
+
     for file in &config.files {
         if file.path.is_absolute() || file.path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
             return Err(format!("unsafe build file path: {}", file.path.display()));
         }
-        if file.path == Path::new("bunker-entrypoint") || file.path == Path::new("bunkerbox-vscomm") {
+        if file.path == Path::new("bunker-entrypoint") || file.path == Path::new("bunkerbox-vscomm") || file.path == Path::new("bunkerbox-status") {
             return Err(format!("image config files must not override reserved file: {}", file.path.display()));
         }
 
@@ -302,21 +312,28 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
     Ok(())
 }
 
-fn find_vscomm_binary() -> Result<PathBuf, String> {
+fn dist_dir() -> Result<PathBuf, String> {
     let exe = env::current_exe().map_err(|e| format!("failed to locate self: {e}"))?;
-    let parent = exe.parent().ok_or_else(|| "failed to determine parent directory".to_string())?;
-    let target_dir = parent.parent().ok_or_else(|| "failed to determine target directory".to_string())?;
+    let target = exe.parent().and_then(|p| p.parent()).ok_or_else(|| "cannot determine target directory".to_string())?;
+    Ok(target.join("dist"))
+}
 
-    for profile in &["release", "debug"] {
-        let musl_candidate = target_dir.join("x86_64-unknown-linux-musl").join(profile).join("bunkerbox-vscomm");
-        if musl_candidate.is_file() {
-            return Ok(musl_candidate);
-        }
+fn find_vscomm_binary() -> Result<PathBuf, String> {
+    let path = dist_dir()?.join("bunkerbox-vscomm");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err("bunkerbox-vscomm not found in target/dist/. Run: make dev".into())
     }
+}
 
-    Err("musl-static bunkerbox-vscomm not found in target/x86_64-unknown-linux-musl/{release,debug}/\n\
-         build it first: make musl-vscomm"
-        .to_string())
+fn find_status_binary() -> Result<PathBuf, String> {
+    let path = dist_dir()?.join("bunkerbox-status");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err("bunkerbox-status not found in target/dist/. Run: make dev".into())
+    }
 }
 
 fn podman_build(config: &ImageConfig, build_dir: &Path) -> Result<(), String> {

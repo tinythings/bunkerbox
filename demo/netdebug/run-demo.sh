@@ -113,6 +113,9 @@ files:
       echo
 
       echo "Interactive shell."
+      echo
+      echo "To test TUI rendering: btop  or  htop"
+      echo "To test VSOCK: bunkerbox-status popup info \"\" \"hello from vm\""
       exec /bin/sh
 
 containerfile: |
@@ -120,16 +123,29 @@ containerfile: |
 
   RUN apk add --no-cache \
         bind-tools \
+        btop \
         busybox-extras \
         ca-certificates \
         curl \
+        htop \
         iproute2 \
         iputils \
         netcat-openbsd \
+        musl-locales \
         openssl
+
+  ENV LANG=C.UTF-8
+
+  RUN mkdir -p /workspace /usr/local/bunkerbox/bin \
+      && chmod 0777 /workspace
 
   COPY debug.sh /usr/local/bin/debug.sh
   RUN chmod 0755 /usr/local/bin/debug.sh
+
+  COPY bunkerbox-vscomm /usr/local/bunkerbox/bin/bunkerbox-vscomm
+  COPY bunkerbox-status /usr/local/bunkerbox/bin/bunkerbox-status
+
+  ENV PATH="/usr/local/bunkerbox/bin:$PATH"
 
   WORKDIR /workspace
   ENTRYPOINT ["/usr/local/bin/debug.sh"]
@@ -141,7 +157,6 @@ cat > "$RUNTIME_CONF" <<EOF_RUNTIME
 oci: ${OCI_FILE}
 image: localhost/bunkerbox-netdebug:0.1.0
 workspace: share
-home: persist
 network: bridge
 allow:
   - qwant.com

@@ -17,3 +17,4 @@ kata-static-*.tar.zst
 /demo/netdebug/netdebug
 /demo/opencode/opencode
 .bunkerbox/
+demo/crush/crush

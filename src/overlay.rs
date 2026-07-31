@@ -131,12 +131,22 @@ impl CowWorkspace {
 
     /// Unmounts stale overlay and loop mounts from previous runs, then detaches the loop device.
     fn cleanup_stale(mount_point: &Path, loop_mount: &Path, loopback: &Path) -> Result<(), String> {
-        Self::run_command_allow_failure("umount", &[&mount_point.to_string_lossy()])?;
+        match Self::run_command_allow_failure("umount", &[&mount_point.to_string_lossy()]) {
+            Ok(()) => crate::logging::log(&format!("cleanup_stale: unmounted overlay {}", mount_point.display())),
+            Err(e) => crate::logging::log(&format!("cleanup_stale: WARNING overlay umount {} failed: {e}", mount_point.display())),
+        }
 
-        Self::run_command_allow_failure("umount", &[&loop_mount.to_string_lossy()])?;
+        match Self::run_command_allow_failure("umount", &[&loop_mount.to_string_lossy()]) {
+            Ok(()) => crate::logging::log(&format!("cleanup_stale: unmounted loop mount {}", loop_mount.display())),
+            Err(e) => crate::logging::log(&format!("cleanup_stale: WARNING loop umount {} failed: {e}", loop_mount.display())),
+        }
 
         if loopback.exists() {
-            Self::run_command_allow_failure("losetup", &["-d", &Self::find_loop_device(loopback).unwrap_or_default()])?;
+            let dev = Self::find_loop_device(loopback).unwrap_or_default();
+            match Self::run_command_allow_failure("losetup", &["-d", &dev]) {
+                Ok(()) => crate::logging::log(&format!("cleanup_stale: detached loop device {dev}")),
+                Err(e) => crate::logging::log(&format!("cleanup_stale: WARNING losetup -d {dev} failed: {e}")),
+            }
         }
 
         Ok(())
@@ -187,18 +197,19 @@ impl CowWorkspace {
         fn check(dir: &Path) -> bool {
             let Ok(entries) = fs::read_dir(dir) else { return false };
             for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                let Ok(ft) = entry.file_type() else { continue };
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else { continue };
                 if name.starts_with('.') || name.ends_with(".wh") {
                     continue;
                 }
-                if path.is_dir() {
-                    if check(&path) {
+                if ft.is_dir() {
+                    if check(&entry.path()) {
                         return true;
                     }
                     continue;
                 }
-                if path.is_file() {
+                if ft.is_file() {
                     return true;
                 }
             }
@@ -335,6 +346,7 @@ fn sync_upper(upper_dir: &Path, repo_root: &Path, sessions_dir: &Path, app_name:
     }
 
     save_manifest(&manifest_path, &manifest_new)?;
+    crate::logging::log(&format!("workspace sync: added {count_add}, deleted {count_del}"));
     Ok((count_add, count_del))
 }
 
@@ -350,19 +362,23 @@ fn sync_upper_dir(
     }
 
     let mut has_opq = false;
+    let mut scanned: u64 = 0;
 
     for entry in fs::read_dir(current).map_err(|e| format!("failed to read {}: {e}", current.display()))? {
         let entry = entry.map_err(|e| format!("failed to read entry: {e}"))?;
         let path = entry.path();
-        let metadata = entry.metadata().map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+        let ft = entry.file_type().map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+
+        scanned += 1;
+        if scanned.is_multiple_of(500) {
+            crate::logging::log(&format!("workspace sync: scanned {scanned} entries in {}...", current.display()));
+        }
 
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
 
-        let file_type = metadata.file_type();
-
-        if file_type.is_char_device() {
+        if ft.is_char_device() {
             if name == ".wh..wh..opq" {
                 has_opq = true;
                 continue;
@@ -383,7 +399,7 @@ fn sync_upper_dir(
             continue;
         }
 
-        if file_type.is_symlink() {
+        if ft.is_symlink() {
             continue;
         }
 
@@ -391,12 +407,12 @@ fn sync_upper_dir(
         let rel_str = rel.to_string_lossy().to_string();
         let dest = repo_root.join(rel);
 
-        if metadata.is_dir() {
+        if ft.is_dir() {
             sync_upper_dir(base, &path, repo_root, count_add, count_del, _manifest_old, manifest_new)?;
             continue;
         }
 
-        if metadata.is_file() {
+        if ft.is_file() {
             let needs_copy = fs::read(&path).ok().and_then(|src| fs::read(&dest).ok().map(|dest_data| src != dest_data)).unwrap_or(true);
             if needs_copy {
                 if let Some(parent) = dest.parent() {
@@ -456,6 +472,7 @@ fn save_manifest(path: &Path, manifest: &BTreeSet<String>) -> Result<(), String>
 /// removes session state, and unmounts the overlay and loop device.
 impl Drop for CowWorkspace {
     fn drop(&mut self) {
+        crate::logging::log("workspace: dropping...");
         let sessions_dir = self.overlay_dir.join("sessions");
 
         for entry in fs::read_dir(&sessions_dir).into_iter().flatten() {
@@ -465,25 +482,30 @@ impl Drop for CowWorkspace {
                 let stem = path.file_stem().unwrap_or_default().to_string_lossy();
                 let synced_marker = sessions_dir.join(format!("{stem}.synced"));
                 if !synced_marker.exists() && self.has_unsynced_changes() {
-                    eprintln!("bunkerbox: syncing changes back to repo...");
+                    crate::logging::log("workspace: syncing changes back to repo...");
                     let upper_dir = self.loop_mount.join("upper");
                     let repo_root = self.overlay_dir.parent().expect("overlay_dir has no parent");
                     let _ = sync_upper(&upper_dir, repo_root, &sessions_dir, &stem);
-                    eprintln!("bunkerbox: sync complete.");
+                    crate::logging::log("workspace: sync complete.");
                 }
                 let _ = fs::remove_file(&path);
                 let _ = fs::remove_file(&synced_marker);
             }
         }
 
+        crate::logging::log("workspace: removing sessions dir...");
         let _ = fs::remove_dir_all(&sessions_dir);
 
+        crate::logging::log("workspace: unmounting overlay...");
         let _ = Self::run_command_allow_failure("umount", &[&self.mount_point.to_string_lossy()]);
+        crate::logging::log("workspace: unmounting loop mount...");
         let _ = Self::run_command_allow_failure("umount", &[&self.loop_mount.to_string_lossy()]);
         if let Some(dev) = Self::find_loop_device(&self.loopback) {
             if !dev.is_empty() {
+                crate::logging::log("workspace: detaching loop device...");
                 let _ = Self::run_command_allow_failure("losetup", &["-d", &dev]);
             }
         }
+        crate::logging::log("workspace: dropped");
     }
 }

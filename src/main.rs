@@ -1,5 +1,5 @@
 use bunkerbox::cfg::{ProjectConfig, WorkspaceMode};
-use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, overlay, tui, vscomm, workspace};
+use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, logging, overlay, tui, vscomm, workspace};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::os::unix::io::RawFd;
@@ -15,6 +15,10 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    let verbose = flag_present("verbose");
+    let log_file = option_from_args("log")?.map(|v| v.to_string_lossy().into_owned());
+    logging::configure(verbose, log_file);
+
     let workspace_override = workspace_mode_from_args()?;
 
     if cfg::RuntimeConfig::invoked_name()? != clidef::APPNAME {
@@ -142,6 +146,22 @@ fn option_from_args(name: &str) -> Result<Option<OsString>, String> {
     }
 
     Ok(None)
+}
+
+fn flag_present(name: &str) -> bool {
+    let long = format!("--{name}");
+    let prefix = format!("--{name}=");
+    for arg in std::env::args_os().skip(1) {
+        if arg == long.as_str() {
+            return true;
+        }
+        if let Some(s) = arg.to_str() {
+            if s.starts_with(&prefix) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<WorkspaceMode>, share_dir: &Path) -> Result<(), String> {

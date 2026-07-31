@@ -52,6 +52,9 @@ pub struct OverlayState {
     pub popup_title: Option<String>,
     pub pending: Vec<PendingAction>,
     pub has_error: bool,
+    pub hide_on_ascii: bool,
+    pub hide_on_content: Option<String>,
+    pub last_content_scan: Instant,
 }
 
 impl Default for OverlayState {
@@ -62,11 +65,28 @@ impl Default for OverlayState {
 
 impl OverlayState {
     pub fn new() -> Self {
-        Self { status_text: String::new(), popup: PopupWidget::new(), popup_title: None, pending: Vec::new(), has_error: false }
+        Self {
+            status_text: String::new(),
+            popup: PopupWidget::new(),
+            popup_title: None,
+            pending: Vec::new(),
+            has_error: false,
+            hide_on_ascii: false,
+            hide_on_content: None,
+            last_content_scan: Instant::now(),
+        }
     }
 }
 
 pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str, options: &str, value: &str) {
+    if widget == WIDGET_POPUP && command == CMD_HIDE && !value.is_empty() {
+        if value == "ASCII" {
+            state.hide_on_ascii = true;
+        } else {
+            state.hide_on_content = Some(value.to_string());
+        }
+    }
+
     let triggers = parse_triggers(options);
     if !triggers.is_empty() {
         state.pending.push(PendingAction {
@@ -378,6 +398,44 @@ fn hold_error_popup(overlay: &Arc<Mutex<OverlayState>>, term: &mut Terminal<Cros
     let _ = event::read();
 }
 
+fn screen_contains(screen: &vt100::Screen, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    let (rows, cols) = screen.size();
+    for row in 0..rows {
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let contents = cell.contents();
+                if contents.contains(pattern) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn screen_has_ascii_alphanumeric(screen: &vt100::Screen) -> bool {
+    let (rows, cols) = screen.size();
+    for row in 0..rows {
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                if cell.contents().chars().any(|c| c.is_ascii_alphanumeric()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Renders PTY output through ratatui until the child process exits.
 ///
 /// Forwards real keystrokes to the PTY master, parses terminal output through
@@ -518,6 +576,20 @@ where
                 for action in &mut state.pending {
                     if action.first_pty_at.is_none() && action.triggers.iter().any(|t| matches!(t, Trigger::OnPty | Trigger::DelayMsAfterPty(_))) {
                         action.first_pty_at = Some(now);
+                    }
+                }
+            }
+
+            if (now - state.last_content_scan).as_millis() >= 100 {
+                state.last_content_scan = now;
+                if state.hide_on_ascii && screen_has_ascii_alphanumeric(term.screen()) {
+                    state.popup.hide();
+                    state.hide_on_ascii = false;
+                }
+                if let Some(ref pat) = state.hide_on_content.clone() {
+                    if screen_contains(term.screen(), pat) {
+                        state.popup.hide();
+                        state.hide_on_content = None;
                     }
                 }
             }

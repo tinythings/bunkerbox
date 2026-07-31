@@ -19,23 +19,52 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
+    let mut find_pattern: Option<String> = None;
+    let mut find_ascii = false;
+    let mut timeout_secs: Option<u64> = None;
 
-    let widget = args.get(1).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [options] [value]".to_string())?;
-    let command = args.get(2).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [options] [value]".to_string())?;
-    let (options, value) = match args.len() {
-        n if n >= 5 => (args[3].as_str(), args[4].as_str()),
-        4 => {
-            if args[3].starts_with("SEC_") || args[3] == "ON_PTY" {
-                (args[3].as_str(), "")
-            } else {
-                ("", args[3].as_str())
-            }
+    let mut i = 1;
+    let mut positional = vec![args[0].clone()];
+    while i < args.len() {
+        if args[i] == "--help" {
+            print_help(&args);
+            std::process::exit(0);
+        } else if args[i] == "--on-find" && i + 1 < args.len() {
+            find_pattern = Some(args[i + 1].clone());
+            i += 2;
+        } else if let Some(p) = args[i].strip_prefix("--on-find=") {
+            find_pattern = Some(p.to_string());
+            i += 1;
+        } else if args[i] == "--on-find-ascii" {
+            find_ascii = true;
+            i += 1;
+        } else if args[i] == "--on-timeout" && i + 1 < args.len() {
+            timeout_secs = args[i + 1].parse::<u64>().ok();
+            i += 2;
+        } else if let Some(s) = args[i].strip_prefix("--on-timeout=") {
+            timeout_secs = s.parse::<u64>().ok();
+            i += 1;
+        } else {
+            positional.push(args[i].clone());
+            i += 1;
         }
-        _ => ("", ""),
+    }
+
+    let widget = positional.get(1).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [flags] [value]".to_string())?;
+    let command = positional.get(2).ok_or_else(|| "usage: bunkerbox-status <widget> <command> [flags] [value]".to_string())?;
+    let pos_value = positional.get(3).map(|s| s.as_str()).unwrap_or("");
+
+    let options = timeout_secs.map(|s| format!("SEC_{s}")).unwrap_or_default();
+    let value = if find_ascii {
+        "ASCII".to_string()
+    } else if let Some(p) = find_pattern {
+        p
+    } else {
+        pos_value.to_string()
     };
 
     if !widget.is_empty() && !command.is_empty() {
-        let payload = vscomm::encode_ui_payload(widget, command, options, value);
+        let payload = vscomm::encode_ui_payload(widget, command, &options, &value);
         let frame = Frame::new(FrameType::UiCommand, payload);
 
         let mut stream = vsock_connect(HOST_CID, STATUS_PORT).map_err(|e| format!("vsock connect: {e}"))?;
@@ -44,6 +73,21 @@ fn run() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn print_help(args: &[String]) {
+    let name = args.first().map(|s| s.as_str()).unwrap_or("bunkerbox-status");
+    eprintln!("Usage: {name} <widget> <command> [flags] [value]\n");
+    eprintln!("Send a UI command to the bunkerbox TUI over vsock.\n");
+    eprintln!("Flags:");
+    eprintln!("  --on-find=<str>       Hide popup when exact text appears on screen");
+    eprintln!("  --on-find-ascii       Hide popup when [a-zA-Z0-9] appears on screen");
+    eprintln!("  --on-timeout=<secs>   Hide popup after N seconds");
+    eprintln!("  --help                Show this message\n");
+    eprintln!("Examples:");
+    eprintln!("  {name} popup hide --on-find-ascii");
+    eprintln!("  {name} popup hide --on-find='$' --on-timeout=10");
+    eprintln!("  {name} status set \"Running: unit tests\"");
 }
 
 fn vsock_connect(cid: u32, port: u32) -> io::Result<VsockStream> {

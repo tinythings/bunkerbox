@@ -69,6 +69,8 @@ pub fn run(
     crate::logging::log("Starting containerd...");
 
     let setup_handle = std::thread::spawn(move || -> Result<(), String> {
+        let just_created = ensure_containerd_dropin()?;
+
         let active = Command::new("sudo")
             .args(["systemctl", "is-active", "containerd"])
             .stdout(Stdio::null())
@@ -78,6 +80,8 @@ pub fn run(
             .unwrap_or(false);
         if !active {
             run_command_quiet("sudo", &["systemctl", "start", "containerd"])?;
+        } else if just_created {
+            run_command_quiet("sudo", &["systemctl", "restart", "containerd"])?;
         }
 
         if needs_bridge {
@@ -360,7 +364,7 @@ fn write_resolv_conf() -> Result<PathBuf, String> {
 fn ensure_bridge_egress_firewall(config: &RuntimeConfig, resolv_conf: Option<&Path>) -> Result<(), String> {
     remove_bridge_egress_firewall()?;
     run_command("sudo", &["modprobe", "br_netfilter"])?;
-    run_command("sudo", &["sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1"])?;
+    run_command_quiet("sudo", &["sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1"])?;
     run_command_allow_failure("sudo", &["iptables", "-N", "BUNKERBOX-EGRESS"])?;
     run_command("sudo", &["iptables", "-F", "BUNKERBOX-EGRESS"])?;
     run_command("sudo", &["iptables", "-I", "FORWARD", "1", "-s", BRIDGE_SUBNET, "-j", "BUNKERBOX-EGRESS"])?;
@@ -634,6 +638,38 @@ fn run_command_quiet(program: &str, args: &[&str]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn ensure_containerd_dropin() -> Result<bool, String> {
+    let dir = "/etc/systemd/system/containerd.service.d";
+    let path = "/etc/systemd/system/containerd.service.d/bunkerbox.conf";
+    let content = "[Service]\nStandardError=journal\n";
+
+    if std::fs::read_to_string(path).map(|c| c == content).unwrap_or(false) {
+        return Ok(false);
+    }
+
+    run_command_quiet("sudo", &["mkdir", "-p", dir])?;
+
+    let mut child = Command::new("sudo")
+        .args(["tee", path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("sudo tee: {e}"))?;
+
+    use std::io::Write;
+    child.stdin.as_mut().unwrap().write_all(content.as_bytes()).map_err(|e| format!("write dropin: {e}"))?;
+    drop(child.stdin.take());
+
+    let status = child.wait().map_err(|e| format!("sudo tee: {e}"))?;
+    if !status.success() {
+        return Err("failed to write containerd drop-in".to_string());
+    }
+
+    run_command_quiet("sudo", &["systemctl", "daemon-reload"])?;
+    Ok(true)
 }
 
 /// Prompts the user with a yes/no question and returns `true` on 'y'/'Y'.

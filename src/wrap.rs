@@ -16,7 +16,7 @@ pub fn generate_init_script(commands: &[String]) -> String {
         let label = truncate_label(cmd, 60);
         script.push_str(&format!("bunkerbox-status status set \"Running: {label}\"\n"));
         if i == count.saturating_sub(1) {
-            script.push_str("bunkerbox-status popup hide \"SEC_2\"\n");
+            script.push_str("bunkerbox-status popup hide --on-find-ascii\n");
         }
         script.push_str(&format!("{cmd}\n"));
         script.push_str(&format!("bunkerbox-status status set \"Done: {label}\"\n\n"));

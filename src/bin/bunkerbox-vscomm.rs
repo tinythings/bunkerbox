@@ -83,7 +83,6 @@ fn install_symlinks() -> Result<(), String> {
 
     let vscomm_path = env::current_exe().map_err(|e| format!("failed to locate vscomm binary: {e}"))?;
 
-    let mut installed = 0;
     for entry in &entries {
         let cmd = extract_command_name(entry);
         if cmd.is_empty() {
@@ -97,11 +96,6 @@ fn install_symlinks() -> Result<(), String> {
             let _ = fs::remove_file(&target);
         }
         std::os::unix::fs::symlink(&vscomm_path, &target).map_err(|e| format!("symlink {cmd}: {e}"))?;
-        installed += 1;
-    }
-
-    if installed > 0 {
-        eprintln!("bunkerbox-vscomm: installed {installed} passthrough commands");
     }
 
     Ok(())

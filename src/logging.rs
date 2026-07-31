@@ -2,15 +2,23 @@ use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
-const LOG_PATH: &str = "/tmp/bunkerbox.log";
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+static LOG_FILE: Mutex<Option<String>> = Mutex::new(None);
 
 thread_local! {
     static STATUS_FD: RefCell<Option<RawFd>> = const { RefCell::new(None) };
 }
 
-pub fn log_path() -> &'static str {
-    LOG_PATH
+pub fn configure(verbose: bool, log_file: Option<String>) {
+    VERBOSE.store(verbose, Ordering::Relaxed);
+    *LOG_FILE.lock().unwrap() = log_file;
+}
+
+pub fn log_path() -> String {
+    LOG_FILE.lock().unwrap().clone().unwrap_or_else(|| "/tmp/bunkerbox.log".to_string())
 }
 
 pub fn set_status_fd(fd: RawFd) {
@@ -57,15 +65,21 @@ pub fn log(msg: &str) {
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     let line = format!("[{ts}] {msg}\n");
 
-    eprint!("[bb] {line}");
+    if VERBOSE.load(Ordering::Relaxed) {
+        eprint!("[bb] {line}");
+    }
 
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(LOG_PATH) {
-        let _ = f.write_all(line.as_bytes());
+    if let Some(ref path) = *LOG_FILE.lock().unwrap() {
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 
     STATUS_FD.with(|f| {
         if let Some(fd) = *f.borrow() {
-            let title = format!("Log: {LOG_PATH}");
+            let log_ref = LOG_FILE.lock().unwrap();
+            let title = if let Some(ref path) = *log_ref { format!("Log: {path}") } else { "Bunkerbox".to_string() };
+            drop(log_ref);
             let payload = crate::vscomm::encode_ui_payload("popup", "info", &title, msg);
             let mut buf = b"@".to_vec();
             buf.extend_from_slice(&payload);

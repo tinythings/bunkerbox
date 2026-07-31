@@ -194,6 +194,48 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
         let status_fd = child_fd;
         bunkerbox::logging::set_status_fd(status_fd);
         bunkerbox::logging::log("Starting...");
+
+        if !std::process::Command::new("sudo")
+            .arg("-n")
+            .arg("-v")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            let pass = bunkerbox::logging::prompt_password("Sudo password", "Enter your sudo password")?;
+
+            let mut child = std::process::Command::new("sudo")
+                .arg("-S")
+                .arg("-v")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| format!("failed to run sudo: {e}"))?;
+
+            use std::io::Write;
+            child.stdin.as_mut().unwrap().write_all(pass.as_bytes()).map_err(|e| format!("failed to write sudo password: {e}"))?;
+            drop(child.stdin.take());
+
+            let status = child.wait().map_err(|e| format!("sudo failed: {e}"))?;
+            if !status.success() {
+                return Err("sudo: authentication failed".to_string());
+            }
+        }
+
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(240));
+            let _ = std::process::Command::new("sudo")
+                .arg("-n")
+                .arg("-v")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+
         let ws = workspace::resolve(workspace_mode, quota, exclude.as_deref(), &name)?;
         let wp = ws.path().to_path_buf();
         {

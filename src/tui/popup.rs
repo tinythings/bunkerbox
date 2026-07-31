@@ -6,7 +6,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Gauge, Padding, Paragraph, Widget},
 };
-use ratatui_glamour::{color::blend_2d, widgets::{passwordinput, spinner}};
+use ratatui_glamour::{
+    color::blend_2d,
+    widgets::{passwordinput, spinner},
+};
 
 pub struct PassModel(passwordinput::Model);
 unsafe impl Send for PassModel {}
@@ -19,7 +22,7 @@ const SPINNER_FPS_MS: u64 = 83;
 pub enum PopupContent {
     Spinner { message: String, model: spinner::Model, last_tick: Instant },
     Progress { title: String, percent: f64, label: Option<String> },
-    Password { title: String, prompt: String, model: PassModel },
+    Password { title: String, prompt: String, model: Box<PassModel> },
     Info { title: Option<String>, message: String, fg: ratatui::style::Color },
 }
 
@@ -66,7 +69,7 @@ impl PopupWidget {
         let mut model = passwordinput::Model::new();
         model.set_prompt("");
         model.focus();
-        self.content = PopupContent::Password { title: title.into(), prompt: prompt.into(), model: PassModel(model) };
+        self.content = PopupContent::Password { title: title.into(), prompt: prompt.into(), model: Box::new(PassModel(model)) };
         self.visible = true;
     }
 
@@ -282,8 +285,7 @@ impl PopupWidget {
             .alignment(Alignment::Center)
             .render(Rect { x: px, y: prompt_area.y, width: pw, height: 1 }, buf);
 
-        Paragraph::new(model.0.view())
-            .render(input_area, buf);
+        Paragraph::new(model.0.view()).render(input_area, buf);
     }
 
     fn render_info(&self, inner: Rect, buf: &mut Buffer, message: &str, fg: ratatui::style::Color) {

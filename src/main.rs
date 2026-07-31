@@ -217,7 +217,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
         if !std::process::Command::new("sudo")
             .arg("-n")
-            .arg("-v")
+            .arg("true")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()

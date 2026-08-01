@@ -862,10 +862,7 @@ fn render_error_toast(area: Rect, buf: &mut Buffer, toast: Option<&ErrorToast>) 
         .style(Style::default().bg(palette::BG_1));
     let inner = block.inner(canvas);
     block.render(canvas, buf);
-    Paragraph::new(toast.message.as_str())
-        .style(Style::default().fg(palette::FG))
-        .wrap(Wrap { trim: true })
-        .render(inner, buf);
+    Paragraph::new(toast.message.as_str()).style(Style::default().fg(palette::FG)).wrap(Wrap { trim: true }).render(inner, buf);
 }
 
 #[cfg(test)]

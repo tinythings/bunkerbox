@@ -8,7 +8,7 @@ use std::mem;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use vscomm::{encode_ui_payload, validate_exec_request, ExecRequest, Frame, FrameType, TUI_STATUS_PORT, TOOLCHAIN_PORT, VSCOMM_BIN_DIR};
+use vscomm::{encode_ui_payload, validate_exec_request, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT, TUI_STATUS_PORT, VSCOMM_BIN_DIR};
 
 const HOST_CID: u32 = 2;
 

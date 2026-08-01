@@ -435,28 +435,14 @@ async fn status_listener(
 
         let overlay = overlay.clone();
         tokio::spawn(async move {
-            let mut header = [0u8; 6];
-            if stream.read_exact(&mut header).await.is_err() {
-                return;
-            }
-
-            let frame_type_raw = u16::from_le_bytes([header[0], header[1]]);
-            let payload_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
-
-            let Some(ft) = vscomm::FrameType::from_u16(frame_type_raw) else {
+            let Ok(frame) = vscomm::Frame::read_async(&mut stream).await else {
                 return;
             };
-
-            if !matches!(ft, vscomm::FrameType::UiCommand) {
+            if !matches!(frame.frame_type, vscomm::FrameType::UiCommand) {
                 return;
             }
 
-            let mut payload = vec![0u8; payload_len];
-            if payload_len > 0 && stream.read_exact(&mut payload).await.is_err() {
-                return;
-            }
-
-            if let Some((widget, cmd, opts, val)) = vscomm::decode_ui_payload(&payload) {
+            if let Some((widget, cmd, opts, val)) = vscomm::decode_ui_payload(&frame.payload) {
                 if widget == "error" && cmd == "show" {
                     let title = if opts.is_empty() { "Bunkerbox error" } else { opts };
                     logging::diagnostic(&format!("TUI error [{title}]: {val}"));

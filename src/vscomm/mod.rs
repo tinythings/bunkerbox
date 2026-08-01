@@ -7,12 +7,15 @@ use std::path::Path;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub mod buildsys;
 pub const TOOLCHAIN_PORT: u32 = 9999;
 // Keep UI traffic on a separate vsock endpoint from command execution.
 pub const TUI_STATUS_PORT: u32 = 10000;
 pub const VSCOMM_BIN_DIR: &str = "/usr/local/bunkerbox/bin";
+/// Maximum payload accepted in one vsock frame.
+pub const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 
 #[repr(u16)]
 #[derive(Clone, Copy)]
@@ -119,11 +122,7 @@ impl Frame {
         let mut header = [0u8; 6];
         reader.read_exact(&mut header)?;
 
-        let frame_type_raw = u16::from_le_bytes([header[0], header[1]]);
-        let frame_type = FrameType::from_u16(frame_type_raw)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unknown frame type: {frame_type_raw}")))?;
-
-        let payload_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+        let (frame_type, payload_len) = decode_header(&header)?;
 
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
@@ -133,13 +132,21 @@ impl Frame {
         Ok(Self { frame_type, payload })
     }
 
-    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        let frame_type_raw = self.frame_type as u16;
-        let payload_len = self.payload.len() as u32;
-
+    pub async fn read_async<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
         let mut header = [0u8; 6];
-        header[0..2].copy_from_slice(&frame_type_raw.to_le_bytes());
-        header[2..6].copy_from_slice(&payload_len.to_le_bytes());
+        reader.read_exact(&mut header).await?;
+
+        let (frame_type, payload_len) = decode_header(&header)?;
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            reader.read_exact(&mut payload).await?;
+        }
+
+        Ok(Self { frame_type, payload })
+    }
+
+    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let header = self.header()?;
         writer.write_all(&header)?;
 
         if !self.payload.is_empty() {
@@ -149,6 +156,46 @@ impl Frame {
         writer.flush()?;
         Ok(())
     }
+
+    pub async fn write_async<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
+        let header = self.header()?;
+        writer.write_all(&header).await?;
+
+        if !self.payload.is_empty() {
+            writer.write_all(&self.payload).await?;
+        }
+
+        writer.flush().await
+    }
+
+    fn header(&self) -> io::Result<[u8; 6]> {
+        validate_payload_size(self.payload.len())?;
+
+        let mut header = [0u8; 6];
+        header[0..2].copy_from_slice(&(self.frame_type as u16).to_le_bytes());
+        header[2..6].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        Ok(header)
+    }
+}
+
+fn decode_header(header: &[u8; 6]) -> io::Result<(FrameType, usize)> {
+    let frame_type_raw = u16::from_le_bytes([header[0], header[1]]);
+    let frame_type = FrameType::from_u16(frame_type_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unknown frame type: {frame_type_raw}")))?;
+    let payload_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+    validate_payload_size(payload_len)?;
+    Ok((frame_type, payload_len))
+}
+
+fn validate_payload_size(payload_len: usize) -> io::Result<()> {
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame payload too large: {payload_len} bytes (maximum {MAX_FRAME_PAYLOAD})"),
+        ));
+    }
+
+    Ok(())
 }
 
 impl ExecRequest {

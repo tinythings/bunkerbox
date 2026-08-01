@@ -446,23 +446,12 @@ fn is_allowed(passthrough: &[String], command: &str, args: &[String]) -> bool {
 }
 
 async fn read_exec_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<ExecRequest, String> {
-    let mut header = [0u8; 6];
-    reader.read_exact(&mut header).await.map_err(|e| format!("read header: {e}"))?;
-
-    let frame_type_raw = u16::from_le_bytes([header[0], header[1]]);
-    let ft = FrameType::from_u16(frame_type_raw).ok_or_else(|| format!("unknown frame type: {frame_type_raw}"))?;
-
-    if !matches!(ft, FrameType::ExecReq) {
-        return Err(format!("expected ExecReq, got {:?}", ft as u16));
+    let frame = Frame::read_async(reader).await.map_err(|e| format!("read frame: {e}"))?;
+    if !matches!(frame.frame_type, FrameType::ExecReq) {
+        return Err(format!("expected ExecReq, got {:?}", frame.frame_type as u16));
     }
 
-    let payload_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        reader.read_exact(&mut payload).await.map_err(|e| format!("read payload: {e}"))?;
-    }
-
-    ExecRequest::deserialize(&payload)
+    ExecRequest::deserialize(&frame.payload)
 }
 
 fn bwrap_status_pipe() -> Result<(File, File), String> {
@@ -546,20 +535,7 @@ async fn pump_to_channel<R: AsyncReadExt + Unpin>(mut reader: R, frame_type: Fra
 }
 
 async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, frame: &Frame) -> Result<(), String> {
-    let frame_type_raw = frame.frame_type as u16;
-    let payload_len = frame.payload.len() as u32;
-
-    let mut header = [0u8; 6];
-    header[0..2].copy_from_slice(&frame_type_raw.to_le_bytes());
-    header[2..6].copy_from_slice(&payload_len.to_le_bytes());
-
-    writer.write_all(&header).await.map_err(|e| format!("write header: {e}"))?;
-    if !frame.payload.is_empty() {
-        writer.write_all(&frame.payload).await.map_err(|e| format!("write payload: {e}"))?;
-    }
-    writer.flush().await.map_err(|e| format!("flush: {e}"))?;
-
-    Ok(())
+    frame.write_async(writer).await.map_err(|e| format!("write frame: {e}"))
 }
 
 fn find_netrelay_binary() -> Result<PathBuf, String> {

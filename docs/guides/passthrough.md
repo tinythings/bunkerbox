@@ -25,9 +25,8 @@ When the AI agent invokes one of those commands, the symlink points to
 `bunkerbox-vscomm`, which proxies the call through a virtio-vsock channel to a
 daemon running on the host. The daemon checks the whitelist one more time,
 spawns the real command inside the overlay workspace at `.bunkerbox/workspace/`,
-consumes stdout and stderr, and returns only the exit code. Command output is
-discarded unless `--log PATH` was requested, in which case it is written to the
-log file instead of the terminal.
+and streams the requested command's stdout, stderr, and exit code back. Daemon
+and sandbox-launcher diagnostics are kept separate from the command stream.
 
 ```
 ┌─ Bunkerbox VM ──────────────────────────────────────┐
@@ -49,20 +48,22 @@ log file instead of the terminal.
 │    ├─ whitelist check: "make *" ✓                  │
 │    ├─ cd .bunkerbox/workspace/                     │
 │    ├─ spawn make build                             │
-│    ├─ log or discard stdout / stderr               │
+│    ├─ stream stdout / stderr back                  │
 │    └─ send exit code                               │
 └────────────────────────────────────────────────────┘
 ```
 
-The host daemon runs inside the overlay workspace, so all output — compiled
-binaries, generated files, and test results — lands in the upper layer of the
-overlay and is auto-synced back to your real repo when the container exits.
-The command-vsock helper never writes returned command output or diagnostics to
-the Kata terminal. Use `--log PATH` when command output is needed for diagnosis.
+The AI agent sees the requested command's standard output and standard error as
+if it ran locally. The host daemon runs inside the overlay workspace, so all
+output — compiled binaries, generated files, and test results — lands in the
+upper layer of the overlay and is auto-synced back to your real repo when the
+container exits. Bunkerbox and sandbox-launcher diagnostics never enter the
+command stream; use `--log PATH` to retain those diagnostics.
 
 The command channel uses vsock port `9999`. TUI status and dialog commands use
 the separate `bunkerbox-status` client and vsock port `10000`; the
-`bunkerbox-vscomm` command client never opens the TUI channel.
+`bunkerbox-vscomm` command client remains silent when its own protocol fails
+and makes a best-effort error notification through port `10000`.
 
 ## Configuration
 

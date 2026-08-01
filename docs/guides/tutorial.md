@@ -250,7 +250,7 @@ workspace and re-creates it.
 │  ~/bunkerbox-tutorial/.bunkerbox/ ← overlay upper layer              │
 │  .bunkerbox/workspace/            ← where AI actually writes         │
 │                                                                      │
-│  Bunkerbox daemon listens on vsock port 9999.                        │
+│  Bunkerbox toolchain daemon listens on vsock port 9999.              │
 │  When AI calls `cargo build`:                                        │
 │    → checks whitelist ("cargo *" ✓)                                  │
 │    → runs `cargo build` inside .bunkerbox/workspace/                 │

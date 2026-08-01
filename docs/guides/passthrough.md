@@ -35,7 +35,7 @@ and streams stdout, stderr, and the exit code back.
 │    │       │                                       │
 │    │       └─ symlink → bunkerbox-vscomm           │
 │    │              │                                │
-│    │              │  vsock (port 9999)             │
+│    │              │  toolchain vsock (port 9999)   │
 │    │              ▼                                │
 │    │       "run make build in /workspace"          │
 └────┼───────────────────────────────────────────────┘
@@ -56,6 +56,10 @@ The AI agent sees standard output exactly as if `make` ran locally. The host
 daemon runs inside the overlay workspace, so all output — compiled binaries,
 generated files, test results — lands in the upper layer of the overlay and is
 auto-synced back to your real repo when the container exits.
+
+The command channel uses vsock port `9999`. TUI status and dialog commands use
+the separate `bunkerbox-status` client and vsock port `10000`; the
+`bunkerbox-vscomm` command client never opens the TUI channel.
 
 ## Configuration
 

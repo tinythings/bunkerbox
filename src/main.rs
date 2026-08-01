@@ -190,6 +190,8 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     let share_dir_owned = share_dir.to_path_buf();
     let daemon_holder = Rc::new(RefCell::new(None));
     let daemon_clone = daemon_holder.clone();
+    let status_holder = Rc::new(RefCell::new(None));
+    let status_clone = status_holder.clone();
 
     let mut sock_fds = [-1i32, -1];
     unsafe {
@@ -307,9 +309,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
             }
 
             let overlay = overlay_clone;
-            tokio::spawn(async move {
-                status_listener(overlay).await;
-            });
+            *status_clone.borrow_mut() = Some(start_status_listener(overlay)?);
 
             Ok(())
         },
@@ -324,6 +324,10 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
         tokio::runtime::Handle::current().block_on(d.shutdown());
     }
 
+    if let Some(listener) = status_holder.borrow_mut().take() {
+        tokio::runtime::Handle::current().block_on(listener.shutdown());
+    }
+
     tui_result?;
 
     if status != 0 {
@@ -333,25 +337,40 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     Ok(())
 }
 
-async fn status_listener(overlay: Arc<Mutex<tui::OverlayState>>) {
-    use std::time::Duration;
-    use tokio::io::AsyncReadExt;
-    use tokio_vsock::VsockListener;
+struct StatusListener {
+    join_handle: tokio::task::JoinHandle<()>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+}
 
-    let listener = loop {
-        match VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, vscomm::STATUS_PORT)) {
-            Ok(l) => break l,
-            Err(e) => {
-                eprintln!("bunkerbox: vsock status listener bind failed ({e}), retrying...");
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    };
+impl StatusListener {
+    async fn shutdown(self) {
+        let _ = self.shutdown.send(());
+        let _ = self.join_handle.await;
+    }
+}
+
+fn start_status_listener(overlay: Arc<Mutex<tui::OverlayState>>) -> Result<StatusListener, String> {
+    let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, vscomm::TUI_STATUS_PORT))
+        .map_err(|e| format!("failed to bind TUI status vsock port {}: {e}", vscomm::TUI_STATUS_PORT))?;
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let join_handle = tokio::spawn(async move {
+        status_listener(listener, overlay, shutdown_rx).await;
+    });
+    Ok(StatusListener { join_handle, shutdown })
+}
+
+async fn status_listener(
+    listener: tokio_vsock::VsockListener, overlay: Arc<Mutex<tui::OverlayState>>, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::AsyncReadExt;
 
     loop {
-        let (mut stream, _peer) = match listener.accept().await {
-            Ok(c) => c,
-            Err(_) => continue,
+        let (mut stream, _peer) = tokio::select! {
+            result = listener.accept() => match result {
+                Ok(c) => c,
+                Err(_) => continue,
+            },
+            _ = &mut shutdown_rx => break,
         };
 
         let overlay = overlay.clone();

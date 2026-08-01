@@ -4,8 +4,9 @@
 use std::io::{self, Read, Write};
 
 pub mod buildsys;
-pub const VSOCK_PORT: u32 = 9999;
-pub const STATUS_PORT: u32 = 9998;
+pub const TOOLCHAIN_PORT: u32 = 9999;
+// Keep UI traffic on a separate vsock endpoint from command execution.
+pub const TUI_STATUS_PORT: u32 = 10000;
 pub const VSCOMM_BIN_DIR: &str = "/usr/local/bunkerbox/bin";
 
 #[repr(u16)]
@@ -212,5 +213,16 @@ pub fn parse_triggers(options: &str) -> Vec<Trigger> {
         vec![Trigger::DelayMs(ms)]
     } else {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameType, TOOLCHAIN_PORT, TUI_STATUS_PORT};
+
+    #[test]
+    fn execution_and_tui_channels_are_distinct() {
+        assert_ne!(TOOLCHAIN_PORT, TUI_STATUS_PORT);
+        assert_ne!(FrameType::ExecReq as u16, FrameType::UiCommand as u16);
     }
 }

@@ -1,5 +1,5 @@
 use crate::cfg::{HomeMode, NetworkMode, RuntimeConfig};
-use crate::vscomm::VSOCK_PORT;
+use crate::vscomm::TOOLCHAIN_PORT;
 use crate::workspace::WorkspaceHandle;
 use aes_gcm::aead::consts::U12;
 use aes_gcm::aead::Aead;
@@ -190,7 +190,7 @@ pub fn run(
     };
 
     if vsock_enabled {
-        container_env.push(format!("BUNKERBOX_VSOCK_PORT={VSOCK_PORT}"));
+        container_env.push(format!("BUNKERBOX_TOOLCHAIN_PORT={TOOLCHAIN_PORT}"));
     }
 
     if let Some(ref cmds) = config.command {

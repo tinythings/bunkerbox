@@ -8,7 +8,7 @@ use std::mem;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use vscomm::{encode_ui_payload, ExecRequest, Frame, FrameType, STATUS_PORT, VSCOMM_BIN_DIR, VSOCK_PORT};
+use vscomm::{ExecRequest, Frame, FrameType, TOOLCHAIN_PORT, VSCOMM_BIN_DIR};
 
 const HOST_CID: u32 = 2;
 
@@ -34,17 +34,13 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "bunkerbox-vscomm must be invoked via symlink (not directly)".to_string())?
         .to_string();
 
-    let label = if args.len() > 1 { format!("{} {}", invoked_as, args[1..].join(" ")) } else { invoked_as.clone() };
-
-    send_status(&format!("Running: {label}"));
-
     let cwd = env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let env_vars: Vec<(String, String)> = env::vars().collect();
 
     let req = ExecRequest { cwd: cwd.to_string_lossy().to_string(), command: invoked_as, args: args[1..].to_vec(), env: env_vars };
 
     let frame = Frame::new(FrameType::ExecReq, req.serialize());
-    let mut stream = vsock_connect(HOST_CID, VSOCK_PORT).map_err(|e| format!("vsock connect: {e}"))?;
+    let mut stream = vsock_connect(HOST_CID, TOOLCHAIN_PORT).map_err(|e| format!("toolchain vsock connect: {e}"))?;
 
     frame.write(&mut stream).map_err(|e| format!("send request: {e}"))?;
     stream.flush().map_err(|e| format!("flush: {e}"))?;
@@ -62,7 +58,6 @@ fn run() -> Result<(), String> {
                 io::stderr().flush().map_err(|e| format!("flush stderr: {e}"))?;
             }
             FrameType::Exit => {
-                send_status(&format!("Done: {label}"));
                 if response.payload.len() >= 4 {
                     let code = i32::from_le_bytes([response.payload[0], response.payload[1], response.payload[2], response.payload[3]]);
                     std::process::exit(code);
@@ -176,20 +171,6 @@ fn command_exists_in_path_except(cmd: &str, except: &Path) -> bool {
         }
     }
     false
-}
-
-fn send_status(msg: &str) {
-    let result = (|| -> Result<(), String> {
-        let payload = encode_ui_payload("status", "set", "", msg);
-        let frame = Frame::new(FrameType::UiCommand, payload);
-        let mut stream = vsock_connect(HOST_CID, STATUS_PORT).map_err(|e| format!("status connect: {e}"))?;
-        frame.write(&mut stream).map_err(|e| format!("status write: {e}"))?;
-        stream.flush().map_err(|e| format!("status flush: {e}"))?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        eprintln!("bunkerbox-vscomm: status: {e}");
-    }
 }
 
 fn vsock_connect(cid: u32, port: u32) -> io::Result<VsockStream> {

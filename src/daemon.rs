@@ -1,7 +1,7 @@
 use crate::cfg::EnvMode;
 use crate::proxy::FilterProxy;
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
-use crate::vscomm::{ExecRequest, Frame, FrameType, VSOCK_PORT};
+use crate::vscomm::{ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -55,8 +55,11 @@ impl VsockDaemon {
 
         let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), env_mode, workspace, merged_profile, has_proxy });
 
+        let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, TOOLCHAIN_PORT))
+            .map_err(|e| format!("failed to bind toolchain vsock port {TOOLCHAIN_PORT}: {e}"))?;
+
         let join_handle = tokio::spawn(async move {
-            let result = daemon_loop(session, shutdown_rx).await;
+            let result = daemon_loop(session, listener, shutdown_rx).await;
             if let Err(err) = result {
                 eprintln!("bunkerbox: vsock daemon: {err}");
             }
@@ -74,19 +77,9 @@ impl VsockDaemon {
     }
 }
 
-async fn daemon_loop(session: Arc<VsockSession>, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
-    use tokio_vsock::VsockListener;
-
-    let listener = match VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, VSOCK_PORT)) {
-        Ok(l) => l,
-        Err(_e) => {
-            // TODO: route to log socket
-            // eprintln!("bunkerbox: vsock unavailable (passthrough disabled): {e}");
-            let _ = shutdown_rx.await;
-            return Ok(());
-        }
-    };
-
+async fn daemon_loop(
+    session: Arc<VsockSession>, listener: tokio_vsock::VsockListener, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), String> {
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -94,9 +87,8 @@ async fn daemon_loop(session: Arc<VsockSession>, mut shutdown_rx: tokio::sync::o
                     Ok((stream, _peer)) => {
                         let session = session.clone();
                         tokio::spawn(async move {
-                            if let Err(_err) = handle_connection(stream, &session).await {
-                                // TODO: route to log socket
-                                // eprintln!("bunkerbox: vsock session error: {err}");
+                            if let Err(err) = handle_connection(stream, &session).await {
+                                eprintln!("bunkerbox: toolchain vsock session failed: {err}");
                             }
                         });
                     }
@@ -126,6 +118,19 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
         return Ok(());
     }
 
+    let command = req.command.clone();
+    if let Err(err) = execute_request(&mut writer, session, &req).await {
+        eprintln!("bunkerbox: toolchain command '{command}' failed: {err}");
+        let msg = format!("bunkerbox-vscomm: {err}\n");
+        let _ = write_frame(&mut writer, &Frame::new(FrameType::Stderr, msg.into_bytes())).await;
+        let _ = write_frame(&mut writer, &Frame::new(FrameType::Exit, 1i32.to_le_bytes().to_vec())).await;
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &VsockSession, req: &ExecRequest) -> Result<(), String> {
     let sandbox_cwd = req.cwd.clone();
     let host_cwd = if req.cwd.starts_with("/workspace") {
         session.workspace.join(req.cwd.strip_prefix("/workspace").unwrap_or(&req.cwd).trim_start_matches('/'))
@@ -133,10 +138,11 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
         PathBuf::from(&req.cwd)
     };
 
-    let mut cmd = build_command(session, &req, &host_cwd, &sandbox_cwd)?;
+    let mut cmd = build_command(session, req, &host_cwd, &sandbox_cwd)?;
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", req.command))?;
 
@@ -153,12 +159,12 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
         tokio::select! {
             chunk = stdout_rx.recv() => {
                 if let Some(data) = chunk {
-                    write_frame(&mut writer, &Frame::new(FrameType::Stdout, data)).await?;
+                    write_frame(writer, &Frame::new(FrameType::Stdout, data)).await?;
                 }
             }
             chunk = stderr_rx.recv() => {
                 if let Some(data) = chunk {
-                    write_frame(&mut writer, &Frame::new(FrameType::Stderr, data)).await?;
+                    write_frame(writer, &Frame::new(FrameType::Stderr, data)).await?;
                 }
             }
         }
@@ -170,7 +176,7 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
 
     let status = child.wait().await.map_err(|e| format!("wait {}: {e}", req.command))?;
     let exit_code = status.code().unwrap_or(-1);
-    write_frame(&mut writer, &Frame::new(FrameType::Exit, exit_code.to_le_bytes().to_vec())).await?;
+    write_frame(writer, &Frame::new(FrameType::Exit, exit_code.to_le_bytes().to_vec())).await?;
 
     stdout_task.await.map_err(|e| format!("stdout task: {e}"))?;
     stderr_task.await.map_err(|e| format!("stderr task: {e}"))?;

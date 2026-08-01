@@ -32,7 +32,8 @@ impl VsockDaemon {
             None
         } else {
             let loaded: Vec<_> = profiles.iter().map(|p| resolve_profile(p, &share_dir)).collect::<Result<Vec<_>, _>>()?;
-            let merged = MergedProfile::from_profiles(&loaded)?;
+            let host_home = std::env::var_os("HOME").map(PathBuf::from);
+            let merged = MergedProfile::from_profiles(&loaded, host_home.as_deref())?;
 
             let check = std::process::Command::new("bwrap").arg("--version").output().map_err(|e| format!("bwrap not found: {e}"))?;
             if !check.status.success() {
@@ -217,17 +218,16 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
             cmd.arg("--ro-bind").arg(&resolved).arg(&dest);
         }
 
-        for dir in &merged.ro {
-            let p = Path::new(dir);
-            if p.exists() {
-                cmd.arg("--ro-bind").arg(dir).arg(dir);
+        cmd.arg("--tmpfs").arg("/home");
+        for path in &merged.paths {
+            if !path.source.exists() {
+                eprintln!("bunkerbox: warning: profile path '{}' not found, skipping", path.source.display());
+                continue;
             }
-        }
-
-        for dir in &merged.rw {
-            let p = Path::new(dir);
-            if p.exists() {
-                cmd.arg("--bind").arg(dir).arg(dir);
+            if path.writable {
+                cmd.arg("--bind").arg(&path.source).arg(&path.destination);
+            } else {
+                cmd.arg("--ro-bind").arg(&path.source).arg(&path.destination);
             }
         }
 
@@ -247,7 +247,6 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
         cmd.arg("--proc").arg("/proc");
         cmd.arg("--dev").arg("/dev");
         cmd.arg("--tmpfs").arg("/tmp");
-        cmd.arg("--tmpfs").arg("/home");
 
         if !sandbox_cwd.is_empty() && sandbox_cwd != "/" {
             cmd.arg("--dir").arg(sandbox_cwd);

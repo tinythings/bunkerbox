@@ -1,7 +1,12 @@
 // Dead-code warnings are expected here: vscomm is shared between
 // two binaries (bunkerbox and bunkerbox-vscomm) that use different items.
 #![allow(dead_code)]
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 pub mod buildsys;
 pub const TOOLCHAIN_PORT: u32 = 9999;
@@ -39,6 +44,65 @@ pub struct ExecRequest {
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+}
+
+pub fn validate_process_string(field: &str, value: &str) -> Result<(), String> {
+    if value.as_bytes().contains(&0) {
+        return Err(format!("{field} contains a NUL byte"));
+    }
+
+    Ok(())
+}
+
+pub fn validate_process_path(field: &str, value: &Path) -> Result<(), String> {
+    if os_str_contains_nul(value.as_os_str()) {
+        return Err(format!("{field} contains a NUL byte"));
+    }
+
+    Ok(())
+}
+
+pub fn validate_env_key(field: &str, key: &str) -> Result<(), String> {
+    validate_process_string(field, key)?;
+    if key.is_empty() {
+        return Err(format!("{field} is empty"));
+    }
+    if key.contains('=') {
+        return Err(format!("{field} contains '='"));
+    }
+
+    Ok(())
+}
+
+pub fn validate_exec_request(req: &ExecRequest) -> Result<(), String> {
+    validate_process_string("request cwd", &req.cwd)?;
+    if req.command.is_empty() {
+        return Err("request command is empty".to_string());
+    }
+    validate_process_string("request command", &req.command)?;
+
+    for (index, arg) in req.args.iter().enumerate() {
+        validate_process_string(&format!("request argument {index}"), arg)?;
+    }
+
+    for (index, (key, value)) in req.env.iter().enumerate() {
+        validate_env_key(&format!("request environment key {index}"), key)?;
+        validate_process_string(&format!("request environment value for '{key}'"), value)?;
+    }
+
+    Ok(())
+}
+
+fn os_str_contains_nul(value: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        value.as_bytes().contains(&0)
+    }
+
+    #[cfg(not(unix))]
+    {
+        value.to_string_lossy().contains('\0')
+    }
 }
 
 pub struct Frame {
@@ -218,11 +282,40 @@ pub fn parse_triggers(options: &str) -> Vec<Trigger> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameType, TOOLCHAIN_PORT, TUI_STATUS_PORT};
+    use super::{validate_exec_request, ExecRequest, FrameType, TOOLCHAIN_PORT, TUI_STATUS_PORT};
 
     #[test]
     fn execution_and_tui_channels_are_distinct() {
         assert_ne!(TOOLCHAIN_PORT, TUI_STATUS_PORT);
         assert_ne!(FrameType::ExecReq as u16, FrameType::UiCommand as u16);
+    }
+
+    #[test]
+    fn reject_nul_in_request_argument() {
+        let request = ExecRequest { cwd: "/workspace".into(), command: "cargo".into(), args: vec!["build\0".into()], env: Vec::new() };
+
+        let err = validate_exec_request(&request).unwrap_err();
+        assert_eq!(err, "request argument 0 contains a NUL byte");
+    }
+
+    #[test]
+    fn reject_invalid_request_environment_key() {
+        let request =
+            ExecRequest { cwd: "/workspace".into(), command: "cargo".into(), args: Vec::new(), env: vec![("BAD=KEY".into(), "value".into())] };
+
+        let err = validate_exec_request(&request).unwrap_err();
+        assert_eq!(err, "request environment key 0 contains '='");
+    }
+
+    #[test]
+    fn accept_valid_cargo_request() {
+        let request = ExecRequest {
+            cwd: "/workspace".into(),
+            command: "cargo".into(),
+            args: vec!["build".into(), "--target-dir".into(), "target/debug".into()],
+            env: vec![("CARGO_TERM_COLOR".into(), "always".into())],
+        };
+
+        assert!(validate_exec_request(&request).is_ok());
     }
 }

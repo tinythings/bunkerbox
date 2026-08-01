@@ -441,16 +441,11 @@ fn screen_has_ascii_alphanumeric(screen: &vt100::Screen) -> bool {
 /// [`vt100::Parser`], and draws each frame with full 24-bit color plus a
 /// floating status overlay in the top-right corner.
 ///
-/// `status_fd` is polled continuously for newline-delimited messages. The
-/// first message is forwarded to `on_setup` (workspace path); subsequent
-/// messages update `overlay.status_text`.
+/// `status_fd` is polled continuously for newline-delimited UI messages.
 ///
 /// `overlay` is shared with the VSOCK status listener so VM-originated
 /// UI commands can update popups, progress bars, and status text.
-pub fn event_loop<F>(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, on_setup: F, overlay: Arc<Mutex<OverlayState>>) -> Result<(), String>
-where
-    F: FnOnce(Vec<u8>) -> Result<(), String>,
-{
+pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, overlay: Arc<Mutex<OverlayState>>) -> Result<(), String> {
     let stdin_fd = io::stdin().as_raw_fd();
 
     let mut stdout = io::stdout();
@@ -468,7 +463,6 @@ where
     let mut last_rows = rows;
     let mut last_cols = cols;
 
-    let mut on_setup = Some(on_setup);
     let mut status_buf = Vec::new();
 
     unsafe {
@@ -552,9 +546,7 @@ where
             while let Some(pos) = status_buf.iter().position(|&b| b == b'\n') {
                 let line = String::from_utf8_lossy(&status_buf[..pos]).into_owned();
                 status_buf.drain(..=pos);
-                if let Some(cb) = on_setup.take() {
-                    cb(line.into_bytes())?;
-                } else if let Some(cmd) = line.strip_prefix('@') {
+                if let Some(cmd) = line.strip_prefix('@') {
                     if let Some((widget, cmd, opts, val)) = vscomm::decode_ui_payload(cmd.as_bytes()) {
                         let mut state = overlay.lock().unwrap();
                         dispatch_ui_command(&mut state, widget, cmd, opts, val);

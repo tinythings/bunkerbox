@@ -8,7 +8,7 @@ use std::mem;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use vscomm::{ExecRequest, Frame, FrameType, TOOLCHAIN_PORT, VSCOMM_BIN_DIR};
+use vscomm::{validate_exec_request, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT, VSCOMM_BIN_DIR};
 
 const HOST_CID: u32 = 2;
 
@@ -38,6 +38,7 @@ fn run() -> Result<(), String> {
     let env_vars: Vec<(String, String)> = env::vars().collect();
 
     let req = ExecRequest { cwd: cwd.to_string_lossy().to_string(), command: invoked_as, args: args[1..].to_vec(), env: env_vars };
+    validate_exec_request(&req)?;
 
     let frame = Frame::new(FrameType::ExecReq, req.serialize());
     let mut stream = vsock_connect(HOST_CID, TOOLCHAIN_PORT).map_err(|e| format!("toolchain vsock connect: {e}"))?;

@@ -1,7 +1,7 @@
 use crate::cfg::EnvMode;
 use crate::proxy::FilterProxy;
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
-use crate::vscomm::{ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
+use crate::vscomm::{validate_exec_request, validate_process_path, validate_process_string, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ impl VsockDaemon {
             None
         } else {
             let loaded: Vec<_> = profiles.iter().map(|p| resolve_profile(p, &share_dir)).collect::<Result<Vec<_>, _>>()?;
-            let merged = MergedProfile::from_profiles(&loaded);
+            let merged = MergedProfile::from_profiles(&loaded)?;
 
             let check = std::process::Command::new("bwrap").arg("--version").output().map_err(|e| format!("bwrap not found: {e}"))?;
             if !check.status.success() {
@@ -111,6 +111,13 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
 
     let req = read_exec_request(&mut reader).await?;
 
+    if let Err(err) = validate_exec_request(&req) {
+        let msg = format!("bunkerbox-vscomm: invalid request: {err}\n");
+        write_frame(&mut writer, &Frame::new(FrameType::Stderr, msg.into_bytes())).await?;
+        write_frame(&mut writer, &Frame::new(FrameType::Exit, 1i32.to_le_bytes().to_vec())).await?;
+        return Ok(());
+    }
+
     if !is_allowed(&session.passthrough, &req.command, &req.args) {
         let msg = format!("bunkerbox-vscomm: command '{}' not whitelisted\n", req.command);
         write_frame(&mut writer, &Frame::new(FrameType::Stderr, msg.into_bytes())).await?;
@@ -131,6 +138,7 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
 }
 
 async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &VsockSession, req: &ExecRequest) -> Result<(), String> {
+    validate_exec_request(req)?;
     let sandbox_cwd = req.cwd.clone();
     let host_cwd = if req.cwd.starts_with("/workspace") {
         session.workspace.join(req.cwd.strip_prefix("/workspace").unwrap_or(&req.cwd).trim_start_matches('/'))
@@ -144,7 +152,8 @@ async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &Vso
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", req.command))?;
+    let launcher = if session.merged_profile.is_some() { "bwrap" } else { &req.command };
+    let mut child = cmd.spawn().map_err(|e| format!("spawn {launcher} for command '{}': {e}", req.command))?;
 
     let child_stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
     let child_stderr = child.stderr.take().ok_or_else(|| "no stderr".to_string())?;
@@ -185,6 +194,11 @@ async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &Vso
 }
 
 fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, sandbox_cwd: &str) -> Result<Command, String> {
+    validate_exec_request(req)?;
+    validate_process_path("workspace path", &session.workspace)?;
+    validate_process_path("host working directory", host_cwd)?;
+    validate_process_string("sandbox working directory", sandbox_cwd)?;
+
     if let Some(ref merged) = session.merged_profile {
         let mut cmd = Command::new("bwrap");
 

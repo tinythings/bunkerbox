@@ -1,11 +1,15 @@
 use bunkerbox::cfg::{ProjectConfig, WorkspaceMode};
 use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, logging, overlay, tui, vscomm, workspace};
-use std::cell::RefCell;
 use std::ffi::OsString;
-use std::os::unix::io::RawFd;
+use std::fs::File;
+use std::io;
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+const WORKSPACE_HANDOFF_MAGIC: &[u8; 4] = b"WS01";
+const MAX_WORKSPACE_HANDOFF_BYTES: usize = 64 * 1024;
 
 fn main() {
     if let Err(err) = run() {
@@ -188,16 +192,19 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     let env_mode = env.project.env;
     let profiles = env.profiles.clone();
     let share_dir_owned = share_dir.to_path_buf();
-    let daemon_holder = Rc::new(RefCell::new(None));
-    let daemon_clone = daemon_holder.clone();
-    let status_holder = Rc::new(RefCell::new(None));
-    let status_clone = status_holder.clone();
+    let daemon_holder: Arc<Mutex<Option<daemon::VsockDaemon>>> = Arc::new(Mutex::new(None));
 
     let mut sock_fds = [-1i32, -1];
-    unsafe {
-        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr());
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr()) } != 0 {
+        return Err(format!("status socketpair: {}", std::io::Error::last_os_error()));
     }
     let (parent_fd, child_fd) = (sock_fds[0], sock_fds[1]);
+
+    let mut setup_fds = [-1i32, -1];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, setup_fds.as_mut_ptr()) } != 0 {
+        return Err(format!("workspace setup socketpair: {}", std::io::Error::last_os_error()));
+    }
+    let (setup_parent_fd, setup_child_fd) = (setup_fds[0], setup_fds[1]);
 
     let (cols, rows) = crossterm::terminal::size().map_err(|e| format!("terminal size: {e}"))?;
 
@@ -212,6 +219,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
     if pid == 0 {
         unsafe { libc::close(parent_fd) };
+        unsafe { libc::close(setup_parent_fd) };
 
         let status_fd = child_fd;
         bunkerbox::logging::set_status_fd(status_fd);
@@ -259,14 +267,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
         });
 
         let ws = workspace::resolve(workspace_mode, quota, exclude.as_deref(), &name)?;
-        let wp = ws.path().to_path_buf();
-        {
-            let mut msg = wp.to_string_lossy().into_owned().into_bytes();
-            msg.push(b'\n');
-            unsafe {
-                libc::write(status_fd, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
-        }
+        write_workspace_handoff(setup_child_fd, ws.path())?;
 
         let vsock_enabled = !passthrough.is_empty();
         let code = match kata::run(&config, ws, &container_name, share_dir, &name, vsock_enabled, status_fd) {
@@ -293,48 +294,107 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     }
 
     unsafe { libc::close(child_fd) };
+    unsafe { libc::close(setup_child_fd) };
 
     let overlay: Arc<Mutex<tui::OverlayState>> = Arc::new(Mutex::new(tui::OverlayState::new()));
-    let overlay_clone = overlay.clone();
+    let status_listener = start_status_listener(overlay.clone())?;
 
-    let tui_result = tui::event_loop(
-        master,
-        rows,
-        cols,
-        parent_fd,
-        move |path_bytes: Vec<u8>| {
-            let wp = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
-            if !passthrough.is_empty() {
-                *daemon_clone.borrow_mut() = Some(daemon::VsockDaemon::start(passthrough, env_mode, wp, profiles, share_dir_owned, merged_allow)?);
-            }
+    let setup_handle = tokio::runtime::Handle::current().clone();
+    let daemon_slot = daemon_holder.clone();
+    let setup_thread = std::thread::spawn(move || -> Result<(), String> {
+        let workspace = read_workspace_handoff(setup_parent_fd)?;
+        if passthrough.is_empty() {
+            return Ok(());
+        }
 
-            let overlay = overlay_clone;
-            *status_clone.borrow_mut() = Some(start_status_listener(overlay)?);
+        let _guard = setup_handle.enter();
+        let daemon = daemon::VsockDaemon::start(passthrough, env_mode, workspace, profiles, share_dir_owned, merged_allow)?;
+        *daemon_slot.lock().map_err(|_| "daemon state lock poisoned".to_string())? = Some(daemon);
+        Ok(())
+    });
 
-            Ok(())
-        },
-        overlay,
-    );
+    let tui_result = tui::event_loop(master, rows, cols, parent_fd, overlay);
 
     let mut status: i32 = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
     unsafe { libc::close(master) };
 
-    if let Some(d) = daemon_holder.borrow_mut().take() {
+    let setup_result = match setup_thread.join() {
+        Ok(result) => result,
+        Err(_) => Err("workspace setup thread panicked".to_string()),
+    };
+
+    if let Some(d) = daemon_holder.lock().map_err(|_| "daemon state lock poisoned".to_string())?.take() {
         tokio::runtime::Handle::current().block_on(d.shutdown());
     }
 
-    if let Some(listener) = status_holder.borrow_mut().take() {
-        tokio::runtime::Handle::current().block_on(listener.shutdown());
-    }
+    tokio::runtime::Handle::current().block_on(status_listener.shutdown());
 
     tui_result?;
+    setup_result?;
 
     if status != 0 {
         return Err(format!("child exited with status {status}"));
     }
 
     Ok(())
+}
+
+fn write_workspace_handoff(fd: RawFd, path: &Path) -> Result<(), String> {
+    let bytes = path.as_os_str().as_bytes();
+    let frame = encode_workspace_handoff(bytes)?;
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    io::Write::write_all(&mut file, &frame).map_err(|err| format!("write workspace handoff: {err}"))
+}
+
+fn read_workspace_handoff(fd: RawFd) -> Result<PathBuf, String> {
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let mut header = [0u8; 8];
+    io::Read::read_exact(&mut file, &mut header).map_err(|err| format!("read workspace handoff header: {err}"))?;
+
+    let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    if payload_len > MAX_WORKSPACE_HANDOFF_BYTES {
+        return Err(format!("workspace handoff is too large: {payload_len} bytes"));
+    }
+
+    let mut payload = vec![0u8; payload_len];
+    io::Read::read_exact(&mut file, &mut payload).map_err(|err| format!("read workspace handoff: {err}"))?;
+
+    let mut frame = header.to_vec();
+    frame.extend_from_slice(&payload);
+    decode_workspace_handoff(&frame)
+}
+
+fn encode_workspace_handoff(path: &[u8]) -> Result<Vec<u8>, String> {
+    if path.len() > MAX_WORKSPACE_HANDOFF_BYTES {
+        return Err(format!("workspace handoff is too large: {} bytes", path.len()));
+    }
+
+    let length = u32::try_from(path.len()).map_err(|_| "workspace handoff length overflow".to_string())?;
+    let mut frame = Vec::with_capacity(8 + path.len());
+    frame.extend_from_slice(WORKSPACE_HANDOFF_MAGIC);
+    frame.extend_from_slice(&length.to_le_bytes());
+    frame.extend_from_slice(path);
+    Ok(frame)
+}
+
+fn decode_workspace_handoff(frame: &[u8]) -> Result<PathBuf, String> {
+    if frame.len() < 8 {
+        return Err("workspace handoff is truncated".to_string());
+    }
+    if &frame[..4] != WORKSPACE_HANDOFF_MAGIC {
+        return Err("workspace handoff has an invalid type".to_string());
+    }
+
+    let payload_len = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
+    if payload_len > MAX_WORKSPACE_HANDOFF_BYTES {
+        return Err(format!("workspace handoff is too large: {payload_len} bytes"));
+    }
+    if frame.len() != 8 + payload_len {
+        return Err("workspace handoff length does not match payload".to_string());
+    }
+
+    Ok(PathBuf::from(OsString::from_vec(frame[8..].to_vec())))
 }
 
 struct StatusListener {
@@ -418,4 +478,32 @@ fn list_sequences() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_workspace_handoff, encode_workspace_handoff};
+    use std::path::Path;
+
+    #[test]
+    fn workspace_handoff_round_trips_a_path() {
+        let frame = encode_workspace_handoff(b"/workspace/project").unwrap();
+        let path = decode_workspace_handoff(&frame).unwrap();
+
+        assert_eq!(path, Path::new("/workspace/project"));
+    }
+
+    #[test]
+    fn ui_message_is_not_a_workspace_handoff() {
+        let ui_message = b"@popup\0info\0Bunkerbox\0Starting...\0\n";
+
+        assert!(decode_workspace_handoff(ui_message).is_err());
+    }
+
+    #[test]
+    fn workspace_handoff_rejects_truncated_payload() {
+        let frame = encode_workspace_handoff(b"/workspace/project").unwrap();
+
+        assert!(decode_workspace_handoff(&frame[..frame.len() - 1]).is_err());
+    }
 }

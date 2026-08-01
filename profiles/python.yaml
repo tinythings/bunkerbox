@@ -6,22 +6,20 @@ bin:
   pip3: /usr/bin/pip3
   pip: /usr/bin/pip3
 
-ro:
-  - /lib
-  - /lib64
-  - /usr/lib
-  - /usr/lib64
-  - /etc/ssl
-  - /etc/localtime
-  - /usr/share/zoneinfo
-  - /usr/lib/locale
-  - /usr/share/python3
-
-rw:
-  - "${HOME}/.cache/pip"
+paths:
+  - src: /lib
+  - src: /lib64
+  - src: /usr/lib
+  - src: /usr/lib64
+  - src: /etc/ssl
+  - src: /etc/localtime
+  - src: /usr/share/zoneinfo
+  - src: /usr/lib/locale
+  - src: /usr/share/python3
+  - src: .cache/pip
 
 env:
-  PIP_CACHE_DIR: "${HOME}/.cache/pip"
+  PIP_CACHE_DIR: /home/.cache/pip
   TERM: "${TERM}"
 
 network: none

@@ -11,17 +11,15 @@ bin:
   as: /usr/bin/as
   strip: /usr/bin/strip
 
-ro:
-  - /lib
-  - /lib64
-  - /usr/lib
-  - /usr/lib64
-  - /etc/ssl
-  - /etc/localtime
-  - /usr/share/zoneinfo
-  - /usr/lib/locale
-
-rw: []
+paths:
+  - src: /lib
+  - src: /lib64
+  - src: /usr/lib
+  - src: /usr/lib64
+  - src: /etc/ssl
+  - src: /etc/localtime
+  - src: /usr/share/zoneinfo
+  - src: /usr/lib/locale
 
 env:
   TERM: "${TERM}"

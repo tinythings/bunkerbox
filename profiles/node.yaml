@@ -5,22 +5,20 @@ bin:
   npm: /usr/bin/npm
   npx: /usr/bin/npx
 
-ro:
-  - /lib
-  - /lib64
-  - /usr/lib
-  - /usr/lib64
-  - /etc/ssl
-  - /etc/localtime
-  - /usr/share/zoneinfo
-  - /usr/lib/locale
-
-rw:
-  - "${HOME}/.npm"
-  - "${HOME}/.node-gyp"
+paths:
+  - src: /lib
+  - src: /lib64
+  - src: /usr/lib
+  - src: /usr/lib64
+  - src: /etc/ssl
+  - src: /etc/localtime
+  - src: /usr/share/zoneinfo
+  - src: /usr/lib/locale
+  - src: .npm
+  - src: .node-gyp
 
 env:
-  npm_config_cache: "${HOME}/.npm"
+  npm_config_cache: /home/.npm
   TERM: "${TERM}"
 
 network: none

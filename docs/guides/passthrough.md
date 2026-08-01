@@ -25,7 +25,9 @@ When the AI agent invokes one of those commands, the symlink points to
 `bunkerbox-vscomm`, which proxies the call through a virtio-vsock channel to a
 daemon running on the host. The daemon checks the whitelist one more time,
 spawns the real command inside the overlay workspace at `.bunkerbox/workspace/`,
-and streams stdout, stderr, and the exit code back.
+consumes stdout and stderr, and returns only the exit code. Command output is
+discarded unless `--log PATH` was requested, in which case it is written to the
+log file instead of the terminal.
 
 ```
 ┌─ Bunkerbox VM ──────────────────────────────────────┐
@@ -47,15 +49,16 @@ and streams stdout, stderr, and the exit code back.
 │    ├─ whitelist check: "make *" ✓                  │
 │    ├─ cd .bunkerbox/workspace/                     │
 │    ├─ spawn make build                             │
-│    ├─ stream stdout / stderr back                  │
+│    ├─ log or discard stdout / stderr               │
 │    └─ send exit code                               │
 └────────────────────────────────────────────────────┘
 ```
 
-The AI agent sees standard output exactly as if `make` ran locally. The host
-daemon runs inside the overlay workspace, so all output — compiled binaries,
-generated files, test results — lands in the upper layer of the overlay and is
-auto-synced back to your real repo when the container exits.
+The host daemon runs inside the overlay workspace, so all output — compiled
+binaries, generated files, and test results — lands in the upper layer of the
+overlay and is auto-synced back to your real repo when the container exits.
+The command-vsock helper never writes returned command output or diagnostics to
+the Kata terminal. Use `--log PATH` when command output is needed for diagnosis.
 
 The command channel uses vsock port `9999`. TUI status and dialog commands use
 the separate `bunkerbox-status` client and vsock port `10000`; the

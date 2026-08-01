@@ -457,6 +457,10 @@ async fn status_listener(
             }
 
             if let Some((widget, cmd, opts, val)) = vscomm::decode_ui_payload(&payload) {
+                if widget == "error" && cmd == "show" {
+                    let title = if opts.is_empty() { "Bunkerbox error" } else { opts };
+                    logging::diagnostic(&format!("TUI error [{title}]: {val}"));
+                }
                 tui::dispatch_ui_command(&mut overlay.lock().unwrap(), widget, cmd, opts, val);
             }
         });

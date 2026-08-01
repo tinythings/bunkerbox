@@ -13,9 +13,7 @@ use vscomm::{validate_exec_request, ExecRequest, Frame, FrameType, TOOLCHAIN_POR
 const HOST_CID: u32 = 2;
 
 fn main() {
-    let result = run();
-    if let Err(err) = result {
-        eprintln!("bunkerbox-vscomm: {err}");
+    if run().is_err() {
         std::process::exit(1);
     }
 }
@@ -49,24 +47,24 @@ fn run() -> Result<(), String> {
     loop {
         let response = Frame::read(&mut stream).map_err(|e| format!("read response: {e}"))?;
 
-        match response.frame_type {
-            FrameType::Stdout => {
-                io::stdout().write_all(&response.payload).map_err(|e| format!("stdout: {e}"))?;
-                io::stdout().flush().map_err(|e| format!("flush stdout: {e}"))?;
-            }
-            FrameType::Stderr => {
-                io::stderr().write_all(&response.payload).map_err(|e| format!("stderr: {e}"))?;
-                io::stderr().flush().map_err(|e| format!("flush stderr: {e}"))?;
-            }
-            FrameType::Exit => {
-                if response.payload.len() >= 4 {
-                    let code = i32::from_le_bytes([response.payload[0], response.payload[1], response.payload[2], response.payload[3]]);
-                    std::process::exit(code);
-                }
-                return Ok(());
-            }
-            _ => return Err(format!("unexpected frame type from host: {:?}", response.frame_type as u16)),
+        if let Some(code) = handle_response(response)? {
+            std::process::exit(code);
         }
+    }
+}
+
+fn handle_response(response: Frame) -> Result<Option<i32>, String> {
+    match response.frame_type {
+        FrameType::Stdout | FrameType::Stderr => Ok(None),
+        FrameType::Exit => {
+            if response.payload.len() >= 4 {
+                let code = i32::from_le_bytes([response.payload[0], response.payload[1], response.payload[2], response.payload[3]]);
+                Ok(Some(code))
+            } else {
+                Ok(Some(0))
+            }
+        }
+        _ => Err(format!("unexpected frame type from host: {:?}", response.frame_type as u16)),
     }
 }
 
@@ -229,3 +227,7 @@ impl Drop for VsockStream {
         unsafe { libc::close(self.fd) };
     }
 }
+
+#[cfg(test)]
+#[path = "../bunkerbox-vscomm_ut.rs"]
+mod vscomm_tests;

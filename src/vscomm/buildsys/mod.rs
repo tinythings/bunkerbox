@@ -52,5 +52,5 @@ mod npm;
 mod python;
 
 #[cfg(test)]
-#[path = "ut.rs"]
+#[path = "mod_ut.rs"]
 mod buildsys_tests;

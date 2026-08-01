@@ -198,5 +198,5 @@ fn get_builtin_profile(name: &str) -> Result<&str, String> {
 }
 
 #[cfg(test)]
-#[path = "ut.rs"]
+#[path = "mod_ut.rs"]
 mod sandbox_tests;

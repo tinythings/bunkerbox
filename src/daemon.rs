@@ -1,4 +1,5 @@
 use crate::cfg::EnvMode;
+use crate::logging;
 use crate::proxy::FilterProxy;
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
 use crate::vscomm::{validate_exec_request, validate_process_path, validate_process_string, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
@@ -62,7 +63,7 @@ impl VsockDaemon {
         let join_handle = tokio::spawn(async move {
             let result = daemon_loop(session, listener, shutdown_rx).await;
             if let Err(err) = result {
-                eprintln!("bunkerbox: vsock daemon: {err}");
+                logging::diagnostic(&format!("bunkerbox: vsock daemon: {err}"));
             }
         });
 
@@ -89,12 +90,12 @@ async fn daemon_loop(
                         let session = session.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_connection(stream, &session).await {
-                                eprintln!("bunkerbox: toolchain vsock session failed: {err}");
+                                logging::diagnostic(&format!("bunkerbox: toolchain vsock session failed: {err}"));
                             }
                         });
                     }
                     Err(e) => {
-                        eprintln!("bunkerbox: vsock accept error: {e}");
+                        logging::diagnostic(&format!("bunkerbox: vsock accept error: {e}"));
                     }
                 }
             }
@@ -128,7 +129,7 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
 
     let command = req.command.clone();
     if let Err(err) = execute_request(&mut writer, session, &req).await {
-        eprintln!("bunkerbox: toolchain command '{command}' failed: {err}");
+        logging::diagnostic(&format!("bunkerbox: toolchain command '{command}' failed: {err}"));
         let msg = format!("bunkerbox-vscomm: {err}\n");
         let _ = write_frame(&mut writer, &Frame::new(FrameType::Stderr, msg.into_bytes())).await;
         let _ = write_frame(&mut writer, &Frame::new(FrameType::Exit, 1i32.to_le_bytes().to_vec())).await;
@@ -159,30 +160,8 @@ async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &Vso
     let child_stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
     let child_stderr = child.stderr.take().ok_or_else(|| "no stderr".to_string())?;
 
-    let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-    let stdout_task = tokio::spawn(async move { pump_to_channel(child_stdout, stdout_tx).await });
-    let stderr_task = tokio::spawn(async move { pump_to_channel(child_stderr, stderr_tx).await });
-
-    loop {
-        tokio::select! {
-            chunk = stdout_rx.recv() => {
-                if let Some(data) = chunk {
-                    write_frame(writer, &Frame::new(FrameType::Stdout, data)).await?;
-                }
-            }
-            chunk = stderr_rx.recv() => {
-                if let Some(data) = chunk {
-                    write_frame(writer, &Frame::new(FrameType::Stderr, data)).await?;
-                }
-            }
-        }
-
-        if stdout_rx.is_closed() && stderr_rx.is_closed() {
-            break;
-        }
-    }
+    let stdout_task = tokio::spawn(async move { pump_to_log(child_stdout, "stdout").await });
+    let stderr_task = tokio::spawn(async move { pump_to_log(child_stderr, "stderr").await });
 
     let status = child.wait().await.map_err(|e| format!("wait {}: {e}", req.command))?;
     let exit_code = status.code().unwrap_or(-1);
@@ -211,7 +190,7 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
             } else if let Some(found) = find_in_path(name) {
                 found
             } else {
-                eprintln!("bunkerbox: warning: binary '{name}' not found, skipping");
+                logging::diagnostic(&format!("bunkerbox: warning: binary '{name}' not found, skipping"));
                 continue;
             };
             let dest = PathBuf::from("/usr/bin").join(name);
@@ -221,7 +200,7 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
         cmd.arg("--tmpfs").arg("/home");
         for path in &merged.paths {
             if !path.source.exists() {
-                eprintln!("bunkerbox: warning: profile path '{}' not found, skipping", path.source.display());
+                logging::diagnostic(&format!("bunkerbox: warning: profile path '{}' not found, skipping", path.source.display()));
                 continue;
             }
             if path.writable {
@@ -379,15 +358,13 @@ async fn read_exec_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Ex
     ExecRequest::deserialize(&payload)
 }
 
-async fn pump_to_channel<R: AsyncReadExt + Unpin>(mut reader: R, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+async fn pump_to_log<R: AsyncReadExt + Unpin>(mut reader: R, stream: &'static str) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                if tx.send(buf[..n].to_vec()).is_err() {
-                    break;
-                }
+                logging::diagnostic_bytes(stream, &buf[..n]);
             }
             Err(_) => break,
         }

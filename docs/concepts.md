@@ -80,25 +80,26 @@ once it's there? That's the sandbox.
 When profiles are configured in `project.conf`, the host daemon does not spawn
 passthrough commands directly. It wraps each one inside a
 [bubblewrap](https://github.com/containers/bubblewrap) sandbox. Bubblewrap uses
-Linux user namespaces to create a thin, unprivileged container around the
-command with exactly the capabilities it needs and nothing more.
+Linux namespaces to create a thin container around the command. The profile
+defines the binaries, paths, environment, and network policy supplied to it.
 
 A sandbox profile is a small YAML file that declares:
 
-- Which exact host binaries the command may access (bind-mounted read-only)
-- Which directories are visible and whether they are writable
+- Which exact host binaries the command may access
+- Which host paths are visible and where they appear in the guest
 - Whether network access is permitted
 - Which environment variables the command inherits
 
 Bunkerbox ships profiles for common build systems — `rust`, `make`, `go`,
 `node`, `python` — and you can write your own. When multiple profiles are
-active, they merge: the union of all binaries and directories is available to
-the sandboxed command.
+active, they merge: the union of all binaries and paths is available to the
+sandboxed command.
 
 Inside the sandbox, the command sees a scratch `/home`, an empty `/tmp`, its
-own `/proc`, no network, and only the binaries you explicitly allowed. It
-cannot read your SSH keys, curl a payload, enumerate host processes, or write
-anywhere outside the overlay workspace.
+own `/proc`, no network, and only the binaries and paths you explicitly
+allowed. Home-relative cache paths are deliberate writable carryover paths;
+profile declarations are trusted host policy, not a complete rogue-process
+capability model.
 
 See the [Profiles guide](guides/profiles.md) for the full reference.
 

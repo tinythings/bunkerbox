@@ -48,7 +48,7 @@ pub fn cli(version: &'static str) -> Command {
         .arg(Arg::new("share").long("share").help("Override bunkerbox share directory"))
         .arg(Arg::new("workspace").long("workspace").value_parser(["share", "clone"]).help("Override workspace mode: share or clone"))
         .arg(Arg::new("verbose").long("verbose").action(ArgAction::SetTrue).help("Print log messages to stderr"))
-        .arg(Arg::new("log").long("log").value_name("PATH").help("Write log messages to the given file"))
+        .arg(Arg::new("log").long("log").value_name("PATH").help("Write Bunkerbox and sandbox diagnostics to the given file"))
         .arg(help_arg())
         .arg(Arg::new("version").short('v').long("version").action(ArgAction::SetTrue).help("Get the current version."))
         .disable_help_flag(true)

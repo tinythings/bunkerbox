@@ -1,11 +1,17 @@
 // Dead-code warnings are expected here: vscomm is shared between
 // two binaries (bunkerbox and bunkerbox-vscomm) that use different items.
 #![allow(dead_code)]
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 pub mod buildsys;
-pub const VSOCK_PORT: u32 = 9999;
-pub const STATUS_PORT: u32 = 9998;
+pub const TOOLCHAIN_PORT: u32 = 9999;
+// Keep UI traffic on a separate vsock endpoint from command execution.
+pub const TUI_STATUS_PORT: u32 = 10000;
 pub const VSCOMM_BIN_DIR: &str = "/usr/local/bunkerbox/bin";
 
 #[repr(u16)]
@@ -38,6 +44,65 @@ pub struct ExecRequest {
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+}
+
+pub fn validate_process_string(field: &str, value: &str) -> Result<(), String> {
+    if value.as_bytes().contains(&0) {
+        return Err(format!("{field} contains a NUL byte"));
+    }
+
+    Ok(())
+}
+
+pub fn validate_process_path(field: &str, value: &Path) -> Result<(), String> {
+    if os_str_contains_nul(value.as_os_str()) {
+        return Err(format!("{field} contains a NUL byte"));
+    }
+
+    Ok(())
+}
+
+pub fn validate_env_key(field: &str, key: &str) -> Result<(), String> {
+    validate_process_string(field, key)?;
+    if key.is_empty() {
+        return Err(format!("{field} is empty"));
+    }
+    if key.contains('=') {
+        return Err(format!("{field} contains '='"));
+    }
+
+    Ok(())
+}
+
+pub fn validate_exec_request(req: &ExecRequest) -> Result<(), String> {
+    validate_process_string("request cwd", &req.cwd)?;
+    if req.command.is_empty() {
+        return Err("request command is empty".to_string());
+    }
+    validate_process_string("request command", &req.command)?;
+
+    for (index, arg) in req.args.iter().enumerate() {
+        validate_process_string(&format!("request argument {index}"), arg)?;
+    }
+
+    for (index, (key, value)) in req.env.iter().enumerate() {
+        validate_env_key(&format!("request environment key {index}"), key)?;
+        validate_process_string(&format!("request environment value for '{key}'"), value)?;
+    }
+
+    Ok(())
+}
+
+fn os_str_contains_nul(value: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        value.as_bytes().contains(&0)
+    }
+
+    #[cfg(not(unix))]
+    {
+        value.to_string_lossy().contains('\0')
+    }
 }
 
 pub struct Frame {
@@ -214,3 +279,7 @@ pub fn parse_triggers(options: &str) -> Vec<Trigger> {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+#[path = "mod_ut.rs"]
+mod vscomm_tests;

@@ -23,29 +23,28 @@ Bunkerbox ships five profiles that cover the most common build systems. You
 can use them by name — no files to write, no paths to manage.
 
 **`rust`** — for projects with a `Cargo.toml`. Provides `cargo`, `rustc`,
-`rustfmt`, and `cc`. Mounts `~/.cargo` and `~/.rustup` read-write so your
-crates and toolchains are cached. Sets `CARGO_HOME` and `RUSTUP_HOME` so cargo
-knows where to look.
+`rustfmt`, and `cc`. Carries over `.cargo` and `.rustup` into the sandbox home
+and sets `CARGO_HOME` and `RUSTUP_HOME` to their guest paths.
 
 **`make`** — for projects with a `Makefile`. Provides `make`, `gcc`, `g++`,
 `ar`, `ld`, `as`, and `strip`. No writable directories by default — make
 output goes to the overlay workspace.
 
 **`go`** — for projects with a `go.mod`. Provides `go` and `gofmt`. Mounts
-the Go toolchain directory read-only and `~/go` read-write for the module
-cache. Sets `GOROOT` and `GOPATH`.
+the Go toolchain directory and carries over `go` and `.cache/go-build`. Sets
+`GOROOT`, `GOPATH`, and `GOCACHE` to guest paths.
 
 **`node`** — for projects with a `package.json`. Provides `node`, `npm`, and
-`npx`. Mounts `~/.npm` and `~/.node-gyp` read-write so packages are cached
-between runs.
+`npx`. Carries over `.npm` and `.node-gyp` so packages are cached between
+runs.
 
 **`python`** — for projects with `pyproject.toml` or `setup.py`. Provides
-`python3` and `pip3` (also aliased as `python` and `pip`). Mounts the pip
-cache read-write.
+`python3` and `pip3` (also aliased as `python` and `pip`). Carries over the
+`.cache/pip` cache.
 
 All profiles share the same base rules: system libraries (`/lib`, `/lib64`,
-`/usr/lib`) are mounted read-only, the network is disabled, and the shell is
-`/bin/sh`.
+`/usr/lib`) are available at their standard paths, the network is disabled,
+and the shell is `/bin/sh`.
 
 ## Using profiles
 
@@ -66,7 +65,7 @@ both Cargo and Make, add both `rust` and `make`. The sandboxed command will
 have access to the union of all binaries and directories from both profiles.
 
 If `profiles` is empty or absent, passthrough commands run directly on the
-host with no sandbox — the pre-bwrap legacy behavior.
+host with no sandbox.
 
 ## Custom profiles
 
@@ -81,14 +80,12 @@ bin:
   my-compiler: /opt/toolchain/bin/my-compiler
   my-linker: /opt/toolchain/bin/my-linker
 
-ro:
-  - /lib
-  - /lib64
-  - /usr/lib
-  - /opt/toolchain/lib
-
-rw:
-  - "${HOME}/.cache/my-toolchain"
+paths:
+  - src: /lib
+  - src: /lib64
+  - src: /usr/lib
+  - src: /opt/toolchain/lib
+  - src: .cache/my-toolchain
 
 env:
   TOOLCHAIN_HOME: /opt/toolchain
@@ -115,18 +112,27 @@ resolves the path against your `PATH` before mounting, so you can write
 `cargo: /usr/bin/cargo` and it will still work if cargo lives at
 `~/.cargo/bin/cargo` — the daemon finds it for you.
 
-**`ro`** — directories mounted read-only inside the sandbox. Use these
-for system libraries, toolchain directories, SSL certificates, timezone data,
-and anything else the tools need to read but should never modify.
+**`paths`** — host paths made available inside the sandbox. A relative `src`
+is resolved below the host user's home and appears below `/home` in the guest:
 
-**`rw`** — directories mounted read-write inside the sandbox. Use these
-for caches, build artifacts that should persist between runs, and any
-directory the toolchain needs to write to. The `${HOME}` variable expands to
-your host home directory.
+```yaml
+paths:
+  - src: .cargo
+  - src: /usr/lib/some/cpp/includes/crap
+  - src: /opt/sdk/include
+    dst: /toolchain/include
+```
 
-**`env`** — environment variables set inside the sandbox. Use these for
-toolchain configuration (`CARGO_HOME`, `GOPATH`, etc.). `${HOME}`, `${USER}`,
-and `${TERM}` are expanded automatically.
+Relative paths are writable carryover data and use `/home/<src>` as the guest
+destination. Absolute paths below the host home use the corresponding `/home`
+destination. Absolute paths outside the host home keep the same destination and
+are mounted as system/toolchain inputs. An explicit `dst` overrides the
+destination. The profile author is responsible for the host paths selected.
+
+**`env`** — guest environment variables set inside the sandbox. Use guest paths
+such as `/home/.cargo` for toolchain configuration (`CARGO_HOME`, `GOPATH`,
+etc.). `${HOME}` expands to `/home`; `${USER}` and `${TERM}` use the host
+runtime values when present.
 
 **`network`** — currently only `none` is supported. The sandboxed command has
 no network access.
@@ -136,17 +142,17 @@ no network access.
 
 ## How rules translate to isolation
 
-When a profile is active, each binary in the list is bind-mounted read-only
-at its expected path inside the sandbox. If the binary is a symlink (common
+When a profile is active, each binary in the list is bind-mounted at its
+expected path inside the sandbox. If the binary is a symlink (common
 with rustup, where `cargo` and `rustc` both point to the same `rustup`
 binary), the daemon follows the link and mounts the real file — so the
 sandbox sees a working executable, not a dangling symlink.
 
-Read-only directories are mounted recursively, so `/usr/lib` brings in the
-full tree. Writeable directories are plain bind mounts — changes inside the
-sandbox are visible on the host. The overlay workspace at `.bunkerbox/workspace`
-is always mounted read-write at `/workspace` inside the sandbox, so build
-output always lands in the copy-on-write layer.
+Absolute system and toolchain paths are mounted at their standard destinations.
+Home-relative paths are plain writable carryover binds, so changes are visible
+on the host. The overlay workspace at `.bunkerbox/workspace` is always mounted
+read-write at `/workspace` inside the sandbox, so build output always lands in
+the copy-on-write layer.
 
 The command gets a clean environment: no host variables leak in, and the
 profile's `env` block provides exactly what the toolchain needs. `/proc` and
@@ -154,5 +160,6 @@ profile's `env` block provides exactly what the toolchain needs. `/proc` and
 devices. `/tmp` and `/home` are empty tmpfs mounts, discarded when the
 command exits.
 
-All of this is enforced by bubblewrap using unprivileged user namespaces — no
-root, no setuid, no kernel modules.
+Bubblewrap provides the namespace boundary. Host paths selected by a profile
+remain trusted profile policy; path declarations are not a substitute for
+capability dropping or a non-root threat model.

@@ -8,14 +8,13 @@ use std::mem;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use vscomm::{encode_ui_payload, ExecRequest, Frame, FrameType, STATUS_PORT, VSCOMM_BIN_DIR, VSOCK_PORT};
+use vscomm::{encode_ui_payload, validate_exec_request, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT, TUI_STATUS_PORT, VSCOMM_BIN_DIR};
 
 const HOST_CID: u32 = 2;
 
 fn main() {
-    let result = run();
-    if let Err(err) = result {
-        eprintln!("bunkerbox-vscomm: {err}");
+    if let Err(err) = run() {
+        notify_tui_error(&err);
         std::process::exit(1);
     }
 }
@@ -34,17 +33,14 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "bunkerbox-vscomm must be invoked via symlink (not directly)".to_string())?
         .to_string();
 
-    let label = if args.len() > 1 { format!("{} {}", invoked_as, args[1..].join(" ")) } else { invoked_as.clone() };
-
-    send_status(&format!("Running: {label}"));
-
     let cwd = env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let env_vars: Vec<(String, String)> = env::vars().collect();
 
     let req = ExecRequest { cwd: cwd.to_string_lossy().to_string(), command: invoked_as, args: args[1..].to_vec(), env: env_vars };
+    validate_exec_request(&req)?;
 
     let frame = Frame::new(FrameType::ExecReq, req.serialize());
-    let mut stream = vsock_connect(HOST_CID, VSOCK_PORT).map_err(|e| format!("vsock connect: {e}"))?;
+    let mut stream = vsock_connect(HOST_CID, TOOLCHAIN_PORT).map_err(|e| format!("toolchain vsock connect: {e}"))?;
 
     frame.write(&mut stream).map_err(|e| format!("send request: {e}"))?;
     stream.flush().map_err(|e| format!("flush: {e}"))?;
@@ -52,26 +48,50 @@ fn run() -> Result<(), String> {
     loop {
         let response = Frame::read(&mut stream).map_err(|e| format!("read response: {e}"))?;
 
-        match response.frame_type {
-            FrameType::Stdout => {
-                io::stdout().write_all(&response.payload).map_err(|e| format!("stdout: {e}"))?;
-                io::stdout().flush().map_err(|e| format!("flush stdout: {e}"))?;
-            }
-            FrameType::Stderr => {
-                io::stderr().write_all(&response.payload).map_err(|e| format!("stderr: {e}"))?;
-                io::stderr().flush().map_err(|e| format!("flush stderr: {e}"))?;
-            }
-            FrameType::Exit => {
-                send_status(&format!("Done: {label}"));
-                if response.payload.len() >= 4 {
-                    let code = i32::from_le_bytes([response.payload[0], response.payload[1], response.payload[2], response.payload[3]]);
-                    std::process::exit(code);
-                }
-                return Ok(());
-            }
-            _ => return Err(format!("unexpected frame type from host: {:?}", response.frame_type as u16)),
+        if let Some(code) = handle_response(response)? {
+            std::process::exit(code);
         }
     }
+}
+
+fn handle_response(response: Frame) -> Result<Option<i32>, String> {
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    handle_response_to(response, &mut stdout, &mut stderr)
+}
+
+fn handle_response_to<WOut: Write, WErr: Write>(response: Frame, stdout: &mut WOut, stderr: &mut WErr) -> Result<Option<i32>, String> {
+    match response.frame_type {
+        FrameType::Stdout => {
+            stdout.write_all(&response.payload).map_err(|e| format!("stdout: {e}"))?;
+            stdout.flush().map_err(|e| format!("flush stdout: {e}"))?;
+            Ok(None)
+        }
+        FrameType::Stderr => {
+            stderr.write_all(&response.payload).map_err(|e| format!("stderr: {e}"))?;
+            stderr.flush().map_err(|e| format!("flush stderr: {e}"))?;
+            Ok(None)
+        }
+        FrameType::Exit => {
+            if response.payload.len() != 4 {
+                return Err("invalid exit frame".to_string());
+            }
+            let code = i32::from_le_bytes([response.payload[0], response.payload[1], response.payload[2], response.payload[3]]);
+            Ok(Some(code))
+        }
+        _ => Err(format!("unexpected frame type from host: {:?}", response.frame_type as u16)),
+    }
+}
+
+fn notify_tui_error(message: &str) {
+    let Ok(mut stream) = vsock_connect(HOST_CID, TUI_STATUS_PORT) else {
+        return;
+    };
+
+    let payload = encode_ui_payload("error", "show", "bunkerbox-vscomm", message);
+    let frame = Frame::new(FrameType::UiCommand, payload);
+    let _ = frame.write(&mut stream);
+    let _ = stream.flush();
 }
 
 fn install_symlinks() -> Result<(), String> {
@@ -178,20 +198,6 @@ fn command_exists_in_path_except(cmd: &str, except: &Path) -> bool {
     false
 }
 
-fn send_status(msg: &str) {
-    let result = (|| -> Result<(), String> {
-        let payload = encode_ui_payload("status", "set", "", msg);
-        let frame = Frame::new(FrameType::UiCommand, payload);
-        let mut stream = vsock_connect(HOST_CID, STATUS_PORT).map_err(|e| format!("status connect: {e}"))?;
-        frame.write(&mut stream).map_err(|e| format!("status write: {e}"))?;
-        stream.flush().map_err(|e| format!("status flush: {e}"))?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        eprintln!("bunkerbox-vscomm: status: {e}");
-    }
-}
-
 fn vsock_connect(cid: u32, port: u32) -> io::Result<VsockStream> {
     unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
@@ -247,3 +253,7 @@ impl Drop for VsockStream {
         unsafe { libc::close(self.fd) };
     }
 }
+
+#[cfg(test)]
+#[path = "../bunkerbox-vscomm_ut.rs"]
+mod vscomm_tests;

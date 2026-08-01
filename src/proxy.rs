@@ -1,3 +1,4 @@
+use crate::logging;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,12 +34,13 @@ impl FilterProxy {
                     Ok((stream, _peer)) => {
                         let allow = allow.clone();
                         tokio::spawn(async move {
-                            // TODO: route to log socket
-                            let _ = handle_client(stream, &allow).await;
+                            if let Err(err) = handle_client(stream, &allow).await {
+                                logging::diagnostic(&format!("bunkerbox-proxy: client failed: {err}"));
+                            }
                         });
                     }
                     Err(e) => {
-                        eprintln!("bunkerbox-proxy: accept error: {e}");
+                        logging::diagnostic(&format!("bunkerbox-proxy: accept error: {e}"));
                     }
                 }
             }

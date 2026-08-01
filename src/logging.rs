@@ -21,6 +21,37 @@ pub fn log_path() -> String {
     LOG_FILE.lock().unwrap().clone().unwrap_or_else(|| "/tmp/bunkerbox.log".to_string())
 }
 
+fn write_log(bytes: &[u8]) {
+    let path = LOG_FILE.lock().unwrap().clone();
+    if let Some(path) = path {
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(bytes);
+        }
+    }
+}
+
+/// Writes a diagnostic to the configured log without sending it to the terminal or TUI.
+pub fn diagnostic(msg: &str) {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let line = format!("[{ts}] {msg}\n");
+    write_log(line.as_bytes());
+}
+
+/// Writes captured command output to the configured log, or discards it when logging is disabled.
+pub fn diagnostic_bytes(stream: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut line = format!("[{ts}] {stream}: ").into_bytes();
+    line.extend_from_slice(bytes);
+    if !line.ends_with(b"\n") {
+        line.push(b'\n');
+    }
+    write_log(&line);
+}
+
 pub fn set_status_fd(fd: RawFd) {
     STATUS_FD.with(|f| *f.borrow_mut() = Some(fd));
 }
@@ -69,11 +100,7 @@ pub fn log(msg: &str) {
         eprint!("[bb] {line}");
     }
 
-    if let Some(ref path) = *LOG_FILE.lock().unwrap() {
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = f.write_all(line.as_bytes());
-        }
-    }
+    write_log(line.as_bytes());
 
     STATUS_FD.with(|f| {
         if let Some(fd) = *f.borrow() {
@@ -90,3 +117,7 @@ pub fn log(msg: &str) {
         }
     });
 }
+
+#[cfg(test)]
+#[path = "logging_ut.rs"]
+mod logging_tests;

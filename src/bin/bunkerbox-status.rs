@@ -5,7 +5,7 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::unix::io::RawFd;
-use vscomm::{Frame, FrameType, STATUS_PORT};
+use vscomm::{Frame, FrameType, TUI_STATUS_PORT};
 
 const HOST_CID: u32 = 2;
 
@@ -67,7 +67,7 @@ fn run() -> Result<(), String> {
         let payload = vscomm::encode_ui_payload(widget, command, &options, &value);
         let frame = Frame::new(FrameType::UiCommand, payload);
 
-        let mut stream = vsock_connect(HOST_CID, STATUS_PORT).map_err(|e| format!("vsock connect: {e}"))?;
+        let mut stream = vsock_connect(HOST_CID, TUI_STATUS_PORT).map_err(|e| format!("TUI vsock connect: {e}"))?;
         frame.write(&mut stream).map_err(|e| format!("send: {e}"))?;
         stream.flush().map_err(|e| format!("flush: {e}"))?;
     }

@@ -103,8 +103,8 @@ sandbox. The host daemon constructs a minimal Linux namespace from the profile
 rules before spawning the real command.
 
 - Only the binaries listed in the profile are visible inside the sandbox.
-  They are bind-mounted read-only at the paths where the command expects them.
-- Filesystem access is limited to the directories the profile declares.
+  They are bind-mounted at the paths where the command expects them.
+- Filesystem access is limited to the `paths` declared in the profile.
   Everything else is invisible.
 - The network is isolated (`--unshare-net`) unless a profile explicitly
   allows it.
@@ -129,12 +129,12 @@ path. The format is the same as the built-ins. See the [Profiles
 guide](../guides/profiles.md) for the full reference.
 
 **Merging.** When multiple profiles are configured, their rules are merged.
-The union of all binaries, read-only directories, writable directories, and
-environment variables is available to the sandboxed command.
+The union of all binaries, paths, and environment variables is available to
+the sandboxed command.
 
 **When profiles are empty** (the default), passthrough commands run directly
-on the host with no sandbox — the pre-bwrap legacy behavior. This is useful
-when you trust the tool completely or are debugging, but it offers no
+on the host with no sandbox. This is useful when you trust the tool completely
+or are debugging, but it offers no
 additional isolation beyond the vsock whitelist.
 
 ### `image`

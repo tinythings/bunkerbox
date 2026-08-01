@@ -1,12 +1,25 @@
 use crate::cfg::EnvMode;
+use crate::logging;
 use crate::proxy::FilterProxy;
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
-use crate::vscomm::{ExecRequest, Frame, FrameType, VSOCK_PORT};
+use crate::vscomm::{validate_exec_request, validate_process_path, validate_process_string, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+
+const BWRAP_STATUS_FD: RawFd = 3;
+
+enum ChildEvent {
+    Output(FrameType, Vec<u8>),
+    StreamClosed,
+    LauncherStarted,
+    LauncherFailed(String),
+}
 
 struct VsockSession {
     passthrough: Arc<Vec<String>>,
@@ -32,7 +45,8 @@ impl VsockDaemon {
             None
         } else {
             let loaded: Vec<_> = profiles.iter().map(|p| resolve_profile(p, &share_dir)).collect::<Result<Vec<_>, _>>()?;
-            let merged = MergedProfile::from_profiles(&loaded);
+            let host_home = std::env::var_os("HOME").map(PathBuf::from);
+            let merged = MergedProfile::from_profiles(&loaded, host_home.as_deref())?;
 
             let check = std::process::Command::new("bwrap").arg("--version").output().map_err(|e| format!("bwrap not found: {e}"))?;
             if !check.status.success() {
@@ -55,10 +69,13 @@ impl VsockDaemon {
 
         let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), env_mode, workspace, merged_profile, has_proxy });
 
+        let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, TOOLCHAIN_PORT))
+            .map_err(|e| format!("failed to bind toolchain vsock port {TOOLCHAIN_PORT}: {e}"))?;
+
         let join_handle = tokio::spawn(async move {
-            let result = daemon_loop(session, shutdown_rx).await;
+            let result = daemon_loop(session, listener, shutdown_rx).await;
             if let Err(err) = result {
-                eprintln!("bunkerbox: vsock daemon: {err}");
+                logging::diagnostic(&format!("bunkerbox: vsock daemon: {err}"));
             }
         });
 
@@ -74,19 +91,9 @@ impl VsockDaemon {
     }
 }
 
-async fn daemon_loop(session: Arc<VsockSession>, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
-    use tokio_vsock::VsockListener;
-
-    let listener = match VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, VSOCK_PORT)) {
-        Ok(l) => l,
-        Err(_e) => {
-            // TODO: route to log socket
-            // eprintln!("bunkerbox: vsock unavailable (passthrough disabled): {e}");
-            let _ = shutdown_rx.await;
-            return Ok(());
-        }
-    };
-
+async fn daemon_loop(
+    session: Arc<VsockSession>, listener: tokio_vsock::VsockListener, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), String> {
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -94,14 +101,13 @@ async fn daemon_loop(session: Arc<VsockSession>, mut shutdown_rx: tokio::sync::o
                     Ok((stream, _peer)) => {
                         let session = session.clone();
                         tokio::spawn(async move {
-                            if let Err(_err) = handle_connection(stream, &session).await {
-                                // TODO: route to log socket
-                                // eprintln!("bunkerbox: vsock session error: {err}");
+                            if let Err(err) = handle_connection(stream, &session).await {
+                                logging::diagnostic(&format!("bunkerbox: toolchain vsock session failed: {err}"));
                             }
                         });
                     }
                     Err(e) => {
-                        eprintln!("bunkerbox: vsock accept error: {e}");
+                        logging::diagnostic(&format!("bunkerbox: vsock accept error: {e}"));
                     }
                 }
             }
@@ -119,13 +125,30 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
 
     let req = read_exec_request(&mut reader).await?;
 
-    if !is_allowed(&session.passthrough, &req.command, &req.args) {
-        let msg = format!("bunkerbox-vscomm: command '{}' not whitelisted\n", req.command);
-        write_frame(&mut writer, &Frame::new(FrameType::Stderr, msg.into_bytes())).await?;
+    if let Err(err) = validate_exec_request(&req) {
+        logging::diagnostic(&format!("bunkerbox-vscomm: invalid request: {err}"));
         write_frame(&mut writer, &Frame::new(FrameType::Exit, 1i32.to_le_bytes().to_vec())).await?;
         return Ok(());
     }
 
+    if !is_allowed(&session.passthrough, &req.command, &req.args) {
+        logging::diagnostic(&format!("bunkerbox-vscomm: command '{}' not whitelisted", req.command));
+        write_frame(&mut writer, &Frame::new(FrameType::Exit, 1i32.to_le_bytes().to_vec())).await?;
+        return Ok(());
+    }
+
+    let command = req.command.clone();
+    if let Err(err) = execute_request(&mut writer, session, &req).await {
+        logging::diagnostic(&format!("bunkerbox: toolchain command '{command}' failed: {err}"));
+        let _ = write_frame(&mut writer, &Frame::new(FrameType::Exit, 1i32.to_le_bytes().to_vec())).await;
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &VsockSession, req: &ExecRequest) -> Result<(), String> {
+    validate_exec_request(req)?;
     let sandbox_cwd = req.cwd.clone();
     let host_cwd = if req.cwd.starts_with("/workspace") {
         session.workspace.join(req.cwd.strip_prefix("/workspace").unwrap_or(&req.cwd).trim_start_matches('/'))
@@ -133,52 +156,89 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
         PathBuf::from(&req.cwd)
     };
 
-    let mut cmd = build_command(session, &req, &host_cwd, &sandbox_cwd)?;
+    let (status_reader, status_writer) = if session.merged_profile.is_some() {
+        let (reader, writer) = bwrap_status_pipe()?;
+        (Some(reader), Some(writer))
+    } else {
+        (None, None)
+    };
+    let mut cmd = build_command(session, req, &host_cwd, &sandbox_cwd)?;
+    if let Some(status_writer) = status_writer.as_ref() {
+        attach_bwrap_status_fd(&mut cmd, status_writer.as_raw_fd());
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", req.command))?;
+    let launcher = if session.merged_profile.is_some() { "bwrap" } else { &req.command };
+    let mut child = cmd.spawn().map_err(|e| format!("spawn {launcher} for command '{}': {e}", req.command))?;
+    drop(status_writer);
 
     let child_stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
     let child_stderr = child.stderr.take().ok_or_else(|| "no stderr".to_string())?;
 
-    let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stdout_task = tokio::spawn(pump_to_channel(child_stdout, FrameType::Stdout, event_tx.clone()));
+    let stderr_task = tokio::spawn(pump_to_channel(child_stderr, FrameType::Stderr, event_tx.clone()));
+    let status_task = status_reader.map(|reader| {
+        let status_tx = event_tx.clone();
+        tokio::task::spawn_blocking(move || monitor_bwrap_status(reader, status_tx))
+    });
+    drop(event_tx);
+    let mut launcher_started = session.merged_profile.is_none();
+    let mut launcher_failed = false;
+    let mut closed_streams = 0;
+    let mut buffered_output = Vec::new();
 
-    let stdout_task = tokio::spawn(async move { pump_to_channel(child_stdout, stdout_tx).await });
-    let stderr_task = tokio::spawn(async move { pump_to_channel(child_stderr, stderr_tx).await });
-
-    loop {
-        tokio::select! {
-            chunk = stdout_rx.recv() => {
-                if let Some(data) = chunk {
-                    write_frame(&mut writer, &Frame::new(FrameType::Stdout, data)).await?;
+    while closed_streams < 2 || (session.merged_profile.is_some() && !launcher_started && !launcher_failed) {
+        let Some(event) = event_rx.recv().await else { break };
+        match event {
+            ChildEvent::Output(frame_type, data) if launcher_failed => {
+                let stream = if matches!(frame_type, FrameType::Stdout) { "bwrap stdout" } else { "bwrap stderr" };
+                logging::diagnostic_bytes(stream, &data);
+            }
+            ChildEvent::Output(frame_type, data) if launcher_started => {
+                write_frame(writer, &Frame::new(frame_type, data)).await?;
+            }
+            ChildEvent::Output(frame_type, data) => buffered_output.push((frame_type, data)),
+            ChildEvent::StreamClosed => closed_streams += 1,
+            ChildEvent::LauncherStarted => {
+                launcher_started = true;
+                for (frame_type, data) in buffered_output.drain(..) {
+                    write_frame(writer, &Frame::new(frame_type, data)).await?;
                 }
             }
-            chunk = stderr_rx.recv() => {
-                if let Some(data) = chunk {
-                    write_frame(&mut writer, &Frame::new(FrameType::Stderr, data)).await?;
+            ChildEvent::LauncherFailed(err) => {
+                launcher_failed = true;
+                logging::diagnostic(&format!("bwrap setup failed: {err}"));
+                for (frame_type, data) in buffered_output.drain(..) {
+                    let stream = if matches!(frame_type, FrameType::Stdout) { "bwrap stdout" } else { "bwrap stderr" };
+                    logging::diagnostic_bytes(stream, &data);
                 }
             }
-        }
-
-        if stdout_rx.is_closed() && stderr_rx.is_closed() {
-            break;
         }
     }
 
     let status = child.wait().await.map_err(|e| format!("wait {}: {e}", req.command))?;
     let exit_code = status.code().unwrap_or(-1);
-    write_frame(&mut writer, &Frame::new(FrameType::Exit, exit_code.to_le_bytes().to_vec())).await?;
+    write_frame(writer, &Frame::new(FrameType::Exit, exit_code.to_le_bytes().to_vec())).await?;
 
     stdout_task.await.map_err(|e| format!("stdout task: {e}"))?;
     stderr_task.await.map_err(|e| format!("stderr task: {e}"))?;
+    if let Some(status_task) = status_task {
+        status_task.await.map_err(|e| format!("bwrap status task: {e}"))?;
+    }
 
     Ok(())
 }
 
 fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, sandbox_cwd: &str) -> Result<Command, String> {
+    validate_exec_request(req)?;
+    validate_process_path("workspace path", &session.workspace)?;
+    validate_process_path("host working directory", host_cwd)?;
+    validate_process_string("sandbox working directory", sandbox_cwd)?;
+
     if let Some(ref merged) = session.merged_profile {
         let mut cmd = Command::new("bwrap");
 
@@ -190,24 +250,23 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
             } else if let Some(found) = find_in_path(name) {
                 found
             } else {
-                eprintln!("bunkerbox: warning: binary '{name}' not found, skipping");
+                logging::diagnostic(&format!("bunkerbox: warning: binary '{name}' not found, skipping"));
                 continue;
             };
             let dest = PathBuf::from("/usr/bin").join(name);
             cmd.arg("--ro-bind").arg(&resolved).arg(&dest);
         }
 
-        for dir in &merged.ro {
-            let p = Path::new(dir);
-            if p.exists() {
-                cmd.arg("--ro-bind").arg(dir).arg(dir);
+        cmd.arg("--tmpfs").arg("/home");
+        for path in &merged.paths {
+            if !path.source.exists() {
+                logging::diagnostic(&format!("bunkerbox: warning: profile path '{}' not found, skipping", path.source.display()));
+                continue;
             }
-        }
-
-        for dir in &merged.rw {
-            let p = Path::new(dir);
-            if p.exists() {
-                cmd.arg("--bind").arg(dir).arg(dir);
+            if path.writable {
+                cmd.arg("--bind").arg(&path.source).arg(&path.destination);
+            } else {
+                cmd.arg("--ro-bind").arg(&path.source).arg(&path.destination);
             }
         }
 
@@ -227,7 +286,6 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
         cmd.arg("--proc").arg("/proc");
         cmd.arg("--dev").arg("/dev");
         cmd.arg("--tmpfs").arg("/tmp");
-        cmd.arg("--tmpfs").arg("/home");
 
         if !sandbox_cwd.is_empty() && sandbox_cwd != "/" {
             cmd.arg("--dir").arg(sandbox_cwd);
@@ -268,6 +326,7 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
             }
         }
 
+        cmd.arg("--json-status-fd").arg(BWRAP_STATUS_FD.to_string());
         cmd.arg("--");
         cmd.arg(&req.command);
         for arg in &req.args {
@@ -360,19 +419,84 @@ async fn read_exec_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Ex
     ExecRequest::deserialize(&payload)
 }
 
-async fn pump_to_channel<R: AsyncReadExt + Unpin>(mut reader: R, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+fn bwrap_status_pipe() -> Result<(File, File), String> {
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(format!("create bwrap status pipe: {}", std::io::Error::last_os_error()));
+    }
+
+    let reader = unsafe { File::from_raw_fd(fds[0]) };
+    let writer = unsafe { File::from_raw_fd(fds[1]) };
+    Ok((reader, writer))
+}
+
+fn attach_bwrap_status_fd(cmd: &mut Command, source_fd: RawFd) {
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(source_fd, BWRAP_STATUS_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if source_fd != BWRAP_STATUS_FD {
+                libc::close(source_fd);
+            }
+            Ok(())
+        });
+    }
+}
+
+fn monitor_bwrap_status(reader: File, tx: tokio::sync::mpsc::UnboundedSender<ChildEvent>) {
+    let mut started = false;
+    for line in BufReader::new(reader).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                if !started {
+                    let _ = tx.send(ChildEvent::LauncherFailed(format!("read status: {err}")));
+                }
+                return;
+            }
+        };
+
+        let status: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(status) => status,
+            Err(err) => {
+                if !started {
+                    let _ = tx.send(ChildEvent::LauncherFailed(format!("invalid status JSON: {err}")));
+                }
+                return;
+            }
+        };
+
+        if status.get("child-pid").is_some() && !started {
+            started = true;
+            let _ = tx.send(ChildEvent::LauncherStarted);
+        } else if !started {
+            if let Some(exit_code) = status.get("exit-code") {
+                let _ = tx.send(ChildEvent::LauncherFailed(format!("exited before command start with status {exit_code}")));
+                return;
+            }
+        }
+    }
+
+    if !started {
+        let _ = tx.send(ChildEvent::LauncherFailed("exited before command start".to_string()));
+    }
+}
+
+async fn pump_to_channel<R: AsyncReadExt + Unpin>(mut reader: R, frame_type: FrameType, tx: tokio::sync::mpsc::UnboundedSender<ChildEvent>) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                if tx.send(buf[..n].to_vec()).is_err() {
-                    break;
+                if tx.send(ChildEvent::Output(frame_type, buf[..n].to_vec())).is_err() {
+                    return;
                 }
             }
             Err(_) => break,
         }
     }
+    let _ = tx.send(ChildEvent::StreamClosed);
 }
 
 async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, frame: &Frame) -> Result<(), String> {
@@ -391,3 +515,7 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, frame: &Frame) ->
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "daemon_ut.rs"]
+mod daemon_tests;

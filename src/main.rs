@@ -422,8 +422,6 @@ fn start_status_listener(overlay: Arc<Mutex<tui::OverlayState>>) -> Result<Statu
 async fn status_listener(
     listener: tokio_vsock::VsockListener, overlay: Arc<Mutex<tui::OverlayState>>, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    use tokio::io::AsyncReadExt;
-
     loop {
         let (mut stream, _peer) = tokio::select! {
             result = listener.accept() => match result {

@@ -2,7 +2,7 @@ use crate::cfg::EnvMode;
 use crate::logging;
 use crate::proxy::{FilterProxy, UnixProxyHandle};
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
-use crate::vscomm::{validate_exec_request, validate_process_path, validate_process_string, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
+use crate::vscomm::{validate_exec_request, validate_process_path, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
 use crate::workspace::WorkspaceCwd;
 use rand::Rng;
 use std::fs::File;

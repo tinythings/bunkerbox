@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -11,6 +11,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Widget, Wrap};
 
 use ratatui::Terminal;
 
@@ -31,11 +32,22 @@ const WIDGET_STATUS: &str = "status";
 const WIDGET_POPUP: &str = "popup";
 const WIDGET_SPINNER: &str = "spinner";
 const WIDGET_PASSWORD: &str = "password";
+const WIDGET_ERROR: &str = "error";
 
 const CMD_SHOW: &str = "show";
 const CMD_HIDE: &str = "hide";
 const CMD_SET: &str = "set";
 const CMD_CLEAR: &str = "clear";
+
+const ERROR_TOAST_IN: Duration = Duration::from_millis(220);
+const ERROR_TOAST_HOLD: Duration = Duration::from_secs(5);
+const ERROR_TOAST_OUT: Duration = Duration::from_millis(260);
+
+struct ErrorToast {
+    title: String,
+    message: String,
+    shown_at: Instant,
+}
 
 pub struct PendingAction {
     pub widget: String,
@@ -52,6 +64,7 @@ pub struct OverlayState {
     pub popup_title: Option<String>,
     pub pending: Vec<PendingAction>,
     pub has_error: bool,
+    error_toast: Option<ErrorToast>,
     pub hide_on_ascii: bool,
     pub hide_on_content: Option<String>,
     pub last_content_scan: Instant,
@@ -71,6 +84,7 @@ impl OverlayState {
             popup_title: None,
             pending: Vec::new(),
             has_error: false,
+            error_toast: None,
             hide_on_ascii: false,
             hide_on_content: None,
             last_content_scan: Instant::now(),
@@ -79,6 +93,15 @@ impl OverlayState {
 }
 
 pub fn dispatch_ui_command(state: &mut OverlayState, widget: &str, command: &str, options: &str, value: &str) {
+    if widget == WIDGET_ERROR && command == CMD_SHOW {
+        state.error_toast = Some(ErrorToast {
+            title: if options.is_empty() { "Bunkerbox error".to_string() } else { options.chars().take(80).collect() },
+            message: value.chars().take(512).collect(),
+            shown_at: Instant::now(),
+        });
+        return;
+    }
+
     if widget == WIDGET_POPUP && command == CMD_HIDE && !value.is_empty() {
         if value == "ASCII" {
             state.hide_on_ascii = true;
@@ -607,6 +630,12 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
             }
 
             state.popup.tick();
+            if let Some(toast) = state.error_toast.as_ref() {
+                let lifetime = ERROR_TOAST_IN + ERROR_TOAST_HOLD + ERROR_TOAST_OUT;
+                if toast.shown_at.elapsed() >= lifetime {
+                    state.error_toast = None;
+                }
+            }
 
             terminal.draw(|f| render_frame(f, term.screen(), &state)).map_err(|e| format!("draw: {e}"))?;
         }
@@ -777,12 +806,66 @@ fn render_frame(f: &mut Frame, screen: &vt100::Screen, overlay: &OverlayState) {
     {
         let buf = f.buffer_mut();
         overlay.popup.render(area, buf);
+        render_error_toast(area, buf, overlay.error_toast.as_ref());
     }
 
     let (cursor_row, cursor_col) = screen.cursor_position();
     if cursor_row < max_rows && cursor_col < max_cols {
         f.set_cursor_position((area.x + cursor_col, area.y + cursor_row));
     }
+}
+
+fn render_error_toast(area: Rect, buf: &mut Buffer, toast: Option<&ErrorToast>) {
+    let Some(toast) = toast else {
+        return;
+    };
+
+    let elapsed = toast.shown_at.elapsed();
+    let width = toast
+        .message
+        .lines()
+        .chain(std::iter::once(toast.title.as_str()))
+        .map(|line| line.chars().count() as u16)
+        .max()
+        .unwrap_or(24)
+        .saturating_add(8)
+        .max(28)
+        .min(area.width.saturating_sub(2));
+    let height = (toast.message.lines().count().max(1) as u16 + 4).min(area.height.saturating_sub(2));
+    if width < 4 || height < 3 {
+        return;
+    }
+
+    let travel = width.saturating_add(2);
+    let target_x = area.right().saturating_sub(travel);
+    let offset = if elapsed < ERROR_TOAST_IN {
+        let progress = elapsed.as_secs_f64() / ERROR_TOAST_IN.as_secs_f64();
+        ((1.0 - progress) * f64::from(travel)) as u16
+    } else if elapsed < ERROR_TOAST_IN + ERROR_TOAST_HOLD {
+        0
+    } else {
+        let out_elapsed = elapsed - ERROR_TOAST_IN - ERROR_TOAST_HOLD;
+        let progress = (out_elapsed.as_secs_f64() / ERROR_TOAST_OUT.as_secs_f64()).min(1.0);
+        (progress * f64::from(travel)) as u16
+    };
+    let x = target_x.saturating_add(offset);
+    let y = area.y.saturating_add(1);
+    let canvas = Rect { x, y, width, height };
+
+    Clear.render(canvas, buf);
+    let block = Block::default()
+        .title(toast.title.as_str())
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::ERROR))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(palette::BG_1));
+    let inner = block.inner(canvas);
+    block.render(canvas, buf);
+    Paragraph::new(toast.message.as_str())
+        .style(Style::default().fg(palette::FG))
+        .wrap(Wrap { trim: true })
+        .render(inner, buf);
 }
 
 #[cfg(test)]

@@ -8,12 +8,13 @@ use std::mem;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use vscomm::{validate_exec_request, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT, VSCOMM_BIN_DIR};
+use vscomm::{encode_ui_payload, validate_exec_request, ExecRequest, Frame, FrameType, TUI_STATUS_PORT, TOOLCHAIN_PORT, VSCOMM_BIN_DIR};
 
 const HOST_CID: u32 = 2;
 
 fn main() {
-    if run().is_err() {
+    if let Err(err) = run() {
+        notify_tui_error(&err);
         std::process::exit(1);
     }
 }
@@ -54,18 +55,43 @@ fn run() -> Result<(), String> {
 }
 
 fn handle_response(response: Frame) -> Result<Option<i32>, String> {
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    handle_response_to(response, &mut stdout, &mut stderr)
+}
+
+fn handle_response_to<WOut: Write, WErr: Write>(response: Frame, stdout: &mut WOut, stderr: &mut WErr) -> Result<Option<i32>, String> {
     match response.frame_type {
-        FrameType::Stdout | FrameType::Stderr => Ok(None),
+        FrameType::Stdout => {
+            stdout.write_all(&response.payload).map_err(|e| format!("stdout: {e}"))?;
+            stdout.flush().map_err(|e| format!("flush stdout: {e}"))?;
+            Ok(None)
+        }
+        FrameType::Stderr => {
+            stderr.write_all(&response.payload).map_err(|e| format!("stderr: {e}"))?;
+            stderr.flush().map_err(|e| format!("flush stderr: {e}"))?;
+            Ok(None)
+        }
         FrameType::Exit => {
-            if response.payload.len() >= 4 {
-                let code = i32::from_le_bytes([response.payload[0], response.payload[1], response.payload[2], response.payload[3]]);
-                Ok(Some(code))
-            } else {
-                Ok(Some(0))
+            if response.payload.len() != 4 {
+                return Err("invalid exit frame".to_string());
             }
+            let code = i32::from_le_bytes([response.payload[0], response.payload[1], response.payload[2], response.payload[3]]);
+            Ok(Some(code))
         }
         _ => Err(format!("unexpected frame type from host: {:?}", response.frame_type as u16)),
     }
+}
+
+fn notify_tui_error(message: &str) {
+    let Ok(mut stream) = vsock_connect(HOST_CID, TUI_STATUS_PORT) else {
+        return;
+    };
+
+    let payload = encode_ui_payload("error", "show", "bunkerbox-vscomm", message);
+    let frame = Frame::new(FrameType::UiCommand, payload);
+    let _ = frame.write(&mut stream);
+    let _ = stream.flush();
 }
 
 fn install_symlinks() -> Result<(), String> {

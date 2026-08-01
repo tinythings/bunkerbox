@@ -99,6 +99,35 @@ project:
 #     - extra.api.example.com
 ```
 
+## Sandbox profile
+
+Profiles are host-side YAML files selected by the project configuration.
+
+```yaml
+name: rust
+bin:
+  cargo: /usr/bin/cargo
+paths:
+  - src: /lib
+  - src: /usr/lib
+  - src: .cargo
+  - src: .rustup
+  - src: /opt/sdk/include
+    dst: /toolchain/include
+env:
+  CARGO_HOME: /home/.cargo
+  RUSTUP_HOME: /home/.rustup
+network: none
+shell: /bin/sh
+```
+
+Relative `src` paths are resolved below the host user's home and appear below
+`/home` in the guest. Absolute paths below the host home use the corresponding
+`/home` destination. Absolute paths outside the host home retain their source
+path as the guest destination unless `dst` is supplied. Home-relative paths are
+writable carryover data; absolute system and toolchain paths are read-only
+inputs by default. These declarations are trusted host policy.
+
 During development, runtime configs live in `runtime/`. In a packaged install, they live under:
 
 ```text

@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -47,6 +49,21 @@ struct ErrorToast {
     title: String,
     message: String,
     shown_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseTracking {
+    Off,
+    Normal,
+    Button,
+    Any,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseEncoding {
+    X10,
+    Urxvt,
+    Sgr,
 }
 
 pub struct PendingAction {
@@ -191,6 +208,11 @@ struct Term {
     g1_dec_special_graphics: bool,
     using_g1_charset: bool,
     application_cursor_keys: bool,
+    mouse_normal: bool,
+    mouse_button: bool,
+    mouse_any: bool,
+    mouse_sgr: bool,
+    mouse_urxvt: bool,
     csi_bytes: Vec<u8>,
 }
 
@@ -215,6 +237,11 @@ impl Term {
             g1_dec_special_graphics: false,
             using_g1_charset: false,
             application_cursor_keys: false,
+            mouse_normal: false,
+            mouse_button: false,
+            mouse_any: false,
+            mouse_sgr: false,
+            mouse_urxvt: false,
             csi_bytes: Vec::new(),
         }
     }
@@ -241,6 +268,28 @@ impl Term {
     #[allow(dead_code)]
     fn application_cursor_keys(&self) -> bool {
         self.application_cursor_keys
+    }
+
+    fn mouse_tracking(&self) -> MouseTracking {
+        if self.mouse_any {
+            MouseTracking::Any
+        } else if self.mouse_button {
+            MouseTracking::Button
+        } else if self.mouse_normal {
+            MouseTracking::Normal
+        } else {
+            MouseTracking::Off
+        }
+    }
+
+    fn mouse_encoding(&self) -> MouseEncoding {
+        if self.mouse_sgr {
+            MouseEncoding::Sgr
+        } else if self.mouse_urxvt {
+            MouseEncoding::Urxvt
+        } else {
+            MouseEncoding::X10
+        }
     }
 
     fn active_dec_special_graphics(&self) -> bool {
@@ -342,6 +391,8 @@ impl Term {
     }
 
     fn handle_csi_complete(&mut self, translated: &mut [u8]) -> bool {
+        self.update_private_modes();
+
         match self.csi_bytes.as_slice() {
             b"?1h" => self.application_cursor_keys = true,
             b"?1l" => self.application_cursor_keys = false,
@@ -361,6 +412,37 @@ impl Term {
         }
 
         false
+    }
+
+    fn update_private_modes(&mut self) {
+        let bytes = self.csi_bytes.clone();
+        if bytes.first() != Some(&b'?') || bytes.len() < 3 {
+            return;
+        }
+
+        let Some((&final_byte, params)) = bytes.split_last() else {
+            return;
+        };
+        let enabled = match final_byte {
+            b'h' => true,
+            b'l' => false,
+            _ => return,
+        };
+
+        for raw_mode in params[1..].split(|byte| *byte == b';') {
+            let Ok(mode) = std::str::from_utf8(raw_mode).unwrap_or_default().parse::<u16>() else {
+                continue;
+            };
+            match mode {
+                1000 => self.mouse_normal = enabled,
+                1002 => self.mouse_button = enabled,
+                1003 => self.mouse_any = enabled,
+                1006 => self.mouse_sgr = enabled,
+                1015 => self.mouse_urxvt = enabled,
+                1005 => {}
+                _ => {}
+            }
+        }
     }
 }
 
@@ -487,6 +569,7 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
     let mut last_cols = cols;
 
     let mut status_buf = Vec::new();
+    let mut mouse_capture_enabled = false;
 
     unsafe {
         libc::signal(libc::SIGWINCH, handle_sigwinch as *const () as libc::sighandler_t);
@@ -520,8 +603,7 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            terminal.backend_mut().execute(LeaveAlternateScreen).ok();
-            terminal::disable_raw_mode().ok();
+            cleanup_terminal(&mut terminal, mouse_capture_enabled);
             return Err(format!("poll: {err}"));
         }
 
@@ -531,6 +613,19 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
             let n = unsafe { libc::read(master_fd, pty_buf.as_mut_ptr() as *mut libc::c_void, pty_buf.len()) };
             if n > 0 {
                 term.process(&pty_buf[..n as usize]);
+                let wants_mouse_capture = term.mouse_tracking() != MouseTracking::Off;
+                if wants_mouse_capture != mouse_capture_enabled {
+                    let result = if wants_mouse_capture {
+                        terminal.backend_mut().execute(EnableMouseCapture).map(|_| ())
+                    } else {
+                        terminal.backend_mut().execute(DisableMouseCapture).map(|_| ())
+                    };
+                    if let Err(err) = result {
+                        cleanup_terminal(&mut terminal, mouse_capture_enabled);
+                        return Err(format!("mouse capture: {err}"));
+                    }
+                    mouse_capture_enabled = wants_mouse_capture;
+                }
                 for response in term.drain_responses() {
                     unsafe {
                         libc::write(master_fd, response.as_ptr() as *const libc::c_void, response.len());
@@ -544,18 +639,30 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
         }
 
         if fds[1].revents & libc::POLLIN != 0 {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+            if let Ok(input_event) = event::read() {
+                match input_event {
+                    Event::Key(key) => {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
 
-                let is_password = overlay.lock().is_ok_and(|s| matches!(s.popup.content, popup::PopupContent::Password { .. }));
-                if is_password {
-                    handle_password_key(&overlay, status_fd, key);
-                } else if let Some(bytes) = key_to_bytes(&key, term.application_cursor_keys()) {
-                    unsafe {
-                        libc::write(master_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+                        let is_password = overlay.lock().is_ok_and(|s| matches!(s.popup.content, popup::PopupContent::Password { .. }));
+                        if is_password {
+                            handle_password_key(&overlay, status_fd, key);
+                        } else if let Some(bytes) = key_to_bytes(&key, term.application_cursor_keys()) {
+                            unsafe {
+                                libc::write(master_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+                            }
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        if let Some(bytes) = mouse_to_bytes(mouse, term.mouse_tracking(), term.mouse_encoding()) {
+                            unsafe {
+                                libc::write(master_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -637,17 +744,27 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
                 }
             }
 
-            terminal.draw(|f| render_frame(f, term.screen(), &state)).map_err(|e| format!("draw: {e}"))?;
+            if let Err(err) = terminal.draw(|f| render_frame(f, term.screen(), &state)) {
+                cleanup_terminal(&mut terminal, mouse_capture_enabled);
+                return Err(format!("draw: {err}"));
+            }
         }
     }
 
+    cleanup_terminal(&mut terminal, mouse_capture_enabled);
+
+    Ok(())
+}
+
+fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mouse_capture_enabled: bool) {
+    if mouse_capture_enabled {
+        terminal.backend_mut().execute(DisableMouseCapture).ok();
+    }
     terminal.backend_mut().execute(LeaveAlternateScreen).ok();
     terminal::disable_raw_mode().ok();
     unsafe {
         libc::signal(libc::SIGWINCH, libc::SIG_DFL);
     }
-
-    Ok(())
 }
 
 fn handle_password_key(overlay: &Arc<Mutex<OverlayState>>, status_fd: RawFd, key: KeyEvent) {
@@ -703,6 +820,69 @@ fn key_to_bytes(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
         KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
         KeyCode::F(n) => fn_key(n),
         _ => None,
+    }
+}
+
+fn mouse_to_bytes(event: MouseEvent, tracking: MouseTracking, encoding: MouseEncoding) -> Option<Vec<u8>> {
+    let (base_code, is_drag, is_release) = match event.kind {
+        MouseEventKind::Down(button) => (mouse_button_code(button), false, false),
+        MouseEventKind::Up(button) => (mouse_button_code(button), false, true),
+        MouseEventKind::Drag(button) => (mouse_button_code(button), true, false),
+        MouseEventKind::Moved => (3, true, false),
+        MouseEventKind::ScrollUp => (64, false, false),
+        MouseEventKind::ScrollDown => (65, false, false),
+        MouseEventKind::ScrollLeft => (66, false, false),
+        MouseEventKind::ScrollRight => (67, false, false),
+    };
+
+    match (tracking, event.kind) {
+        (MouseTracking::Off, _) => return None,
+        (MouseTracking::Normal, MouseEventKind::Drag(_) | MouseEventKind::Moved) => return None,
+        (MouseTracking::Button, MouseEventKind::Moved) => return None,
+        _ => {}
+    }
+
+    let mut code = base_code;
+    if event.modifiers.contains(KeyModifiers::SHIFT) {
+        code += 4;
+    }
+    if event.modifiers.contains(KeyModifiers::ALT) {
+        code += 8;
+    }
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        code += 16;
+    }
+    if is_drag {
+        code += 32;
+    }
+
+    let column = u32::from(event.column) + 1;
+    let row = u32::from(event.row) + 1;
+
+    match encoding {
+        MouseEncoding::Sgr => {
+            let suffix = if is_release { 'm' } else { 'M' };
+            Some(format!("\x1b[<{};{};{}{}", code, column, row, suffix).into_bytes())
+        }
+        MouseEncoding::Urxvt => {
+            let legacy_code = if is_release { 3 } else { code };
+            Some(format!("\x1b[{};{};{}M", legacy_code + 32, column, row).into_bytes())
+        }
+        MouseEncoding::X10 => {
+            let legacy_code = if is_release { 3 } else { code };
+            if column > 223 || row > 223 || legacy_code + 32 > 255 {
+                return None;
+            }
+            Some(vec![0x1b, b'[', b'M', (legacy_code + 32) as u8, (column + 32) as u8, (row + 32) as u8])
+        }
+    }
+}
+
+fn mouse_button_code(button: MouseButton) -> u32 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
     }
 }
 

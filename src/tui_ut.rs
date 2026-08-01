@@ -1,4 +1,17 @@
-use super::Term;
+use super::{dispatch_ui_command, OverlayState, Term};
+
+#[test]
+fn internal_error_creates_a_non_modal_toast() {
+    let mut state = OverlayState::new();
+
+    dispatch_ui_command(&mut state, "error", "show", "bunkerbox-vscomm", "connection failed");
+
+    assert!(state.error_toast.is_some());
+    assert!(!state.popup.visible);
+    let toast = state.error_toast.as_ref().unwrap();
+    assert_eq!(toast.title, "bunkerbox-vscomm");
+    assert_eq!(toast.message, "connection failed");
+}
 
 #[test]
 fn cursor_report_uses_position_after_prior_bytes_in_same_chunk() {

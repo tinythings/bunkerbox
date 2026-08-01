@@ -3,6 +3,7 @@ use crate::logging;
 use crate::proxy::{FilterProxy, UnixProxyHandle};
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
 use crate::vscomm::{validate_exec_request, validate_process_path, validate_process_string, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
+use crate::workspace::WorkspaceCwd;
 use rand::Rng;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -183,12 +184,7 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
 
 async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &VsockSession, req: &ExecRequest) -> Result<(), String> {
     validate_exec_request(req)?;
-    let sandbox_cwd = req.cwd.clone();
-    let host_cwd = if req.cwd.starts_with("/workspace") {
-        session.workspace.join(req.cwd.strip_prefix("/workspace").unwrap_or(&req.cwd).trim_start_matches('/'))
-    } else {
-        PathBuf::from(&req.cwd)
-    };
+    let cwd = WorkspaceCwd::resolve(&session.workspace, Path::new(&req.cwd))?;
 
     let (status_reader, status_writer) = if session.merged_profile.is_some() {
         let (reader, writer) = bwrap_status_pipe()?;
@@ -196,7 +192,7 @@ async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &Vso
     } else {
         (None, None)
     };
-    let mut cmd = build_command(session, req, &host_cwd, &sandbox_cwd)?;
+    let mut cmd = build_command(session, req, &cwd)?;
     if let Some(status_writer) = status_writer.as_ref() {
         attach_bwrap_status_fd(&mut cmd, status_writer.as_raw_fd());
     }
@@ -267,12 +263,12 @@ async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &Vso
     Ok(())
 }
 
-fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, sandbox_cwd: &str) -> Result<Command, String> {
+fn build_command(session: &VsockSession, req: &ExecRequest, cwd: &WorkspaceCwd) -> Result<Command, String> {
     validate_exec_request(req)?;
     validate_process_path("workspace path", &session.workspace)?;
-    validate_process_path("host working directory", host_cwd)?;
-    validate_process_string("sandbox working directory", sandbox_cwd)?;
-
+    validate_process_path("host working directory", cwd.host_path())?;
+    let sandbox_cwd = cwd.guest_path();
+    validate_process_path("sandbox working directory", &sandbox_cwd)?;
     if let Some(ref merged) = session.merged_profile {
         let mut cmd = Command::new("bwrap");
 
@@ -321,10 +317,10 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
         cmd.arg("--dev").arg("/dev");
         cmd.arg("--tmpfs").arg("/tmp");
 
-        if !sandbox_cwd.is_empty() && sandbox_cwd != "/" {
-            cmd.arg("--dir").arg(sandbox_cwd);
+        if sandbox_cwd != Path::new("/") {
+            cmd.arg("--dir").arg(&sandbox_cwd);
         }
-        cmd.arg("--chdir").arg(sandbox_cwd);
+        cmd.arg("--chdir").arg(&sandbox_cwd);
 
         cmd.arg("--clearenv");
         cmd.arg("--setenv").arg("PATH").arg("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
@@ -383,7 +379,7 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
     } else {
         let mut cmd = Command::new(&req.command);
         cmd.args(&req.args);
-        cmd.current_dir(host_cwd);
+        cmd.current_dir(cwd.host_path());
 
         if session.env_mode == EnvMode::Relaxed {
             for (key, val) in &req.env {

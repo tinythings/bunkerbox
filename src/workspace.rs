@@ -3,7 +3,7 @@ use crate::overlay::CowWorkspace;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub fn prepare(reset: bool) -> Result<(), String> {
@@ -16,6 +16,63 @@ pub enum WorkspaceHandle {
     Cow { inner: CowWorkspace },
     Direct { path: PathBuf },
     Isolated { path: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCwd {
+    host: PathBuf,
+    relative: PathBuf,
+}
+
+impl WorkspaceCwd {
+    pub fn resolve(workspace: &Path, guest_cwd: &Path) -> Result<Self, String> {
+        if !guest_cwd.is_absolute() {
+            return Err(format!("working directory must be absolute: {}", guest_cwd.display()));
+        }
+
+        let relative = guest_cwd
+            .strip_prefix(Path::new("/workspace"))
+            .map_err(|_| format!("working directory must be under /workspace: {}", guest_cwd.display()))?
+            .components()
+            .try_fold(PathBuf::new(), |mut relative, component| match component {
+                Component::CurDir => Ok(relative),
+                Component::Normal(name) => {
+                    relative.push(name);
+                    Ok(relative)
+                }
+                Component::ParentDir => Err(format!("working directory contains '..': {}", guest_cwd.display())),
+                Component::RootDir | Component::Prefix(_) => Err(format!("invalid workspace path: {}", guest_cwd.display())),
+            })?;
+
+        let canonical_workspace = fs::canonicalize(workspace).map_err(|err| format!("failed to resolve workspace {}: {err}", workspace.display()))?;
+        let candidate = canonical_workspace.join(&relative);
+        let canonical_host =
+            fs::canonicalize(&candidate).map_err(|err| format!("failed to resolve working directory {}: {err}", guest_cwd.display()))?;
+
+        canonical_host.strip_prefix(&canonical_workspace).map_err(|_| format!("working directory escapes workspace: {}", guest_cwd.display()))?;
+
+        if !fs::metadata(&canonical_host).map(|metadata| metadata.is_dir()).unwrap_or(false) {
+            return Err(format!("working directory is not a directory: {}", guest_cwd.display()));
+        }
+
+        Ok(Self { host: canonical_host, relative })
+    }
+
+    pub fn host_path(&self) -> &Path {
+        &self.host
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        &self.relative
+    }
+
+    pub fn guest_path(&self) -> PathBuf {
+        if self.relative.as_os_str().is_empty() {
+            PathBuf::from("/workspace")
+        } else {
+            Path::new("/workspace").join(&self.relative)
+        }
+    }
 }
 
 impl WorkspaceHandle {
@@ -152,3 +209,7 @@ fn copy_dir(source: &Path, destination: &Path) -> Result<(), String> {
 fn should_skip(name: &OsStr) -> bool {
     matches!(name.to_str(), Some(".bunker") | Some(".bunkerbox") | Some(".git") | Some("target"))
 }
+
+#[cfg(test)]
+#[path = "workspace_ut.rs"]
+mod tests;

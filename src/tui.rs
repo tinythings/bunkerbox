@@ -550,7 +550,9 @@ fn screen_has_ascii_alphanumeric(screen: &vt100::Screen) -> bool {
 ///
 /// `overlay` is shared with the VSOCK status listener so VM-originated
 /// UI commands can update popups, progress bars, and status text.
-pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, overlay: Arc<Mutex<OverlayState>>) -> Result<(), String> {
+pub fn event_loop(
+    master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, startup_status_fd: RawFd, overlay: Arc<Mutex<OverlayState>>,
+) -> Result<(), String> {
     let stdin_fd = io::stdin().as_raw_fd();
 
     let mut stdout = io::stdout();
@@ -569,6 +571,8 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
     let mut last_cols = cols;
 
     let mut status_buf = Vec::new();
+    let mut startup_status_buf = Vec::new();
+    let mut startup_status_fd = startup_status_fd;
     let mut mouse_capture_enabled = false;
 
     unsafe {
@@ -594,9 +598,10 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
             libc::pollfd { fd: master_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: status_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: startup_status_fd, events: libc::POLLIN, revents: 0 },
         ];
 
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, 16) };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 4, 16) };
 
         if ret == -1 {
             let err = io::Error::last_os_error();
@@ -638,6 +643,16 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
             }
         }
 
+        if fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            read_status_messages(status_fd, &mut status_buf, &overlay);
+        }
+        if startup_status_fd >= 0
+            && fds[3].revents & (libc::POLLIN | libc::POLLHUP) != 0
+            && read_status_messages(startup_status_fd, &mut startup_status_buf, &overlay) == 0
+        {
+            startup_status_fd = -1;
+        }
+
         if fds[1].revents & libc::POLLIN != 0 {
             if let Ok(input_event) = event::read() {
                 match input_event {
@@ -663,28 +678,6 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
                         }
                     }
                     _ => {}
-                }
-            }
-        }
-
-        if fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            let mut chunk = [0u8; 256];
-            let n = unsafe { libc::read(status_fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
-            if n > 0 {
-                status_buf.extend_from_slice(&chunk[..n as usize]);
-            }
-            while let Some(pos) = status_buf.iter().position(|&b| b == b'\n') {
-                let line = String::from_utf8_lossy(&status_buf[..pos]).into_owned();
-                status_buf.drain(..=pos);
-                if let Some(cmd) = line.strip_prefix('@') {
-                    if let Some((widget, cmd, opts, val)) = vscomm::decode_ui_payload(cmd.as_bytes()) {
-                        let mut state = overlay.lock().unwrap();
-                        dispatch_ui_command(&mut state, widget, cmd, opts, val);
-                    }
-                } else {
-                    let mut state = overlay.lock().unwrap();
-                    let title = state.popup_title.clone();
-                    state.popup.show_info(title, &line, Some(palette::FG), Some(palette::ACCENT));
                 }
             }
         }
@@ -754,6 +747,34 @@ pub fn event_loop(master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, over
     cleanup_terminal(&mut terminal, mouse_capture_enabled);
 
     Ok(())
+}
+
+fn read_status_messages(fd: RawFd, buffer: &mut Vec<u8>, overlay: &Arc<Mutex<OverlayState>>) -> isize {
+    let mut chunk = [0u8; 256];
+    let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+    if n <= 0 {
+        return 0;
+    }
+    process_status_bytes(buffer, &chunk[..n as usize], overlay);
+    n
+}
+
+fn process_status_bytes(buffer: &mut Vec<u8>, bytes: &[u8], overlay: &Arc<Mutex<OverlayState>>) {
+    buffer.extend_from_slice(bytes);
+    while let Some(pos) = buffer.iter().position(|&byte| byte == b'\n') {
+        let line = String::from_utf8_lossy(&buffer[..pos]).into_owned();
+        buffer.drain(..=pos);
+        if let Some(command) = line.strip_prefix('@') {
+            if let Some((widget, command, options, value)) = vscomm::decode_ui_payload(command.as_bytes()) {
+                let mut state = overlay.lock().unwrap();
+                dispatch_ui_command(&mut state, widget, command, options, value);
+            }
+        } else {
+            let mut state = overlay.lock().unwrap();
+            let title = state.popup_title.clone();
+            state.popup.show_info(title, &line, Some(palette::FG), Some(palette::ACCENT));
+        }
+    }
 }
 
 fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mouse_capture_enabled: bool) {

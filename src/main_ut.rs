@@ -1,4 +1,7 @@
-use super::{decode_workspace_handoff, encode_workspace_handoff};
+use super::{decode_workspace_handoff, encode_workspace_handoff, read_run_handoff, remote_tool_names, write_run_handoff};
+use bunkerbox::vscomm::WorkspaceSessionId;
+use std::fs::File;
+use std::os::fd::FromRawFd;
 use std::path::Path;
 
 #[test]
@@ -21,4 +24,37 @@ fn workspace_handoff_rejects_truncated_payload() {
     let frame = encode_workspace_handoff(b"/workspace/project").unwrap();
 
     assert!(decode_workspace_handoff(&frame[..frame.len() - 1]).is_err());
+}
+
+#[test]
+fn run_handoff_round_trips_path_and_session() {
+    let (parent, child) = unsafe {
+        let mut fds = [-1; 2];
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1]))
+    };
+    let mut child = child;
+    write_run_handoff(&mut child, Path::new("/workspace/project"), WorkspaceSessionId([7; 16])).unwrap();
+    drop(child);
+    let mut parent = parent;
+    let (path, session) = read_run_handoff(&mut parent).unwrap();
+    assert_eq!(path, Path::new("/workspace/project"));
+    assert_eq!(session, WorkspaceSessionId([7; 16]));
+}
+
+#[test]
+fn run_handoff_rejects_zero_session() {
+    let mut payload = b"/workspace/project".to_vec();
+    payload.push(0);
+    payload.extend_from_slice(&[0; 16]);
+    let frame = encode_workspace_handoff(&payload).unwrap();
+    let path = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(path.path(), frame).unwrap();
+    let mut file = File::open(path.path()).unwrap();
+    assert!(read_run_handoff(&mut file).is_err());
+}
+
+#[test]
+fn remote_tool_names_reduce_passthrough_entries_to_executables() {
+    assert_eq!(remote_tool_names(&["make *".into(), "cargo build".into(), "make test".into()]), vec!["cargo", "make"]);
 }

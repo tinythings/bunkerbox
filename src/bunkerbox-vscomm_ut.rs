@@ -1,5 +1,6 @@
-use super::vscomm::{RemoteEvent, RemoteEventKind, RequestId, WorkspaceSessionId};
-use super::{execute_remote_request_to, handle_response, handle_response_to, remote_build_request, Frame, FrameType};
+use super::{handle_response, handle_response_to, Frame, FrameType};
+use bunkerbox::remote_client::{execute_remote_request_to, remote_build_request, remote_sync_request};
+use bunkerbox::vscomm::{Frame as RemoteFrame, RemoteEvent, RemoteEventKind, RequestId, WorkspaceSessionId};
 use std::io::{self, Read, Write};
 
 struct MemoryStream {
@@ -25,7 +26,7 @@ impl Write for FlushWriter {
 }
 
 impl MemoryStream {
-    fn new(frames: Vec<Frame>) -> Self {
+    fn new(frames: Vec<RemoteFrame>) -> Self {
         let mut input = Vec::new();
         for frame in frames {
             frame.write(&mut input).unwrap();
@@ -86,10 +87,10 @@ fn explicit_remote_client_preserves_streams_status_and_request_id() {
     assert_eq!(stdout.flushes, 1);
     assert_eq!(stderr.flushes, 1);
 
-    let sent = Frame::read(&mut io::Cursor::new(stream.output)).unwrap();
-    let decoded = super::vscomm::RemoteRequest::from_frame(sent).unwrap();
+    let sent = RemoteFrame::read(&mut io::Cursor::new(stream.output)).unwrap();
+    let decoded = bunkerbox::vscomm::RemoteRequest::from_frame(sent).unwrap();
     assert_eq!(decoded.request_id, request_id);
-    let super::vscomm::RemoteOperation::Build(build) = decoded.operation else { panic!("expected build") };
+    let bunkerbox::vscomm::RemoteOperation::Build(build) = decoded.operation else { panic!("expected build") };
     assert_eq!(build.cwd.as_str(), "src");
     assert_eq!(build.argv, ["release mode"]);
 }
@@ -97,10 +98,10 @@ fn explicit_remote_client_preserves_streams_status_and_request_id() {
 #[test]
 fn explicit_remote_client_returns_remote_failure_without_local_fallback() {
     let request_id = RequestId([4; 16]);
-    let request = super::remote_sync_request(request_id, WorkspaceSessionId([5; 16]));
+    let request = remote_sync_request(request_id, WorkspaceSessionId([5; 16]));
     let response = RemoteEvent {
         request_id,
-        kind: RemoteEventKind::Error { code: super::vscomm::RemoteErrorCode::Failed, message: "backend unavailable".into() },
+        kind: RemoteEventKind::Error { code: bunkerbox::vscomm::RemoteErrorCode::Failed, message: "backend unavailable".into() },
     };
     let mut stream = MemoryStream::new(vec![response.to_frame().unwrap()]);
 

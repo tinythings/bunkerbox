@@ -4,6 +4,20 @@ fn ids() -> (RequestId, WorkspaceSessionId) {
     (RequestId([1; 16]), WorkspaceSessionId([2; 16]))
 }
 
+#[test]
+fn workspace_session_hex_round_trips_without_accepting_zero() {
+    let session = WorkspaceSessionId([0xab; 16]);
+    assert_eq!(WorkspaceSessionId::from_hex(&session.to_hex()), Ok(session));
+    assert!(WorkspaceSessionId::from_hex(&"0".repeat(32)).is_err());
+}
+
+#[test]
+fn workspace_session_hex_rejects_non_ascii_without_panicking() {
+    let mut value = "0".repeat(30);
+    value.push('\u{00e9}');
+    assert!(WorkspaceSessionId::from_hex(&value).is_err());
+}
+
 fn build(argv: Vec<String>, env: Vec<(String, String)>) -> Result<RemoteBuild, String> {
     RemoteBuild::new(WorkspaceRelativePath::new("src").unwrap(), RemoteTool::new("make").unwrap(), argv, env)
 }

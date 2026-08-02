@@ -1,5 +1,6 @@
-use super::{dispatch_ui_command, mouse_to_bytes, MouseEncoding, MouseTracking, OverlayState, Term};
+use super::{dispatch_ui_command, mouse_to_bytes, process_status_bytes, MouseEncoding, MouseTracking, OverlayState, Term};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn internal_error_creates_a_non_modal_toast() {
@@ -12,6 +13,30 @@ fn internal_error_creates_a_non_modal_toast() {
     let toast = state.error_toast.as_ref().unwrap();
     assert_eq!(toast.title, "bunkerbox-vscomm");
     assert_eq!(toast.message, "connection failed");
+}
+
+#[test]
+fn startup_status_is_processed_before_child_status() {
+    let overlay = Arc::new(Mutex::new(OverlayState::new()));
+    let mut buffer = Vec::new();
+    let mut message = b"@".to_vec();
+    message.extend_from_slice(&crate::vscomm::encode_ui_payload("status", "set", "", "Preparing workspace..."));
+    message.push(b'\n');
+
+    let split = message.len() / 2;
+    process_status_bytes(&mut buffer, &message[..split], &overlay);
+    assert!(!overlay.lock().unwrap().popup.visible);
+    process_status_bytes(&mut buffer, &message[split..], &overlay);
+    assert!(overlay.lock().unwrap().popup.visible);
+}
+
+#[test]
+fn hiding_password_clears_sensitive_popup_state() {
+    let mut state = OverlayState::new();
+    dispatch_ui_command(&mut state, "password", "show", "Password", "Enter password");
+    assert!(state.popup.password_value().is_some());
+    state.popup.hide();
+    assert!(state.popup.password_value().is_none());
 }
 
 #[test]

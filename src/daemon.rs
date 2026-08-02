@@ -1,5 +1,6 @@
 use crate::cfg::EnvMode;
 use crate::logging;
+use crate::loopback::{LoopbackBackend, RunRemoteSession};
 use crate::proxy::{FilterProxy, UnixProxyHandle};
 use crate::remote::{
     RemoteAuthorizationError, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteExecutionContext, RemoteRequest,
@@ -14,7 +15,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
@@ -75,16 +76,6 @@ impl RemoteBroker {
     }
 }
 
-struct UnavailableRemoteBackend;
-
-impl RemoteBackend for UnavailableRemoteBackend {
-    fn execute<'a>(
-        &'a self, _request: crate::remote::AuthorizedRemoteRequest, _events: tokio::sync::mpsc::Sender<RemoteBackendEvent>,
-    ) -> crate::remote::RemoteFuture<'a, Result<(), RemoteBackendError>> {
-        Box::pin(async { Err(RemoteBackendError::Failed("remote backend is unavailable".to_string())) })
-    }
-}
-
 struct VsockSession {
     passthrough: Arc<Vec<String>>,
     env_mode: EnvMode,
@@ -101,9 +92,42 @@ pub struct VsockDaemon {
     sandbox_proxy_dir: Option<PathBuf>,
 }
 
+pub struct RemoteDaemonConfig {
+    session: Arc<RunRemoteSession>,
+    allowed_tools: Vec<String>,
+    tools: std::collections::BTreeMap<String, PathBuf>,
+}
+
+impl RemoteDaemonConfig {
+    pub fn new(session: Arc<RunRemoteSession>, allowed_tools: Vec<String>, tools: std::collections::BTreeMap<String, PathBuf>) -> Self {
+        Self { session, allowed_tools, tools }
+    }
+}
+
+struct RemoteComponents {
+    context: RemoteExecutionContext,
+    policy: RemoteAuthorizationPolicy,
+    backend: Arc<dyn RemoteBackend>,
+}
+
 impl VsockDaemon {
-    pub fn start(
+    pub fn start_with_remote(
         passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, profiles: Vec<String>, share_dir: PathBuf, allow: Vec<String>,
+        remote: RemoteDaemonConfig,
+    ) -> Result<Self, String> {
+        let remote_policy = RemoteAuthorizationPolicy::new(remote.session.target(), remote.session.session_id(), remote.allowed_tools);
+        let remote_context = RemoteExecutionContext { target: remote.session.target(), workspace_session_id: remote.session.session_id() };
+        let remote_components = RemoteComponents {
+            context: remote_context,
+            policy: remote_policy,
+            backend: Arc::new(LoopbackBackend::new(remote.session, remote.tools)),
+        };
+        Self::start_inner(passthrough, env_mode, workspace, profiles, share_dir, allow, remote_components)
+    }
+
+    fn start_inner(
+        passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, profiles: Vec<String>, share_dir: PathBuf, allow: Vec<String>,
+        remote: RemoteComponents,
     ) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -130,7 +154,6 @@ impl VsockDaemon {
             let rt = tokio::runtime::Handle::current();
 
             let netrelay_path = find_netrelay_binary()?;
-            let netrelay_path = find_netrelay_binary()?;
 
             let dir = make_proxy_runtime_dir()?;
             sandbox_proxy_dir = Some(dir.clone());
@@ -143,16 +166,8 @@ impl VsockDaemon {
             proxy_config = Some(SandboxProxyConfig { socket_path, netrelay_path });
         }
 
-        let remote_target = crate::remote::RemoteTargetId([0; 16]);
-        let remote_session = crate::remote::WorkspaceSessionId([0; 16]);
-        let remote_policy = RemoteAuthorizationPolicy::new(remote_target, remote_session, Vec::new());
-        let remote_backend: Arc<dyn RemoteBackend> = Arc::new(UnavailableRemoteBackend);
-        let remote_broker = Arc::new(RemoteBroker::new(
-            remote_policy,
-            RemoteExecutionContext { target: remote_target, workspace_session_id: remote_session },
-            remote_backend,
-        ));
-
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let remote_broker = Arc::new(RemoteBroker::new(remote.policy, remote.context, remote.backend));
         let session = Arc::new(VsockSession {
             passthrough: Arc::new(passthrough),
             env_mode,
@@ -162,18 +177,18 @@ impl VsockDaemon {
             remote_broker,
         });
 
-        let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, TOOLCHAIN_PORT)).map_err(|e| {
+        let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, TOOLCHAIN_PORT)).map_err(|error| {
             if let Some(h) = sandbox_proxy.take() {
                 h.stop();
             }
             if let Some(d) = sandbox_proxy_dir.take() {
                 let _ = std::fs::remove_dir_all(&d);
             }
-            format!("failed to bind toolchain vsock port {TOOLCHAIN_PORT}: {e}")
+            format!("failed to bind toolchain vsock port {TOOLCHAIN_PORT}: {error}")
         })?;
 
         let join_handle = tokio::spawn(async move {
-            let result = daemon_loop(session, listener, shutdown_rx).await;
+            let result = daemon_loop(session, listener, shutdown_rx, connections).await;
             if let Err(err) = result {
                 logging::diagnostic(&format!("bunkerbox: vsock daemon: {err}"));
             }
@@ -196,6 +211,7 @@ impl VsockDaemon {
 
 async fn daemon_loop(
     session: Arc<VsockSession>, listener: tokio_vsock::VsockListener, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) -> Result<(), String> {
     loop {
         tokio::select! {
@@ -203,11 +219,14 @@ async fn daemon_loop(
                 match result {
                     Ok((stream, _peer)) => {
                         let session = session.clone();
-                        tokio::spawn(async move {
+                        let connection = tokio::spawn(async move {
                             if let Err(err) = handle_connection(stream, &session).await {
                                 logging::diagnostic(&format!("bunkerbox: toolchain vsock session failed: {err}"));
                             }
                         });
+                        let mut active = connections.lock().map_err(|_| "connection task lock poisoned".to_string())?;
+                        active.retain(|task| !task.is_finished());
+                        active.push(connection);
                     }
                     Err(e) => {
                         logging::diagnostic(&format!("bunkerbox: vsock accept error: {e}"));
@@ -218,6 +237,14 @@ async fn daemon_loop(
                 break;
             }
         }
+    }
+
+    let tasks = connections.lock().map_err(|_| "connection task lock poisoned".to_string())?.drain(..).collect::<Vec<_>>();
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
     }
 
     Ok(())

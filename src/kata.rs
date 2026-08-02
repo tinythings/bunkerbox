@@ -1,6 +1,6 @@
 use crate::cfg::{HomeMode, NetworkMode, RuntimeConfig};
+use crate::vscomm::WorkspaceSessionId;
 use crate::vscomm::TOOLCHAIN_PORT;
-use crate::workspace::WorkspaceHandle;
 use aes_gcm::aead::consts::U12;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -16,6 +16,11 @@ use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+
+pub struct WorkspaceBinding<'a> {
+    pub path: &'a Path,
+    pub remote_session: WorkspaceSessionId,
+}
 
 const BRIDGE_SUBNET: &str = "10.247.0.0/24";
 const BRIDGE_NAME: &str = "bunkerbox0";
@@ -40,7 +45,7 @@ fn cleanup_partial_session(session_dir: Option<&PathBuf>, home_path: Option<&Pat
 }
 
 pub fn run(
-    config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, _share_dir: &Path, app_name: &str, vsock_enabled: bool,
+    config: &RuntimeConfig, workspace: WorkspaceBinding<'_>, container_name: &str, _share_dir: &Path, app_name: &str, vsock_enabled: bool,
     _status_fd: RawFd,
 ) -> Result<(), String> {
     if !config.oci.is_file() {
@@ -168,7 +173,7 @@ pub fn run(
         ensure_bridge_egress_firewall(config, resolv_conf.as_deref())?;
     }
     let resolv_conf_mount = resolv_conf.as_ref().map(|path| format!("type=bind,src={},dst=/etc/resolv.conf,options=rbind:ro", path.display()));
-    let workspace_mount = format!("type=bind,src={},dst=/workspace,options=rbind:rw", workspace.path().display());
+    let workspace_mount = format!("type=bind,src={},dst=/workspace,options=rbind:rw", workspace.path.display());
     let mut container_env = Vec::new();
     let mut tools_mount: Option<String> = None;
     let init_cmd = String::from("/bunkerbox-tools/init.sh");
@@ -191,6 +196,7 @@ pub fn run(
 
     if vsock_enabled {
         container_env.push(format!("BUNKERBOX_TOOLCHAIN_PORT={TOOLCHAIN_PORT}"));
+        container_env.push(format!("BUNKERBOX_REMOTE_SESSION={}", workspace.remote_session.to_hex()));
     }
 
     if let Some(ref cmds) = config.command {

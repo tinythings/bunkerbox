@@ -69,6 +69,37 @@ pub struct RequestId(pub [u8; 16]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceSessionId(pub [u8; 16]);
 
+impl WorkspaceSessionId {
+    pub fn from_hex(value: &str) -> Result<Self, String> {
+        if value.len() != 32 {
+            return Err("remote session ID must contain 32 hexadecimal characters".to_string());
+        }
+        let mut bytes = [0u8; 16];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let high = hex_digit(value.as_bytes()[index * 2]).ok_or_else(|| "remote session ID is not hexadecimal".to_string())?;
+            let low = hex_digit(value.as_bytes()[index * 2 + 1]).ok_or_else(|| "remote session ID is not hexadecimal".to_string())?;
+            *byte = (high << 4) | low;
+        }
+        if bytes == [0; 16] {
+            return Err("remote session ID must be nonzero".to_string());
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRelativePath(String);
 

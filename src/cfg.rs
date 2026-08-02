@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::remote::{RemoteEnvironmentPolicy, RemoteTool};
 use crate::vscomm::buildsys::{self, PassthroughMode};
 
 pub const DEFAULT_SHARE_DIR: &str = "/usr/share/bunkerbox";
@@ -196,6 +197,23 @@ pub struct ProjectSection {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub passthrough: Vec<String>,
+    #[serde(default)]
+    pub remote: RemoteSection,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RemoteSection {
+    #[serde(default)]
+    pub environment: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<RemoteToolSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteToolSpec {
+    pub name: String,
+    #[serde(default, rename = "allow-args")]
+    pub allow_args: bool,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -238,6 +256,7 @@ impl ProjectConfig {
                 quota: Some("auto".into()),
                 exclude: Vec::new(),
                 passthrough: buildsys::scan(repo_root, PassthroughMode::Relaxed),
+                remote: RemoteSection::default(),
             },
             image: ImageOverrides::default(),
             profiles: Vec::new(),
@@ -256,6 +275,14 @@ impl ProjectConfig {
                         "paranoid env mode: glob patterns are not allowed in passthrough. Found '{entry}'. Use exact command names only."
                     ));
                 }
+            }
+        }
+        RemoteEnvironmentPolicy::from_names(self.project.remote.environment.clone())?;
+        let mut tools = std::collections::BTreeSet::new();
+        for tool in &self.project.remote.tools {
+            RemoteTool::new(tool.name.clone())?;
+            if !tools.insert(tool.name.clone()) {
+                return Err(format!("duplicate remote tool: {}", tool.name));
             }
         }
         Ok(())
@@ -277,7 +304,13 @@ impl ProjectConfig {
                 .map_err(|e| format!("failed to parse legacy {}: {e}", legacy_path.display()))?;
 
         let cfg = ProjectConfig {
-            project: ProjectSection { env: EnvMode::default(), quota: old.quota, exclude: old.exclude, passthrough: old.passthrough },
+            project: ProjectSection {
+                env: EnvMode::default(),
+                quota: old.quota,
+                exclude: old.exclude,
+                passthrough: old.passthrough,
+                remote: RemoteSection::default(),
+            },
             image: ImageOverrides::default(),
             profiles: Vec::new(),
         };
@@ -345,6 +378,26 @@ impl ProjectConfig {
         } else {
             for cmd in pt {
                 y.push_str(&format!("    - \"{cmd}\"\n"));
+            }
+        }
+
+        if !self.project.remote.environment.is_empty() || !self.project.remote.tools.is_empty() {
+            y.push_str("  remote:\n");
+            y.push_str("    environment:\n");
+            if self.project.remote.environment.is_empty() {
+                y.push_str("      []\n");
+            } else {
+                for name in &self.project.remote.environment {
+                    y.push_str(&format!("      - \"{name}\"\n"));
+                }
+            }
+            y.push_str("    tools:\n");
+            if self.project.remote.tools.is_empty() {
+                y.push_str("      []\n");
+            } else {
+                for tool in &self.project.remote.tools {
+                    y.push_str(&format!("      - name: \"{}\"\n        allow-args: {}\n", tool.name, tool.allow_args));
+                }
             }
         }
 

@@ -1,5 +1,6 @@
 use crate::remote::{
-    AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteFuture, RemoteOperation, RemoteTargetId, WorkspaceSessionId,
+    AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteFuture, RemoteOperation, RemoteResourcePolicy,
+    RemoteTargetId, WorkspaceSessionId,
 };
 use crate::snapshot::{SnapshotBuilder, SnapshotHandle, SnapshotStore};
 use std::collections::BTreeMap;
@@ -15,7 +16,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-pub const LOOPBACK_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
+pub const LOOPBACK_BUILD_TIMEOUT: Duration = crate::remote::DEFAULT_REMOTE_BUILD_TIMEOUT;
 const LOOPBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -124,16 +125,34 @@ impl RunRemoteSession {
 pub struct LoopbackBackend {
     session: Arc<RunRemoteSession>,
     tools: Arc<BTreeMap<String, PathBuf>>,
-    timeout: Duration,
+    target_environment: Arc<BTreeMap<String, String>>,
+    resources: RemoteResourcePolicy,
 }
 
 impl LoopbackBackend {
     pub fn new(session: Arc<RunRemoteSession>, tools: BTreeMap<String, PathBuf>) -> Self {
-        Self { session, tools: Arc::new(tools), timeout: LOOPBACK_BUILD_TIMEOUT }
+        Self {
+            session,
+            tools: Arc::new(tools),
+            target_environment: Arc::new(trusted_target_environment()),
+            resources: RemoteResourcePolicy::default(),
+        }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.resources.build_timeout = timeout;
+        self
+    }
+
+    pub fn with_output_limit(mut self, max_output_bytes: u64) -> Self {
+        self.resources.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    pub fn with_target_environment(mut self, environment: BTreeMap<String, String>) -> Self {
+        let mut trusted = trusted_target_environment();
+        trusted.extend(environment);
+        self.target_environment = Arc::new(trusted);
         self
     }
 }
@@ -144,11 +163,12 @@ impl RemoteBackend for LoopbackBackend {
     ) -> RemoteFuture<'a, Result<(), RemoteBackendError>> {
         let session = self.session.clone();
         let tools = self.tools.clone();
-        let timeout = self.timeout;
+        let target_environment = self.target_environment.clone();
+        let resources = self.resources;
         Box::pin(async move {
             match request.request().operation() {
                 RemoteOperation::Sync => execute_sync(session, events).await,
-                RemoteOperation::Build(build) => execute_build(session, tools, timeout, build, events).await,
+                RemoteOperation::Build(build) => execute_build(session, tools, target_environment, resources, build, events).await,
             }
         })
     }
@@ -164,12 +184,9 @@ async fn execute_sync(session: Arc<RunRemoteSession>, events: mpsc::Sender<Remot
 }
 
 async fn execute_build(
-    session: Arc<RunRemoteSession>, tools: Arc<BTreeMap<String, PathBuf>>, timeout_duration: Duration, build: &crate::remote::RemoteBuild,
-    events: mpsc::Sender<RemoteBackendEvent>,
+    session: Arc<RunRemoteSession>, tools: Arc<BTreeMap<String, PathBuf>>, target_environment: Arc<BTreeMap<String, String>>,
+    resources: RemoteResourcePolicy, build: &crate::remote::RemoteBuild, events: mpsc::Sender<RemoteBackendEvent>,
 ) -> Result<(), RemoteBackendError> {
-    if !build.env().is_empty() {
-        return Err(RemoteBackendError::Failed("remote environment is unavailable until remote environment policy is configured".to_string()));
-    }
     let executable = tools
         .get(build.tool().as_str())
         .ok_or_else(|| RemoteBackendError::Spawn(format!("loopback tool is not configured: {}", build.tool().as_str())))?;
@@ -197,7 +214,13 @@ async fn execute_build(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    command.env_clear().env("PATH", LOOPBACK_PATH);
+    command.env_clear();
+    for (key, value) in build.env() {
+        command.env(key, value);
+    }
+    for (key, value) in target_environment.iter() {
+        command.env(key, value);
+    }
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) != 0 {
@@ -211,10 +234,12 @@ async fn execute_build(
     let process_group = child.id().map(|pid| ProcessGroupGuard { pgid: pid as i32, active: true });
     let stdout = child.stdout.take().ok_or_else(|| RemoteBackendError::Failed("loopback child has no stdout".to_string()))?;
     let stderr = child.stderr.take().ok_or_else(|| RemoteBackendError::Failed("loopback child has no stderr".to_string()))?;
-    let mut stdout_task = Box::pin(tokio::spawn(pump(stdout, RemoteStream::Stdout, events.clone())));
-    let mut stderr_task = Box::pin(tokio::spawn(pump(stderr, RemoteStream::Stderr, events.clone())));
+    let output_bytes = Arc::new(AtomicU64::new(0));
+    let mut stdout_task =
+        Box::pin(tokio::spawn(pump(stdout, RemoteStream::Stdout, events.clone(), output_bytes.clone(), resources.max_output_bytes)));
+    let mut stderr_task = Box::pin(tokio::spawn(pump(stderr, RemoteStream::Stderr, events.clone(), output_bytes, resources.max_output_bytes)));
     let mut child_wait = Box::pin(child.wait());
-    let mut timeout_sleep = Box::pin(sleep(timeout_duration));
+    let mut timeout_sleep = Box::pin(sleep(resources.build_timeout));
     let mut child_status = None;
     let mut stdout_done = false;
     let mut stderr_done = false;
@@ -260,7 +285,7 @@ enum RemoteStream {
 }
 
 async fn pump<R: tokio::io::AsyncRead + Unpin>(
-    mut reader: R, stream: RemoteStream, events: mpsc::Sender<RemoteBackendEvent>,
+    mut reader: R, stream: RemoteStream, events: mpsc::Sender<RemoteBackendEvent>, output_bytes: Arc<AtomicU64>, max_output_bytes: u64,
 ) -> Result<(), RemoteBackendError> {
     let mut buffer = [0u8; 8192];
     loop {
@@ -268,12 +293,20 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
         if count == 0 {
             return Ok(());
         }
+        let total = output_bytes.fetch_add(count as u64, Ordering::Relaxed).saturating_add(count as u64);
+        if total > max_output_bytes {
+            return Err(RemoteBackendError::OutputLimit { limit: max_output_bytes });
+        }
         let event = match stream {
             RemoteStream::Stdout => RemoteBackendEvent::Stdout(buffer[..count].to_vec()),
             RemoteStream::Stderr => RemoteBackendEvent::Stderr(buffer[..count].to_vec()),
         };
         events.send(event).await.map_err(|_| RemoteBackendError::Cancelled)?;
     }
+}
+
+fn trusted_target_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([(String::from("PATH"), String::from(LOOPBACK_PATH))])
 }
 
 async fn join_pump(result: Result<Result<(), RemoteBackendError>, tokio::task::JoinError>) -> Result<(), RemoteBackendError> {

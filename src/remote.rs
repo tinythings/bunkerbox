@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub const MAX_REMOTE_STRING_BYTES: usize = 4 * 1024;
@@ -11,6 +13,9 @@ pub const MAX_REMOTE_ARG_BYTES: usize = 4 * 1024;
 pub const MAX_REMOTE_ENV_COUNT: usize = 64;
 pub const MAX_REMOTE_ENV_KEY_BYTES: usize = 256;
 pub const MAX_REMOTE_ENV_VALUE_BYTES: usize = 4 * 1024;
+pub const DEFAULT_REMOTE_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_REMOTE_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_REMOTE_ENVIRONMENT: &[&str] = &["CC", "CXX", "AR", "RUSTFLAGS", "CFLAGS", "CXXFLAGS", "MAKEFLAGS"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestId(pub [u8; 16]);
@@ -51,8 +56,12 @@ impl RemoteTool {
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         validate_string("remote tool", &value, MAX_REMOTE_TOOL_BYTES)?;
-        if value.is_empty() {
-            return Err("remote tool is empty".to_string());
+        if value.is_empty()
+            || value == "."
+            || value == ".."
+            || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+'))
+        {
+            return Err("remote tool must be a single executable identity".to_string());
         }
         Ok(Self(value))
     }
@@ -76,11 +85,8 @@ impl RemoteBuild {
         argv.iter().try_for_each(|arg| validate_string("remote argument", arg, MAX_REMOTE_ARG_BYTES))?;
         validate_count(env.len(), MAX_REMOTE_ENV_COUNT, "remote environment")?;
         env.iter().try_for_each(|(key, value)| {
-            validate_string("remote environment key", key, MAX_REMOTE_ENV_KEY_BYTES)?;
-            if key.is_empty() || key.contains('=') {
-                return Err("remote environment key is invalid".to_string());
-            }
-            validate_string("remote environment value", value, MAX_REMOTE_ENV_VALUE_BYTES)
+            validate_environment_key(key)?;
+            validate_environment_value(value)
         })?;
         Ok(Self { cwd, tool, argv, env })
     }
@@ -99,6 +105,90 @@ impl RemoteBuild {
 
     pub fn env(&self) -> &[(String, String)] {
         &self.env
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteResourcePolicy {
+    pub build_timeout: Duration,
+    pub max_output_bytes: u64,
+}
+
+impl Default for RemoteResourcePolicy {
+    fn default() -> Self {
+        Self { build_timeout: DEFAULT_REMOTE_BUILD_TIMEOUT, max_output_bytes: DEFAULT_REMOTE_OUTPUT_BYTES }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEnvironmentPolicy {
+    allowed: BTreeSet<String>,
+}
+
+impl Default for RemoteEnvironmentPolicy {
+    fn default() -> Self {
+        Self { allowed: DEFAULT_REMOTE_ENVIRONMENT.iter().map(|name| (*name).to_string()).collect() }
+    }
+}
+
+impl RemoteEnvironmentPolicy {
+    pub fn from_names(names: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut policy = Self::default();
+        let mut configured = BTreeSet::new();
+        for name in names {
+            validate_environment_key(&name)?;
+            if forbidden_environment_name(&name) {
+                return Err(format!("remote environment variable is forbidden: {name}"));
+            }
+            if !configured.insert(name.clone()) {
+                return Err(format!("duplicate remote environment variable: {name}"));
+            }
+            policy.allowed.insert(name);
+        }
+        Ok(policy)
+    }
+
+    pub fn allows(&self, name: &str) -> bool {
+        self.allowed.contains(name)
+    }
+
+    pub fn allowed_names(&self) -> impl Iterator<Item = &str> {
+        self.allowed.iter().map(String::as_str)
+    }
+
+    fn filter(&self, environment: &[(String, String)]) -> Result<Vec<(String, String)>, RemoteAuthorizationError> {
+        let mut seen = BTreeSet::new();
+        let mut filtered = Vec::with_capacity(environment.len());
+        for (key, value) in environment {
+            validate_environment_key(key).map_err(RemoteAuthorizationError::InvalidEnvironment)?;
+            validate_environment_value(value).map_err(RemoteAuthorizationError::InvalidEnvironment)?;
+            if forbidden_environment_name(key) {
+                return Err(RemoteAuthorizationError::ForbiddenEnvironment(key.clone()));
+            }
+            if !self.allowed.contains(key) {
+                return Err(RemoteAuthorizationError::EnvironmentNotAllowed(key.clone()));
+            }
+            if !seen.insert(key.clone()) {
+                return Err(RemoteAuthorizationError::DuplicateEnvironment(key.clone()));
+            }
+            filtered.push((key.clone(), value.clone()));
+        }
+        Ok(filtered)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteToolPolicy {
+    allow_arbitrary_argv: bool,
+}
+
+impl RemoteToolPolicy {
+    pub fn new(allow_arbitrary_argv: bool) -> Self {
+        Self { allow_arbitrary_argv }
+    }
+
+    pub fn allows_arbitrary_argv(self) -> bool {
+        self.allow_arbitrary_argv
     }
 }
 
@@ -168,6 +258,11 @@ pub enum RemoteAuthorizationError {
     SessionMismatch,
     TargetNotAllowed,
     ToolNotAllowed(String),
+    ToolArgumentsNotAllowed(String),
+    InvalidEnvironment(String),
+    ForbiddenEnvironment(String),
+    EnvironmentNotAllowed(String),
+    DuplicateEnvironment(String),
 }
 
 impl RemoteAuthorizationError {
@@ -180,12 +275,32 @@ impl RemoteAuthorizationError {
 pub struct RemoteAuthorizationPolicy {
     allowed_target: RemoteTargetId,
     allowed_session: WorkspaceSessionId,
-    allowed_tools: Vec<String>,
+    allowed_tools: BTreeMap<String, RemoteToolPolicy>,
+    environment: RemoteEnvironmentPolicy,
 }
 
 impl RemoteAuthorizationPolicy {
     pub fn new(allowed_target: RemoteTargetId, allowed_session: WorkspaceSessionId, allowed_tools: Vec<String>) -> Self {
-        Self { allowed_target, allowed_session, allowed_tools }
+        let allowed_tools = allowed_tools.into_iter().map(|tool| (tool, RemoteToolPolicy::new(true))).collect();
+        Self { allowed_target, allowed_session, allowed_tools, environment: RemoteEnvironmentPolicy::default() }
+    }
+
+    pub fn from_policies(
+        allowed_target: RemoteTargetId, allowed_session: WorkspaceSessionId, tools: impl IntoIterator<Item = (String, RemoteToolPolicy)>,
+        environment: RemoteEnvironmentPolicy,
+    ) -> Result<Self, String> {
+        let mut allowed_tools = BTreeMap::new();
+        for (tool, policy) in tools {
+            RemoteTool::new(tool.clone())?;
+            if allowed_tools.insert(tool.clone(), policy).is_some() {
+                return Err(format!("duplicate remote tool policy: {tool}"));
+            }
+        }
+        Ok(Self { allowed_target, allowed_session, allowed_tools, environment })
+    }
+
+    pub fn allowed_tools(&self) -> impl Iterator<Item = &str> {
+        self.allowed_tools.keys().map(String::as_str)
     }
 
     pub fn authorize(&self, context: &RemoteExecutionContext, request: RemoteRequest) -> Result<AuthorizedRemoteRequest, RemoteAuthorizationError> {
@@ -196,11 +311,21 @@ impl RemoteAuthorizationPolicy {
             return Err(RemoteAuthorizationError::TargetNotAllowed);
         }
 
-        if let RemoteOperation::Build(build) = request.operation() {
-            if !self.allowed_tools.iter().any(|tool| tool == build.tool().as_str()) {
-                return Err(RemoteAuthorizationError::ToolNotAllowed(build.tool().as_str().to_string()));
+        let request = match request.operation() {
+            RemoteOperation::Sync => request,
+            RemoteOperation::Build(build) => {
+                let Some(tool_policy) = self.allowed_tools.get(build.tool().as_str()).copied() else {
+                    return Err(RemoteAuthorizationError::ToolNotAllowed(build.tool().as_str().to_string()));
+                };
+                if !tool_policy.allows_arbitrary_argv() && !build.argv().is_empty() {
+                    return Err(RemoteAuthorizationError::ToolArgumentsNotAllowed(build.tool().as_str().to_string()));
+                }
+                let environment = self.environment.filter(build.env())?;
+                let filtered = RemoteBuild::new(build.cwd.clone(), build.tool.clone(), build.argv.clone(), environment)
+                    .map_err(RemoteAuthorizationError::InvalidEnvironment)?;
+                RemoteRequest::build(request.request_id, request.workspace_session_id, filtered)
             }
-        }
+        };
 
         Ok(AuthorizedRemoteRequest { request, target: context.target })
     }
@@ -221,6 +346,7 @@ pub enum RemoteBackendError {
     Failed(String),
     Spawn(String),
     Timeout,
+    OutputLimit { limit: u64 },
     Cancelled,
 }
 
@@ -229,6 +355,7 @@ impl RemoteBackendError {
         match self {
             Self::Failed(message) | Self::Spawn(message) => RemoteBackendEvent::Error { message: message.clone() },
             Self::Timeout => RemoteBackendEvent::Error { message: "remote backend timed out".to_string() },
+            Self::OutputLimit { limit } => RemoteBackendEvent::Error { message: format!("remote output exceeded limit of {limit} bytes") },
             Self::Cancelled => RemoteBackendEvent::Cancelled,
         }
     }
@@ -250,6 +377,85 @@ fn validate_string(field: &str, value: &str, max: usize) -> Result<(), String> {
         return Err(format!("{field} exceeds maximum length {max}"));
     }
     Ok(())
+}
+
+fn validate_environment_key(key: &str) -> Result<(), String> {
+    validate_string("remote environment key", key, MAX_REMOTE_ENV_KEY_BYTES)?;
+    let mut characters = key.bytes();
+    let Some(first) = characters.next() else {
+        return Err("remote environment key is empty".to_string());
+    };
+    if !(first == b'_' || first.is_ascii_alphabetic()) || !characters.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()) {
+        return Err("remote environment key is not a valid variable name".to_string());
+    }
+    Ok(())
+}
+
+fn validate_environment_value(value: &str) -> Result<(), String> {
+    validate_string("remote environment value", value, MAX_REMOTE_ENV_VALUE_BYTES)?;
+    if value.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err("remote environment value contains control data".to_string());
+    }
+    Ok(())
+}
+
+fn forbidden_environment_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "SSH_AUTH_SOCK"
+            | "SSH_AGENT_PID"
+            | "GITHUB_TOKEN"
+            | "GITLAB_TOKEN"
+            | "NPM_TOKEN"
+            | "KUBECONFIG"
+            | "HOME"
+            | "CARGO_HOME"
+            | "RUSTUP_HOME"
+            | "XDG_CONFIG_HOME"
+            | "XDG_DATA_HOME"
+            | "PATH"
+            | "PWD"
+            | "OLDPWD"
+            | "TMP"
+            | "TMPDIR"
+            | "TEMP"
+            | "USER"
+            | "LOGNAME"
+            | "SHELL"
+            | "BASH_ENV"
+            | "ENV"
+            | "CDPATH"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "PYTHONPATH"
+            | "PERL5LIB"
+            | "RUBYLIB"
+            | "NODE_PATH"
+            | "GOPATH"
+            | "GOMODCACHE"
+            | "TOKEN"
+            | "PASSWORD"
+            | "PASS"
+            | "SECRET"
+            | "KEY"
+            | "GIT_SSH_COMMAND"
+    ) || upper.starts_with("AWS_")
+        || upper.starts_with("GCP_")
+        || upper.starts_with("GOOGLE_")
+        || upper.starts_with("AZURE_")
+        || upper.starts_with("DOCKER_")
+        || upper.starts_with("CARGO_REGISTRIES_")
+        || upper.starts_with("XDG_")
+        || upper.starts_with("BUNKERBOX_")
+        || upper.ends_with("_PROXY")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_PASSWORD")
+        || upper.ends_with("_PASS")
+        || upper.ends_with("_SECRET")
+        || upper.ends_with("_KEY")
+        || upper.contains("CREDENTIAL")
+        || upper.contains("PRIVATE_KEY")
 }
 
 fn validate_count(count: usize, max: usize, field: &str) -> Result<(), String> {

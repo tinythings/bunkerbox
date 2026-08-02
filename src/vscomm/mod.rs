@@ -131,8 +131,12 @@ impl RemoteTool {
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         validate_remote_string("remote tool", &value, MAX_REMOTE_TOOL_BYTES)?;
-        if value.is_empty() {
-            return Err("remote tool is empty".to_string());
+        if value.is_empty()
+            || value == "."
+            || value == ".."
+            || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+'))
+        {
+            return Err("remote tool must be a single executable identity".to_string());
         }
         Ok(Self(value))
     }
@@ -279,7 +283,8 @@ fn validate_remote_build_fields(cwd: &WorkspaceRelativePath, tool: &RemoteTool, 
     env.iter().try_for_each(|(key, value)| {
         validate_remote_string("remote environment key", key, MAX_REMOTE_ENV_KEY_BYTES)?;
         validate_env_key("remote environment key", key)?;
-        validate_remote_string("remote environment value", value, MAX_REMOTE_ENV_VALUE_BYTES)
+        validate_remote_string("remote environment value", value, MAX_REMOTE_ENV_VALUE_BYTES)?;
+        validate_env_value("remote environment value", value)
     })
 }
 
@@ -294,6 +299,13 @@ fn validate_remote_string(field: &str, value: &str, max: usize) -> Result<(), St
 fn validate_remote_count(count: usize, max: usize, field: &str) -> Result<(), String> {
     if count > max {
         return Err(format!("{field} exceeds maximum count {max}"));
+    }
+    Ok(())
+}
+
+fn validate_env_value(field: &str, value: &str) -> Result<(), String> {
+    if value.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err(format!("{field} contains control data"));
     }
     Ok(())
 }

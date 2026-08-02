@@ -1,4 +1,5 @@
-use bunkerbox::cfg::{ProjectConfig, WorkspaceMode};
+use bunkerbox::cfg::{ProjectConfig, RemoteToolSpec, WorkspaceMode};
+use bunkerbox::remote::{RemoteEnvironmentPolicy, RemoteToolPolicy};
 use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, logging, loopback, overlay, snapshot, tui, vscomm, workspace};
 use rand::RngCore;
 use std::ffi::OsString;
@@ -195,6 +196,10 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     let passthrough = env.project.passthrough.clone();
     let env_mode = env.project.env;
     let profiles = env.profiles.clone();
+    let remote_environment = RemoteEnvironmentPolicy::from_names(env.project.remote.environment.clone())?;
+    let remote_tool_policies =
+        env.project.remote.tools.iter().map(|tool| (tool.name.clone(), RemoteToolPolicy::new(tool.allow_args))).collect::<Vec<_>>();
+    let remote_tool_names = remote_tool_names(&env.project.remote.tools);
     let share_dir_owned = share_dir.to_path_buf();
 
     let mut sock_fds = [-1i32, -1];
@@ -328,8 +333,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
                     snapshot_builder,
                     jobs_root,
                 )?);
-                let allowed_tools = remote_tool_names(&passthrough);
-                let tools = loopback::resolve_fixed_tools(allowed_tools.clone());
+                let tools = loopback::resolve_fixed_tools(remote_tool_names.clone());
                 logging::log("Starting remote daemon...");
                 let daemon = daemon::VsockDaemon::start_with_remote(
                     passthrough,
@@ -338,7 +342,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
                     profiles,
                     share_dir_owned,
                     merged_allow,
-                    daemon::RemoteDaemonConfig::new(session.clone(), allowed_tools, tools),
+                    daemon::RemoteDaemonConfig::new(session.clone(), Vec::new(), tools).with_policy(remote_tool_policies, remote_environment),
                 )?;
                 if let Err(error) = write_run_handoff(&mut setup_parent, workspace.path(), remote_session) {
                     tokio::runtime::Handle::current().block_on(daemon.shutdown());
@@ -415,15 +419,8 @@ fn new_target_id() -> bunkerbox::remote::RemoteTargetId {
     }
 }
 
-fn remote_tool_names(entries: &[String]) -> Vec<String> {
-    let mut names = std::collections::BTreeSet::new();
-    for entry in entries {
-        let command = entry.trim().strip_suffix(" *").unwrap_or(entry.trim());
-        if let Some(tool) = command.split_whitespace().next().filter(|tool| !tool.is_empty() && !tool.contains('/')) {
-            names.insert(tool.to_string());
-        }
-    }
-    names.into_iter().collect()
+fn remote_tool_names(entries: &[RemoteToolSpec]) -> Vec<String> {
+    entries.iter().map(|tool| tool.name.clone()).collect()
 }
 
 fn write_run_handoff(file: &mut File, path: &Path, session_id: vscomm::WorkspaceSessionId) -> Result<(), String> {

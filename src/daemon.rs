@@ -3,7 +3,8 @@ use crate::logging;
 use crate::loopback::{LoopbackBackend, RunRemoteSession};
 use crate::proxy::{FilterProxy, UnixProxyHandle};
 use crate::remote::{
-    RemoteAuthorizationError, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteExecutionContext, RemoteRequest,
+    RemoteAuthorizationError, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteEnvironmentPolicy,
+    RemoteExecutionContext, RemoteRequest, RemoteResourcePolicy, RemoteToolPolicy,
 };
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
 use crate::vscomm::{validate_exec_request, validate_process_path, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
@@ -95,12 +96,40 @@ pub struct VsockDaemon {
 pub struct RemoteDaemonConfig {
     session: Arc<RunRemoteSession>,
     allowed_tools: Vec<String>,
+    tool_policies: Option<Vec<(String, RemoteToolPolicy)>>,
+    environment: Option<RemoteEnvironmentPolicy>,
     tools: std::collections::BTreeMap<String, PathBuf>,
+    target_environment: std::collections::BTreeMap<String, String>,
+    resources: RemoteResourcePolicy,
 }
 
 impl RemoteDaemonConfig {
     pub fn new(session: Arc<RunRemoteSession>, allowed_tools: Vec<String>, tools: std::collections::BTreeMap<String, PathBuf>) -> Self {
-        Self { session, allowed_tools, tools }
+        Self {
+            session,
+            allowed_tools,
+            tool_policies: None,
+            environment: None,
+            tools,
+            target_environment: std::collections::BTreeMap::new(),
+            resources: RemoteResourcePolicy::default(),
+        }
+    }
+
+    pub fn with_policy(mut self, tools: Vec<(String, RemoteToolPolicy)>, environment: RemoteEnvironmentPolicy) -> Self {
+        self.tool_policies = Some(tools);
+        self.environment = Some(environment);
+        self
+    }
+
+    pub fn with_target_environment(mut self, environment: std::collections::BTreeMap<String, String>) -> Self {
+        self.target_environment = environment;
+        self
+    }
+
+    pub fn with_resources(mut self, resources: RemoteResourcePolicy) -> Self {
+        self.resources = resources;
+        self
     }
 }
 
@@ -115,13 +144,20 @@ impl VsockDaemon {
         passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, profiles: Vec<String>, share_dir: PathBuf, allow: Vec<String>,
         remote: RemoteDaemonConfig,
     ) -> Result<Self, String> {
-        let remote_policy = RemoteAuthorizationPolicy::new(remote.session.target(), remote.session.session_id(), remote.allowed_tools);
-        let remote_context = RemoteExecutionContext { target: remote.session.target(), workspace_session_id: remote.session.session_id() };
-        let remote_components = RemoteComponents {
-            context: remote_context,
-            policy: remote_policy,
-            backend: Arc::new(LoopbackBackend::new(remote.session, remote.tools)),
+        let RemoteDaemonConfig { session, allowed_tools, tool_policies, environment, tools, target_environment, resources } = remote;
+        let remote_policy = match (tool_policies, environment) {
+            (Some(tool_policies), Some(environment)) => {
+                RemoteAuthorizationPolicy::from_policies(session.target(), session.session_id(), tool_policies, environment)?
+            }
+            (None, None) => RemoteAuthorizationPolicy::new(session.target(), session.session_id(), allowed_tools),
+            _ => return Err("remote tool and environment policies must be configured together".to_string()),
         };
+        let remote_context = RemoteExecutionContext { target: session.target(), workspace_session_id: session.session_id() };
+        let backend = LoopbackBackend::new(session, tools)
+            .with_target_environment(target_environment)
+            .with_timeout(resources.build_timeout)
+            .with_output_limit(resources.max_output_bytes);
+        let remote_components = RemoteComponents { context: remote_context, policy: remote_policy, backend: Arc::new(backend) };
         Self::start_inner(passthrough, env_mode, workspace, profiles, share_dir, allow, remote_components)
     }
 

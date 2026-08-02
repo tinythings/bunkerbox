@@ -7,6 +7,23 @@ struct MemoryStream {
     output: Vec<u8>,
 }
 
+struct FlushWriter {
+    bytes: Vec<u8>,
+    flushes: usize,
+}
+
+impl Write for FlushWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushes += 1;
+        Ok(())
+    }
+}
+
 impl MemoryStream {
     fn new(frames: Vec<Frame>) -> Self {
         let mut input = Vec::new();
@@ -60,12 +77,14 @@ fn explicit_remote_client_preserves_streams_status_and_request_id() {
         RemoteEvent { request_id, kind: RemoteEventKind::Completed { exit_code: 23 } }.to_frame().unwrap(),
     ];
     let mut stream = MemoryStream::new(responses);
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
+    let mut stdout = FlushWriter { bytes: Vec::new(), flushes: 0 };
+    let mut stderr = FlushWriter { bytes: Vec::new(), flushes: 0 };
 
     assert_eq!(execute_remote_request_to(&mut stream, request, &mut stdout, &mut stderr).unwrap(), 23);
-    assert_eq!(stdout, b"out");
-    assert_eq!(stderr, b"err");
+    assert_eq!(stdout.bytes, b"out");
+    assert_eq!(stderr.bytes, b"err");
+    assert_eq!(stdout.flushes, 1);
+    assert_eq!(stderr.flushes, 1);
 
     let sent = Frame::read(&mut io::Cursor::new(stream.output)).unwrap();
     let decoded = super::vscomm::RemoteRequest::from_frame(sent).unwrap();
@@ -87,4 +106,16 @@ fn explicit_remote_client_returns_remote_failure_without_local_fallback() {
 
     let error = execute_remote_request_to(&mut stream, request, &mut Vec::new(), &mut Vec::new()).unwrap_err();
     assert_eq!(error, "backend unavailable");
+}
+
+#[test]
+fn explicit_remote_client_rejects_mismatched_request_id() {
+    let request_id = RequestId([4; 16]);
+    let response = RemoteEvent { request_id: RequestId([5; 16]), kind: RemoteEventKind::Completed { exit_code: 0 } };
+    let mut stream = MemoryStream::new(vec![response.to_frame().unwrap()]);
+
+    let error =
+        execute_remote_request_to(&mut stream, super::remote_sync_request(request_id, WorkspaceSessionId([5; 16])), &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
+    assert_eq!(error, "remote event request ID mismatch");
 }

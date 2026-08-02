@@ -261,15 +261,32 @@ pub async fn dispatch_remote_frame<W: AsyncWriteExt + Unpin>(frame: Frame, broke
     let request = crate::vscomm::RemoteRequest::from_frame(frame).map_err(|err| format!("decode remote request: {err}"))?.into_domain()?;
     let request_id = request.request_id();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
-    let dispatch_result = broker.dispatch(request, event_tx).await;
+    let mut dispatch = Box::pin(broker.dispatch(request, event_tx));
+    let mut dispatch_result: Option<Result<(), RemoteDispatchError>> = None;
 
-    while let Some(event) = event_rx.recv().await {
-        let response =
-            crate::vscomm::RemoteEvent::from_backend_event(request_id, event).to_frame().map_err(|err| format!("encode remote event: {err}"))?;
-        write_frame(writer, &response).await?;
+    loop {
+        if dispatch_result.is_some() {
+            let Some(event) = event_rx.recv().await else {
+                let result = dispatch_result.take().expect("dispatch result is present");
+                return result.map_err(|err| format!("remote dispatch failed: {err:?}"));
+            };
+            let response =
+                crate::vscomm::RemoteEvent::from_backend_event(request_id, event).to_frame().map_err(|err| format!("encode remote event: {err}"))?;
+            write_frame(writer, &response).await?;
+            continue;
+        }
+
+        tokio::select! {
+            result = &mut dispatch => dispatch_result = Some(result),
+            event = event_rx.recv() => {
+                let Some(event) = event else { return Err("remote event stream closed before backend completion".to_string()) };
+                let response = crate::vscomm::RemoteEvent::from_backend_event(request_id, event)
+                    .to_frame()
+                    .map_err(|err| format!("encode remote event: {err}"))?;
+                write_frame(writer, &response).await?;
+            }
+        }
     }
-
-    dispatch_result.map_err(|err| format!("remote dispatch failed: {err:?}"))
 }
 
 async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &VsockSession, req: &ExecRequest) -> Result<(), String> {

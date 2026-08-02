@@ -2,6 +2,7 @@ use super::{
     decode_workspace_handoff, encode_workspace_handoff, read_run_handoff, read_startup_ready, remote_tool_names, write_run_handoff,
     write_startup_ready,
 };
+use bunkerbox::cfg::RemoteToolSpec;
 use bunkerbox::vscomm::WorkspaceSessionId;
 use std::fs::File;
 use std::os::fd::FromRawFd;
@@ -58,8 +59,11 @@ fn run_handoff_rejects_zero_session() {
 }
 
 #[test]
-fn remote_tool_names_reduce_passthrough_entries_to_executables() {
-    assert_eq!(remote_tool_names(&["make *".into(), "cargo build".into(), "make test".into()]), vec!["cargo", "make"]);
+fn remote_tool_names_preserve_configured_order() {
+    assert_eq!(
+        remote_tool_names(&[RemoteToolSpec { name: "make".into(), allow_args: true }, RemoteToolSpec { name: "cargo".into(), allow_args: false },]),
+        vec!["make", "cargo"]
+    );
 }
 
 #[test]

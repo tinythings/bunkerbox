@@ -63,15 +63,21 @@ async fn sync_and_build_materialize_a_bound_snapshot() {
     assert!(fs::read_dir(&session_state.jobs_root).unwrap().next().is_none());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nonempty_remote_environment_is_rejected() {
-    let (_temp, session, target, session_id) = fixture();
-    let backend = LoopbackBackend::new(session, BTreeMap::new());
-    let (events, _receiver) = mpsc::channel(8);
-    let request = authorized_build(target, session_id, "printf", Vec::new(), vec![("UNTRUSTED".to_string(), "1".to_string())]);
+#[test]
+fn unapproved_remote_environment_is_rejected_before_backend_execution() {
+    let (_temp, _session, target, session_id) = fixture();
+    let build = RemoteBuild::new(
+        WorkspaceRelativePath::new("src").unwrap(),
+        RemoteTool::new("printf").unwrap(),
+        Vec::new(),
+        vec![("UNTRUSTED".to_string(), "1".to_string())],
+    )
+    .unwrap();
+    let request = RemoteRequest::build(RequestId([3; 16]), session_id, build);
+    let policy = RemoteAuthorizationPolicy::new(target, session_id, vec!["printf".to_string()]);
     assert_eq!(
-        backend.execute(request, events).await,
-        Err(RemoteBackendError::Failed("remote environment is unavailable until remote environment policy is configured".to_string(),))
+        policy.authorize(&RemoteExecutionContext { target, workspace_session_id: session_id }, request),
+        Err(crate::remote::RemoteAuthorizationError::EnvironmentNotAllowed("UNTRUSTED".to_string()))
     );
 }
 
@@ -90,6 +96,23 @@ async fn build_preserves_argument_bytes_and_reports_nonzero_stderr() {
     let events = collect_events(receiver).await;
     assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Stderr(bytes) if !bytes.is_empty())));
     assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { exit_code } if *exit_code != 0)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_receives_guest_environment_but_trusted_target_wins() {
+    let (_temp, session, target, session_id) = fixture();
+    session.sync_snapshot().unwrap();
+    let tools = resolve_fixed_tools(["printenv".to_string()]);
+    if tools.is_empty() {
+        return;
+    }
+    let backend = LoopbackBackend::new(session, tools).with_target_environment(BTreeMap::from([("CC".into(), "trusted-target".into())]));
+    let (events, receiver) = mpsc::channel(8);
+    let request = authorized_build(target, session_id, "printenv", vec!["CC".into()], vec![("CC".into(), "guest-value".into())]);
+    assert_eq!(backend.execute(request, events).await, Ok(()));
+    let events = collect_events(receiver).await;
+    assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Stdout(bytes) if bytes == b"trusted-target\n")));
+    assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { exit_code: 0 })));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -113,4 +136,18 @@ async fn timeout_kills_a_direct_child_process() {
     let (events, _receiver) = mpsc::channel(8);
     let request = authorized_build(target, session_id, "sleep", vec!["5".to_string()], Vec::new());
     assert_eq!(backend.execute(request, events).await, Err(RemoteBackendError::Timeout));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_limit_kills_a_flooding_direct_child() {
+    let (_temp, session, target, session_id) = fixture();
+    session.sync_snapshot().unwrap();
+    let tools = resolve_fixed_tools(["printf".to_string()]);
+    if tools.is_empty() {
+        return;
+    }
+    let backend = LoopbackBackend::new(session, tools).with_output_limit(8);
+    let (events, _receiver) = mpsc::channel(8);
+    let request = authorized_build(target, session_id, "printf", vec!["0123456789".into()], Vec::new());
+    assert_eq!(backend.execute(request, events).await, Err(RemoteBackendError::OutputLimit { limit: 8 }));
 }

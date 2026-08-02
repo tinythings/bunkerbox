@@ -487,3 +487,22 @@ fn load_or_create_accepts_paranoid_exact() {
     write_project_conf(root.path(), "project:\n  env: paranoid\n  passthrough:\n    - \"make\"\n    - \"cargo\"\n");
     assert!(ProjectConfig::load_or_create(root.path()).is_ok());
 }
+
+#[test]
+fn load_or_create_validates_remote_policy_configuration() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(
+        root.path(),
+        "project:\n  remote:\n    environment:\n      - PROJECT_MODE\n    tools:\n      - name: make\n        allow-args: false\n",
+    );
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+    assert_eq!(cfg.project.remote.environment, vec!["PROJECT_MODE"]);
+    assert_eq!(cfg.project.remote.tools, vec![RemoteToolSpec { name: "make".into(), allow_args: false }]);
+}
+
+#[test]
+fn load_or_create_rejects_forbidden_remote_environment() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(root.path(), "project:\n  remote:\n    environment:\n      - SSH_AUTH_SOCK\n");
+    assert!(ProjectConfig::load_or_create(root.path()).is_err());
+}

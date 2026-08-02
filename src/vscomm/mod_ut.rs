@@ -194,6 +194,12 @@ fn oversized_environment_key_and_value_are_rejected() {
 }
 
 #[test]
+fn control_data_in_remote_environment_value_is_rejected() {
+    assert!(build(Vec::new(), vec![("CC".into(), "bad\nvalue".into())]).is_err());
+    assert!(RemoteRequest::from_frame(raw_build_frame(0, None, 1, Some(("CC", "bad\nvalue")))).is_err());
+}
+
+#[test]
 fn invalid_remote_cwd_is_rejected() {
     assert!(WorkspaceRelativePath::new("/absolute").is_err());
     assert!(WorkspaceRelativePath::new("foo/../bar").is_err());

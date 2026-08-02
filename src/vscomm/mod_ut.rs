@@ -199,3 +199,27 @@ fn existing_exec_request_wire_format_is_unchanged() {
     assert_eq!(decoded.args, request.args);
     assert_eq!(decoded.env, request.env);
 }
+
+#[test]
+fn protocol_request_converts_to_transport_independent_domain_request() {
+    let request = RemoteRequest::build(ids().0, ids().1, build(vec!["--release".into()], vec![("MODE".into(), "debug".into())]).unwrap());
+    let domain = request.into_domain().unwrap();
+
+    assert_eq!(domain.request_id(), crate::remote::RequestId([1; 16]));
+    let crate::remote::RemoteOperation::Build(build) = domain.operation() else { panic!("expected build") };
+    assert_eq!(build.cwd().as_str(), "src");
+    assert_eq!(build.tool().as_str(), "make");
+    assert_eq!(build.argv(), ["--release"]);
+    assert_eq!(build.env(), [("MODE".into(), "debug".into())]);
+}
+
+#[test]
+fn backend_events_convert_to_protocol_events_without_transport_in_backend() {
+    let request_id = crate::remote::RequestId([7; 16]);
+    let event = RemoteEvent::from_backend_event(request_id, crate::remote::RemoteBackendEvent::Stdout(b"out".to_vec()));
+    assert_eq!(event.request_id, RequestId([7; 16]));
+    assert_eq!(event.kind, RemoteEventKind::Stdout(b"out".to_vec()));
+
+    let event = RemoteEvent::from_backend_event(request_id, crate::remote::RemoteBackendEvent::Completed { exit_code: 3 });
+    assert_eq!(event.kind, RemoteEventKind::Completed { exit_code: 3 });
+}

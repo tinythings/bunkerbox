@@ -1,6 +1,9 @@
 use crate::cfg::EnvMode;
 use crate::logging;
 use crate::proxy::{FilterProxy, UnixProxyHandle};
+use crate::remote::{
+    RemoteAuthorizationError, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteExecutionContext, RemoteRequest,
+};
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
 use crate::vscomm::{validate_exec_request, validate_process_path, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
 use crate::workspace::WorkspaceCwd;
@@ -17,8 +20,14 @@ use tokio::process::Command;
 
 const BWRAP_STATUS_FD: RawFd = 3;
 
+#[derive(Clone, Copy)]
+enum ProcessStream {
+    Stdout,
+    Stderr,
+}
+
 enum ChildEvent {
-    Output(FrameType, Vec<u8>),
+    Output(ProcessStream, Vec<u8>),
     StreamClosed,
     LauncherStarted,
     LauncherFailed(String),
@@ -28,6 +37,36 @@ enum ChildEvent {
 struct SandboxProxyConfig {
     socket_path: PathBuf,
     netrelay_path: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoteDispatchError {
+    Unauthorized(RemoteAuthorizationError),
+    Backend(RemoteBackendError),
+    EventSinkClosed,
+}
+
+pub struct RemoteBroker {
+    policy: RemoteAuthorizationPolicy,
+    context: RemoteExecutionContext,
+    backend: Arc<dyn RemoteBackend>,
+}
+
+impl RemoteBroker {
+    pub fn new(policy: RemoteAuthorizationPolicy, context: RemoteExecutionContext, backend: Arc<dyn RemoteBackend>) -> Self {
+        Self { policy, context, backend }
+    }
+
+    pub async fn dispatch(&self, request: RemoteRequest, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>) -> Result<(), RemoteDispatchError> {
+        let authorized = self.policy.authorize(&self.context, request).map_err(RemoteDispatchError::Unauthorized)?;
+        match self.backend.execute(authorized, events.clone()).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                events.send(error.event()).await.map_err(|_| RemoteDispatchError::EventSinkClosed)?;
+                Err(RemoteDispatchError::Backend(error))
+            }
+        }
+    }
 }
 
 struct VsockSession {
@@ -209,8 +248,8 @@ async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &Vso
     let child_stderr = child.stderr.take().ok_or_else(|| "no stderr".to_string())?;
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let stdout_task = tokio::spawn(pump_to_channel(child_stdout, FrameType::Stdout, event_tx.clone()));
-    let stderr_task = tokio::spawn(pump_to_channel(child_stderr, FrameType::Stderr, event_tx.clone()));
+    let stdout_task = tokio::spawn(pump_to_channel(child_stdout, ProcessStream::Stdout, event_tx.clone()));
+    let stderr_task = tokio::spawn(pump_to_channel(child_stderr, ProcessStream::Stderr, event_tx.clone()));
     let status_task = status_reader.map(|reader| {
         let status_tx = event_tx.clone();
         tokio::task::spawn_blocking(move || monitor_bwrap_status(reader, status_tx))
@@ -224,26 +263,26 @@ async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &Vso
     while closed_streams < 2 || (session.merged_profile.is_some() && !launcher_started && !launcher_failed) {
         let Some(event) = event_rx.recv().await else { break };
         match event {
-            ChildEvent::Output(frame_type, data) if launcher_failed => {
-                let stream = if matches!(frame_type, FrameType::Stdout) { "bwrap stdout" } else { "bwrap stderr" };
+            ChildEvent::Output(stream_kind, data) if launcher_failed => {
+                let stream = if matches!(stream_kind, ProcessStream::Stdout) { "bwrap stdout" } else { "bwrap stderr" };
                 logging::diagnostic_bytes(stream, &data);
             }
-            ChildEvent::Output(frame_type, data) if launcher_started => {
-                write_frame(writer, &Frame::new(frame_type, data)).await?;
+            ChildEvent::Output(stream_kind, data) if launcher_started => {
+                write_frame(writer, &Frame::new(process_stream_frame_type(stream_kind), data)).await?;
             }
-            ChildEvent::Output(frame_type, data) => buffered_output.push((frame_type, data)),
+            ChildEvent::Output(stream_kind, data) => buffered_output.push((stream_kind, data)),
             ChildEvent::StreamClosed => closed_streams += 1,
             ChildEvent::LauncherStarted => {
                 launcher_started = true;
-                for (frame_type, data) in buffered_output.drain(..) {
-                    write_frame(writer, &Frame::new(frame_type, data)).await?;
+                for (stream_kind, data) in buffered_output.drain(..) {
+                    write_frame(writer, &Frame::new(process_stream_frame_type(stream_kind), data)).await?;
                 }
             }
             ChildEvent::LauncherFailed(err) => {
                 launcher_failed = true;
                 logging::diagnostic(&format!("bwrap setup failed: {err}"));
-                for (frame_type, data) in buffered_output.drain(..) {
-                    let stream = if matches!(frame_type, FrameType::Stdout) { "bwrap stdout" } else { "bwrap stderr" };
+                for (stream_kind, data) in buffered_output.drain(..) {
+                    let stream = if matches!(stream_kind, ProcessStream::Stdout) { "bwrap stdout" } else { "bwrap stderr" };
                     logging::diagnostic_bytes(stream, &data);
                 }
             }
@@ -514,13 +553,13 @@ fn monitor_bwrap_status(reader: File, tx: tokio::sync::mpsc::UnboundedSender<Chi
     }
 }
 
-async fn pump_to_channel<R: AsyncReadExt + Unpin>(mut reader: R, frame_type: FrameType, tx: tokio::sync::mpsc::UnboundedSender<ChildEvent>) {
+async fn pump_to_channel<R: AsyncReadExt + Unpin>(mut reader: R, stream_kind: ProcessStream, tx: tokio::sync::mpsc::UnboundedSender<ChildEvent>) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                if tx.send(ChildEvent::Output(frame_type, buf[..n].to_vec())).is_err() {
+                if tx.send(ChildEvent::Output(stream_kind, buf[..n].to_vec())).is_err() {
                     return;
                 }
             }
@@ -528,6 +567,13 @@ async fn pump_to_channel<R: AsyncReadExt + Unpin>(mut reader: R, frame_type: Fra
         }
     }
     let _ = tx.send(ChildEvent::StreamClosed);
+}
+
+fn process_stream_frame_type(stream: ProcessStream) -> FrameType {
+    match stream {
+        ProcessStream::Stdout => FrameType::Stdout,
+        ProcessStream::Stderr => FrameType::Stderr,
+    }
 }
 
 async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, frame: &Frame) -> Result<(), String> {

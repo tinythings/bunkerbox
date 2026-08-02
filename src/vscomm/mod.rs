@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use crate::remote as remote_domain;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -188,6 +189,20 @@ impl RemoteRequest {
         let request = Self { request_id, workspace_session_id, operation };
         reader.finish()?;
         Ok(request)
+    }
+
+    pub fn into_domain(self) -> Result<remote_domain::RemoteRequest, String> {
+        let request_id = remote_domain::RequestId(self.request_id.0);
+        let session_id = remote_domain::WorkspaceSessionId(self.workspace_session_id.0);
+        match self.operation {
+            RemoteOperation::Sync(_) => Ok(remote_domain::RemoteRequest::sync(request_id, session_id)),
+            RemoteOperation::Build(build) => {
+                let cwd = remote_domain::WorkspaceRelativePath::new(build.cwd.as_str())?;
+                let tool = remote_domain::RemoteTool::new(build.tool.as_str())?;
+                let build = remote_domain::RemoteBuild::new(cwd, tool, build.argv, build.env)?;
+                Ok(remote_domain::RemoteRequest::build(request_id, session_id, build))
+            }
+        }
     }
 }
 
@@ -440,6 +455,21 @@ pub struct RemoteEvent {
 }
 
 impl RemoteEvent {
+    pub fn from_backend_event(request_id: remote_domain::RequestId, event: remote_domain::RemoteBackendEvent) -> Self {
+        let request_id = RequestId(request_id.0);
+        let kind = match event {
+            remote_domain::RemoteBackendEvent::SyncProgress { completed_bytes, total_bytes } => {
+                RemoteEventKind::SyncProgress { completed_bytes, total_bytes }
+            }
+            remote_domain::RemoteBackendEvent::Stdout(data) => RemoteEventKind::Stdout(data),
+            remote_domain::RemoteBackendEvent::Stderr(data) => RemoteEventKind::Stderr(data),
+            remote_domain::RemoteBackendEvent::Error { message } => RemoteEventKind::Error { code: RemoteErrorCode::Failed, message },
+            remote_domain::RemoteBackendEvent::Cancelled => RemoteEventKind::Cancelled,
+            remote_domain::RemoteBackendEvent::Completed { exit_code } => RemoteEventKind::Completed { exit_code },
+        };
+        Self { request_id, kind }
+    }
+
     pub fn to_frame(&self) -> Result<Frame, String> {
         let mut writer = WireWriter::new(*b"BBE1");
         writer.u16(REMOTE_PROTOCOL_VERSION);

@@ -1,3 +1,5 @@
+#[path = "../remote.rs"]
+mod remote;
 #[path = "../vscomm/mod.rs"]
 mod vscomm;
 

@@ -8,6 +8,7 @@ pub mod logging;
 pub mod netrelay;
 pub mod overlay;
 pub mod proxy;
+pub mod remote;
 pub mod sandbox;
 pub mod tui;
 pub mod vscomm;

@@ -170,6 +170,12 @@ pub enum RemoteAuthorizationError {
     ToolNotAllowed(String),
 }
 
+impl RemoteAuthorizationError {
+    pub fn event(&self) -> RemoteBackendEvent {
+        RemoteBackendEvent::Error { message: format!("remote authorization rejected: {self:?}") }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAuthorizationPolicy {
     allowed_target: RemoteTargetId,

@@ -58,7 +58,13 @@ impl RemoteBroker {
     }
 
     pub async fn dispatch(&self, request: RemoteRequest, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>) -> Result<(), RemoteDispatchError> {
-        let authorized = self.policy.authorize(&self.context, request).map_err(RemoteDispatchError::Unauthorized)?;
+        let authorized = match self.policy.authorize(&self.context, request) {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                events.send(error.event()).await.map_err(|_| RemoteDispatchError::EventSinkClosed)?;
+                return Err(RemoteDispatchError::Unauthorized(error));
+            }
+        };
         match self.backend.execute(authorized, events.clone()).await {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -69,12 +75,23 @@ impl RemoteBroker {
     }
 }
 
+struct UnavailableRemoteBackend;
+
+impl RemoteBackend for UnavailableRemoteBackend {
+    fn execute<'a>(
+        &'a self, _request: crate::remote::AuthorizedRemoteRequest, _events: tokio::sync::mpsc::Sender<RemoteBackendEvent>,
+    ) -> crate::remote::RemoteFuture<'a, Result<(), RemoteBackendError>> {
+        Box::pin(async { Err(RemoteBackendError::Failed("remote backend is unavailable".to_string())) })
+    }
+}
+
 struct VsockSession {
     passthrough: Arc<Vec<String>>,
     env_mode: EnvMode,
     workspace: PathBuf,
     merged_profile: Option<Arc<MergedProfile>>,
     proxy_config: Option<Arc<SandboxProxyConfig>>,
+    remote_broker: Arc<RemoteBroker>,
 }
 
 pub struct VsockDaemon {
@@ -113,6 +130,7 @@ impl VsockDaemon {
             let rt = tokio::runtime::Handle::current();
 
             let netrelay_path = find_netrelay_binary()?;
+            let netrelay_path = find_netrelay_binary()?;
 
             let dir = make_proxy_runtime_dir()?;
             sandbox_proxy_dir = Some(dir.clone());
@@ -125,12 +143,23 @@ impl VsockDaemon {
             proxy_config = Some(SandboxProxyConfig { socket_path, netrelay_path });
         }
 
+        let remote_target = crate::remote::RemoteTargetId([0; 16]);
+        let remote_session = crate::remote::WorkspaceSessionId([0; 16]);
+        let remote_policy = RemoteAuthorizationPolicy::new(remote_target, remote_session, Vec::new());
+        let remote_backend: Arc<dyn RemoteBackend> = Arc::new(UnavailableRemoteBackend);
+        let remote_broker = Arc::new(RemoteBroker::new(
+            remote_policy,
+            RemoteExecutionContext { target: remote_target, workspace_session_id: remote_session },
+            remote_backend,
+        ));
+
         let session = Arc::new(VsockSession {
             passthrough: Arc::new(passthrough),
             env_mode,
             workspace,
             merged_profile,
             proxy_config: proxy_config.map(Arc::new),
+            remote_broker,
         });
 
         let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, TOOLCHAIN_PORT)).map_err(|e| {
@@ -197,7 +226,14 @@ async fn daemon_loop(
 async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSession) -> Result<(), String> {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    let req = read_exec_request(&mut reader).await?;
+    let frame = Frame::read_async(&mut reader).await.map_err(|e| format!("read frame: {e}"))?;
+    if matches!(frame.frame_type, FrameType::RemoteRequest) {
+        return dispatch_remote_frame(frame, &session.remote_broker, &mut writer).await;
+    }
+    if !matches!(frame.frame_type, FrameType::ExecReq) {
+        return Err(format!("expected ExecReq or RemoteRequest, got {:?}", frame.frame_type as u16));
+    }
+    let req = ExecRequest::deserialize(&frame.payload)?;
 
     if let Err(err) = validate_exec_request(&req) {
         logging::diagnostic(&format!("bunkerbox-vscomm: invalid request: {err}"));
@@ -219,6 +255,21 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     }
 
     Ok(())
+}
+
+pub async fn dispatch_remote_frame<W: AsyncWriteExt + Unpin>(frame: Frame, broker: &RemoteBroker, writer: &mut W) -> Result<(), String> {
+    let request = crate::vscomm::RemoteRequest::from_frame(frame).map_err(|err| format!("decode remote request: {err}"))?.into_domain()?;
+    let request_id = request.request_id();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let dispatch_result = broker.dispatch(request, event_tx).await;
+
+    while let Some(event) = event_rx.recv().await {
+        let response =
+            crate::vscomm::RemoteEvent::from_backend_event(request_id, event).to_frame().map_err(|err| format!("encode remote event: {err}"))?;
+        write_frame(writer, &response).await?;
+    }
+
+    dispatch_result.map_err(|err| format!("remote dispatch failed: {err:?}"))
 }
 
 async fn execute_request<W: AsyncWriteExt + Unpin>(writer: &mut W, session: &VsockSession, req: &ExecRequest) -> Result<(), String> {
@@ -478,15 +529,6 @@ fn is_allowed(passthrough: &[String], command: &str, args: &[String]) -> bool {
         }
     }
     false
-}
-
-async fn read_exec_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<ExecRequest, String> {
-    let frame = Frame::read_async(reader).await.map_err(|e| format!("read frame: {e}"))?;
-    if !matches!(frame.frame_type, FrameType::ExecReq) {
-        return Err(format!("expected ExecReq, got {:?}", frame.frame_type as u16));
-    }
-
-    ExecRequest::deserialize(&frame.payload)
 }
 
 fn bwrap_status_pipe() -> Result<(File, File), String> {

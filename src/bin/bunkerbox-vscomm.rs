@@ -10,7 +10,10 @@ use std::mem;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use vscomm::{encode_ui_payload, validate_exec_request, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT, TUI_STATUS_PORT, VSCOMM_BIN_DIR};
+use vscomm::{
+    encode_ui_payload, validate_exec_request, ExecRequest, Frame, FrameType, RemoteBuild, RemoteEvent, RemoteEventKind, RemoteRequest, RemoteTool,
+    RequestId, WorkspaceRelativePath, WorkspaceSessionId, TOOLCHAIN_PORT, TUI_STATUS_PORT, VSCOMM_BIN_DIR,
+};
 
 const HOST_CID: u32 = 2;
 
@@ -82,6 +85,37 @@ fn handle_response_to<WOut: Write, WErr: Write>(response: Frame, stdout: &mut WO
             Ok(Some(code))
         }
         _ => Err(format!("unexpected frame type from host: {:?}", response.frame_type as u16)),
+    }
+}
+
+pub fn remote_sync_request(request_id: RequestId, session_id: WorkspaceSessionId) -> RemoteRequest {
+    RemoteRequest::sync(request_id, session_id)
+}
+
+pub fn remote_build_request(
+    request_id: RequestId, session_id: WorkspaceSessionId, cwd: impl Into<String>, tool: impl Into<String>, argv: Vec<String>,
+    env: Vec<(String, String)>,
+) -> Result<RemoteRequest, String> {
+    let build = RemoteBuild::new(WorkspaceRelativePath::new(cwd)?, RemoteTool::new(tool)?, argv, env)?;
+    Ok(RemoteRequest::build(request_id, session_id, build))
+}
+
+pub fn execute_remote_request_to<S: Read + Write, WOut: Write, WErr: Write>(
+    stream: &mut S, request: RemoteRequest, stdout: &mut WOut, stderr: &mut WErr,
+) -> Result<i32, String> {
+    request.to_frame()?.write(stream).map_err(|e| format!("send remote request: {e}"))?;
+
+    loop {
+        let frame = Frame::read(stream).map_err(|e| format!("read remote event: {e}"))?;
+        let event = RemoteEvent::from_frame(frame)?;
+        match event.kind {
+            RemoteEventKind::SyncProgress { .. } => {}
+            RemoteEventKind::Stdout(data) => stdout.write_all(&data).map_err(|e| format!("stdout: {e}"))?,
+            RemoteEventKind::Stderr(data) => stderr.write_all(&data).map_err(|e| format!("stderr: {e}"))?,
+            RemoteEventKind::Error { message, .. } => return Err(message),
+            RemoteEventKind::Cancelled => return Err("remote operation cancelled".to_string()),
+            RemoteEventKind::Completed { exit_code } => return Ok(exit_code),
+        }
     }
 }
 

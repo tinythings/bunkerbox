@@ -16,5 +16,6 @@ kata-static-*.tar.zst
 /demo/kilocode/kilo
 /demo/netdebug/netdebug
 /demo/opencode/opencode
+/demo/goose/goose
 .bunkerbox/
 demo/crush/crush

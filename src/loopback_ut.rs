@@ -99,6 +99,51 @@ async fn build_preserves_argument_bytes_and_reports_nonzero_stderr() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_exit_does_not_wait_for_inherited_output_pipes() {
+    let (_temp, session, target, session_id) = fixture();
+    fs::write(session.workspace_root().join("src/Makefile"), ".PHONY: leak\nleak:\n\t@sleep 30 & echo $$!\n\t@printf 'direct-output\\n'\n").unwrap();
+    session.sync_snapshot().unwrap();
+    let tools = resolve_fixed_tools(["make".to_string()]);
+    if tools.is_empty() {
+        return;
+    }
+
+    let backend = LoopbackBackend::new(session.clone(), tools);
+    let (events, receiver) = mpsc::channel(16);
+    let request = authorized_build(target, session_id, "make", vec!["leak".into()], Vec::new());
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(1), backend.execute(request, events)).await.unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    let events = collect_events(receiver).await;
+    let stdout = events
+        .iter()
+        .filter_map(|event| match event {
+            RemoteBackendEvent::Stdout(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(stdout.windows(b"direct-output\n".len()).any(|window| window == b"direct-output\n"));
+    let pid = std::str::from_utf8(&stdout).unwrap().split_whitespace().find_map(|value| value.parse::<libc::pid_t>().ok()).unwrap();
+
+    let terminal_events = events
+        .iter()
+        .filter(|event| matches!(event, RemoteBackendEvent::Error { .. } | RemoteBackendEvent::Cancelled | RemoteBackendEvent::Completed { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_events, vec![&RemoteBackendEvent::Completed { exit_code: 0 }]);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while super::process_is_alive(pid) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!super::process_is_alive(pid));
+    assert!(fs::read_dir(&session.jobs_root).unwrap().next().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_receives_guest_environment_but_trusted_target_wins() {
     let (_temp, session, target, session_id) = fixture();
     session.sync_snapshot().unwrap();

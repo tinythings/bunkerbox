@@ -37,3 +37,4 @@ make install-image OCI=path/to/image.oci
 | `opencode.conf` | [OpenCode](https://github.com/anomalyco/opencode) | `bunkerbox-opencode-1.17.18.oci` |
 | `kilocode.conf` | [KiloCode](https://github.com/Kilo-Org/kilocode) | `bunkerbox-kilocode-7.4.11.oci` |
 | `crush.conf` | [Crush](https://github.com/charmbracelet/crush) | `bunkerbox-crush-0.84.1.oci` |
+| `goose.conf` | [Goose](https://github.com/aaif-goose/goose) | `bunkerbox-goose-1.45.0.oci` |

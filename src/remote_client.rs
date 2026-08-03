@@ -9,6 +9,10 @@ pub fn remote_sync_request(request_id: RequestId, session_id: WorkspaceSessionId
     RemoteRequest::sync(request_id, session_id)
 }
 
+pub fn remote_diagnostic_sync_request(request_id: RequestId, session_id: WorkspaceSessionId) -> RemoteRequest {
+    RemoteRequest::diagnostic_sync(request_id, session_id)
+}
+
 pub fn remote_session_from_env() -> Result<WorkspaceSessionId, String> {
     env::var("BUNKERBOX_REMOTE_SESSION")
         .map_err(|_| "BUNKERBOX_REMOTE_SESSION is missing".to_string())

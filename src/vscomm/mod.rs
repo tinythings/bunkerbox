@@ -76,6 +76,11 @@ impl RemoteSnapshotId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteSync {
+    pub retain_capability: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceSessionId(pub [u8; 16]);
 
 impl WorkspaceSessionId {
@@ -182,9 +187,6 @@ pub enum RemoteOperation {
     Build(RemoteBuild),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RemoteSync;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRequest {
     pub request_id: RequestId,
@@ -194,7 +196,15 @@ pub struct RemoteRequest {
 
 impl RemoteRequest {
     pub fn sync(request_id: RequestId, workspace_session_id: WorkspaceSessionId) -> Self {
-        Self { request_id, workspace_session_id, operation: RemoteOperation::Sync(RemoteSync) }
+        Self::sync_with_capability(request_id, workspace_session_id, true)
+    }
+
+    pub fn diagnostic_sync(request_id: RequestId, workspace_session_id: WorkspaceSessionId) -> Self {
+        Self::sync_with_capability(request_id, workspace_session_id, false)
+    }
+
+    fn sync_with_capability(request_id: RequestId, workspace_session_id: WorkspaceSessionId, retain_capability: bool) -> Self {
+        Self { request_id, workspace_session_id, operation: RemoteOperation::Sync(RemoteSync { retain_capability }) }
     }
 
     pub fn build(request_id: RequestId, workspace_session_id: WorkspaceSessionId, build: RemoteBuild) -> Self {
@@ -214,6 +224,8 @@ impl RemoteRequest {
 
         if let RemoteOperation::Build(build) = &self.operation {
             encode_remote_build(&mut writer, build)?;
+        } else if let RemoteOperation::Sync(sync) = &self.operation {
+            writer.u8(u8::from(sync.retain_capability));
         }
 
         writer.into_frame(FrameType::RemoteRequest)
@@ -232,7 +244,14 @@ impl RemoteRequest {
         let request_id = RequestId(reader.array16()?);
         let workspace_session_id = WorkspaceSessionId(reader.array16()?);
         let operation = match operation_kind {
-            1 => RemoteOperation::Sync(RemoteSync),
+            1 => {
+                let retain_capability = match reader.u8()? {
+                    0 => false,
+                    1 => true,
+                    value => return Err(format!("invalid remote sync capability flag: {value}")),
+                };
+                RemoteOperation::Sync(RemoteSync { retain_capability })
+            }
             2 => RemoteOperation::Build(decode_remote_build(&mut reader)?),
             value => return Err(format!("unknown remote operation: {value}")),
         };
@@ -245,7 +264,13 @@ impl RemoteRequest {
         let request_id = remote_domain::RequestId(self.request_id.0);
         let session_id = remote_domain::WorkspaceSessionId(self.workspace_session_id.0);
         match self.operation {
-            RemoteOperation::Sync(_) => Ok(remote_domain::RemoteRequest::sync(request_id, session_id)),
+            RemoteOperation::Sync(sync) => {
+                if sync.retain_capability {
+                    Ok(remote_domain::RemoteRequest::sync(request_id, session_id))
+                } else {
+                    Ok(remote_domain::RemoteRequest::diagnostic_sync(request_id, session_id))
+                }
+            }
             RemoteOperation::Build(build) => {
                 let cwd = remote_domain::WorkspaceRelativePath::new(build.cwd.as_str())?;
                 let tool = remote_domain::RemoteTool::new(build.tool.as_str())?;

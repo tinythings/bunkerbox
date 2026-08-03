@@ -61,6 +61,24 @@ async fn sync_capability(backend: &LoopbackBackend, target: RemoteTargetId, sess
         .unwrap()
 }
 
+async fn diagnostic_sync(backend: &LoopbackBackend, target: RemoteTargetId, session: WorkspaceSessionId) -> Vec<RemoteBackendEvent> {
+    let request = RemoteRequest::diagnostic_sync(RequestId([5; 16]), session);
+    let policy = RemoteAuthorizationPolicy::new(target, session, Vec::new());
+    let authorized = policy.authorize(&RemoteExecutionContext { target, workspace_session_id: session }, request).unwrap();
+    let (events, receiver) = mpsc::channel(8);
+    assert_eq!(backend.execute(authorized, events).await, Ok(()));
+    collect_events(receiver).await
+}
+
+fn published_snapshot_count(session: &RunRemoteSession) -> usize {
+    fs::read_dir(session.snapshot_store_root())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name() != ".staging")
+        .map(|entry| fs::read_dir(entry.path()).map(|entries| entries.filter_map(Result::ok).count()).unwrap_or_default())
+        .sum()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_and_build_materialize_a_bound_snapshot() {
     let (_temp, session, target, session_id) = fixture();
@@ -93,6 +111,56 @@ async fn sync_and_build_materialize_a_bound_snapshot() {
         vec![RemoteBackendEvent::Stdout(b"value with spaces:$(literal)".to_vec()), RemoteBackendEvent::Completed { exit_code: 0 },]
     );
     assert!(fs::read_dir(&session_state.jobs_root).unwrap().next().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostic_sync_releases_capability_and_snapshot_storage() {
+    let (_temp, session, target, session_id) = fixture();
+    let backend = LoopbackBackend::new(session.clone(), BTreeMap::new());
+
+    for _ in 0..(MAX_OUTSTANDING_SNAPSHOT_CAPABILITIES * 2) {
+        let events = diagnostic_sync(&backend, target, session_id).await;
+        assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { exit_code: 0 })));
+        assert!(!events.iter().any(|event| matches!(event, RemoteBackendEvent::SyncCompleted { .. })));
+        assert!(session.snapshot_capabilities.lock().unwrap().capabilities.is_empty());
+        assert_eq!(published_snapshot_count(&session), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_diagnostic_sync_registers_nothing() {
+    let (_temp, session, target, session_id) = fixture();
+    fs::remove_dir_all(session.workspace_root()).unwrap();
+    let backend = LoopbackBackend::new(session.clone(), BTreeMap::new());
+    let request = RemoteRequest::diagnostic_sync(RequestId([5; 16]), session_id);
+    let policy = RemoteAuthorizationPolicy::new(target, session_id, Vec::new());
+    let authorized = policy.authorize(&RemoteExecutionContext { target, workspace_session_id: session_id }, request).unwrap();
+    let (events, _receiver) = mpsc::channel(8);
+
+    assert!(matches!(backend.execute(authorized, events).await, Err(RemoteBackendError::Failed(_))));
+    assert!(session.snapshot_capabilities.lock().unwrap().capabilities.is_empty());
+    assert_eq!(published_snapshot_count(&session), 0);
+}
+
+#[test]
+fn outstanding_snapshot_capabilities_are_bounded_and_consumption_frees_a_slot() {
+    let (temp, session, _target, _session_id) = fixture();
+    let mut capabilities = Vec::new();
+    for _ in 0..MAX_OUTSTANDING_SNAPSHOT_CAPABILITIES {
+        capabilities.push(session.sync_snapshot().unwrap());
+    }
+    assert_eq!(session.snapshot_capabilities.lock().unwrap().capabilities.len(), MAX_OUTSTANDING_SNAPSHOT_CAPABILITIES);
+    assert!(session.sync_snapshot().unwrap_err().contains("capability limit reached"));
+
+    let claim = session.claim_snapshot(capabilities.pop().unwrap()).unwrap();
+    drop(claim);
+    assert_eq!(session.snapshot_capabilities.lock().unwrap().capabilities.len(), MAX_OUTSTANDING_SNAPSHOT_CAPABILITIES - 1);
+    session.sync_snapshot().unwrap();
+
+    let snapshot_root = session.snapshot_store_root();
+    drop(session);
+    assert!(!snapshot_root.exists());
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

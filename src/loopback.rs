@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 pub const LOOPBACK_BUILD_TIMEOUT: Duration = crate::remote::DEFAULT_REMOTE_BUILD_TIMEOUT;
+pub const MAX_OUTSTANDING_SNAPSHOT_CAPABILITIES: usize = 16;
 const LOOPBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const POST_CHILD_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const POST_CHILD_EXIT_FINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -80,13 +81,35 @@ impl RunRemoteSession {
     }
 
     pub fn sync_snapshot(&self) -> Result<RemoteSnapshotId, String> {
+        self.sync_snapshot_for_request(true)?.ok_or_else(|| "retained snapshot capability was not created".to_string())
+    }
+
+    fn sync_snapshot_for_request(&self, retain_capability: bool) -> Result<Option<RemoteSnapshotId>, String> {
         let _operation = self.snapshot_operation.lock().map_err(|_| "remote session operation lock poisoned".to_string())?;
         let snapshot = self.snapshot_builder.build_root(&self.workspace_root, self.session_id)?;
-        self.register_snapshot(snapshot.handle().clone())
+        let handle = snapshot.handle().clone();
+        if !retain_capability {
+            self.discard_unclaimed_snapshot(&handle)?;
+            return Ok(None);
+        }
+
+        match self.register_snapshot(handle.clone()) {
+            Ok(snapshot_id) => Ok(Some(snapshot_id)),
+            Err(error) => {
+                let cleanup = self.discard_unclaimed_snapshot(&handle);
+                if let Err(cleanup_error) = cleanup {
+                    return Err(format!("{error}; snapshot cleanup failed: {cleanup_error}"));
+                }
+                Err(error)
+            }
+        }
     }
 
     fn register_snapshot(&self, handle: SnapshotHandle) -> Result<RemoteSnapshotId, String> {
         let mut registry = self.snapshot_capabilities.lock().map_err(|_| "remote snapshot registry lock poisoned".to_string())?;
+        if registry.capabilities.len() >= MAX_OUTSTANDING_SNAPSHOT_CAPABILITIES {
+            return Err(format!("remote snapshot capability limit reached ({MAX_OUTSTANDING_SNAPSHOT_CAPABILITIES})"));
+        }
         let snapshot_id = loop {
             let mut bytes = [0u8; 16];
             rand::thread_rng().fill_bytes(&mut bytes);
@@ -98,6 +121,16 @@ impl RunRemoteSession {
         registry.capabilities.insert(snapshot_id, handle.clone());
         *registry.references.entry(handle).or_insert(0) += 1;
         Ok(snapshot_id)
+    }
+
+    fn discard_unclaimed_snapshot(&self, handle: &SnapshotHandle) -> Result<(), String> {
+        let referenced =
+            self.snapshot_capabilities.lock().map_err(|_| "remote snapshot registry lock poisoned".to_string())?.references.contains_key(handle);
+        if referenced {
+            Ok(())
+        } else {
+            self.snapshot_store.remove(handle)
+        }
     }
 
     fn claim_snapshot(self: &Arc<Self>, snapshot_id: RemoteSnapshotId) -> Result<SnapshotClaim, String> {
@@ -243,20 +276,24 @@ impl RemoteBackend for LoopbackBackend {
         let resources = self.resources;
         Box::pin(async move {
             match request.request().operation() {
-                RemoteOperation::Sync => execute_sync(session, events).await,
+                RemoteOperation::Sync(sync) => execute_sync(session, sync.retain_capability(), events).await,
                 RemoteOperation::Build(build) => execute_build(session, tools, target_environment, resources, build, events).await,
             }
         })
     }
 }
 
-async fn execute_sync(session: Arc<RunRemoteSession>, events: mpsc::Sender<RemoteBackendEvent>) -> Result<(), RemoteBackendError> {
+async fn execute_sync(
+    session: Arc<RunRemoteSession>, retain_capability: bool, events: mpsc::Sender<RemoteBackendEvent>,
+) -> Result<(), RemoteBackendError> {
     send_event(&events, RemoteBackendEvent::SyncProgress { completed_bytes: 0, total_bytes: None }).await?;
-    let sync = tokio::task::spawn_blocking(move || session.sync_snapshot())
+    let sync = tokio::task::spawn_blocking(move || session.sync_snapshot_for_request(retain_capability))
         .await
         .map_err(|error| RemoteBackendError::Failed(format!("snapshot worker failed: {error}")))?;
-    let snapshot_id = sync.map_err(RemoteBackendError::Failed)?;
-    send_event(&events, RemoteBackendEvent::SyncCompleted { snapshot_id }).await
+    match sync.map_err(RemoteBackendError::Failed)? {
+        Some(snapshot_id) => send_event(&events, RemoteBackendEvent::SyncCompleted { snapshot_id }).await,
+        None => send_event(&events, RemoteBackendEvent::Completed { exit_code: 0 }).await,
+    }
 }
 
 async fn execute_build(

@@ -220,9 +220,20 @@ impl RemoteToolPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteSync {
+    retain_capability: bool,
+}
+
+impl RemoteSync {
+    pub fn retain_capability(self) -> bool {
+        self.retain_capability
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteOperation {
-    Sync,
+    Sync(RemoteSync),
     Build(RemoteBuild),
 }
 
@@ -235,7 +246,15 @@ pub struct RemoteRequest {
 
 impl RemoteRequest {
     pub fn sync(request_id: RequestId, workspace_session_id: WorkspaceSessionId) -> Self {
-        Self { request_id, workspace_session_id, operation: RemoteOperation::Sync }
+        Self::sync_with_capability(request_id, workspace_session_id, true)
+    }
+
+    pub fn diagnostic_sync(request_id: RequestId, workspace_session_id: WorkspaceSessionId) -> Self {
+        Self::sync_with_capability(request_id, workspace_session_id, false)
+    }
+
+    fn sync_with_capability(request_id: RequestId, workspace_session_id: WorkspaceSessionId, retain_capability: bool) -> Self {
+        Self { request_id, workspace_session_id, operation: RemoteOperation::Sync(RemoteSync { retain_capability }) }
     }
 
     pub fn build(request_id: RequestId, workspace_session_id: WorkspaceSessionId, build: RemoteBuild) -> Self {
@@ -351,7 +370,7 @@ impl RemoteAuthorizationPolicy {
         }
 
         let request = match request.operation() {
-            RemoteOperation::Sync => request,
+            RemoteOperation::Sync(_) => request,
             RemoteOperation::Build(build) => {
                 if self.snapshot_authority.as_ref().is_none_or(|authority| !authority.snapshot_available(self.allowed_session, build.snapshot_id())) {
                     return Err(RemoteAuthorizationError::SnapshotNotAllowed);

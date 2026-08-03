@@ -3,6 +3,7 @@ pub mod cfgsetup;
 pub mod clidef;
 pub mod cmdrun;
 pub mod daemon;
+pub mod guest_install;
 pub mod kata;
 pub mod logging;
 pub mod netrelay;

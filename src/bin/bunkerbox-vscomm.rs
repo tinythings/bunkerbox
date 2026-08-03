@@ -7,9 +7,9 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::mem;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use bunkerbox::guest_install::install_vscomm_links;
 pub use bunkerbox::remote_client::{execute_remote_request_to, remote_build_request, remote_sync_request};
 use vscomm::{encode_ui_payload, validate_exec_request, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT, TUI_STATUS_PORT, VSCOMM_BIN_DIR};
 
@@ -101,27 +101,10 @@ fn install_symlinks() -> Result<(), String> {
     let config_path = find_config().ok_or_else(|| "no whitelist config found".to_string())?;
 
     let entries = read_whitelist_entries(&config_path)?;
-
-    fs::create_dir_all(VSCOMM_BIN_DIR).map_err(|e| format!("mkdir {VSCOMM_BIN_DIR}: {e}"))?;
-
     let vscomm_path = env::current_exe().map_err(|e| format!("failed to locate vscomm binary: {e}"))?;
-
-    for entry in &entries {
-        let cmd = extract_command_name(entry);
-        if cmd.is_empty() {
-            continue;
-        }
-        if command_exists_in_path_except(&cmd, &vscomm_path) {
-            continue;
-        }
-        let target = PathBuf::from(VSCOMM_BIN_DIR).join(&cmd);
-        if target.exists() {
-            let _ = fs::remove_file(&target);
-        }
-        std::os::unix::fs::symlink(&vscomm_path, &target).map_err(|e| format!("symlink {cmd}: {e}"))?;
-    }
-
-    Ok(())
+    let commands = entries.iter().map(|entry| extract_command_name(entry));
+    let path = env::var("PATH").unwrap_or_default();
+    install_vscomm_links(commands, Path::new(VSCOMM_BIN_DIR), &vscomm_path, &path)
 }
 
 fn find_config() -> Option<PathBuf> {
@@ -178,27 +161,6 @@ fn extract_command_name(entry: &str) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-fn command_exists_in_path_except(cmd: &str, except: &Path) -> bool {
-    if let Ok(path) = env::var("PATH") {
-        for dir in path.split(':') {
-            let candidate = Path::new(dir).join(cmd);
-            if candidate == except {
-                continue;
-            }
-            if candidate.is_file() {
-                let metadata = match fs::metadata(&candidate) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if metadata.permissions().mode() & 0o111 != 0 {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 fn vsock_connect(cid: u32, port: u32) -> io::Result<VsockStream> {

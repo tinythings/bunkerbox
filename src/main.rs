@@ -197,8 +197,10 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     let env_mode = env.project.env;
     let profiles = env.profiles.clone();
     let remote_environment = RemoteEnvironmentPolicy::from_names(env.project.remote.environment.clone())?;
+    let remote_environment_names = remote_environment.allowed_names().map(str::to_string).collect::<Vec<_>>();
     let remote_tool_policies =
         env.project.remote.tools.iter().map(|tool| (tool.name.clone(), RemoteToolPolicy::new(tool.allow_args))).collect::<Vec<_>>();
+    let configured_remote_tool_names = env.project.remote.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
     let remote_tool_names = remote_tool_names(&env.project.remote.tools);
     let share_dir_owned = share_dir.to_path_buf();
 
@@ -242,7 +244,12 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
         let (workspace_path, remote_session) = read_run_handoff(&mut setup_child)?;
         let code = match kata::run(
             &config,
-            kata::WorkspaceBinding { path: &workspace_path, remote_session },
+            kata::WorkspaceBinding {
+                path: &workspace_path,
+                remote_session,
+                remote_tools: &remote_tool_names,
+                remote_environment: &remote_environment_names,
+            },
             &container_name,
             share_dir,
             &name,
@@ -333,7 +340,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
                     snapshot_builder,
                     jobs_root,
                 )?);
-                let tools = loopback::resolve_fixed_tools(remote_tool_names.clone());
+                let tools = loopback::resolve_fixed_tools(configured_remote_tool_names.clone());
                 logging::log("Starting remote daemon...");
                 let daemon = daemon::VsockDaemon::start_with_remote(
                     passthrough,
@@ -420,7 +427,7 @@ fn new_target_id() -> bunkerbox::remote::RemoteTargetId {
 }
 
 fn remote_tool_names(entries: &[RemoteToolSpec]) -> Vec<String> {
-    entries.iter().map(|tool| tool.name.clone()).collect()
+    entries.iter().filter(|tool| tool.name == "make").map(|tool| tool.name.clone()).collect()
 }
 
 fn write_run_handoff(file: &mut File, path: &Path, session_id: vscomm::WorkspaceSessionId) -> Result<(), String> {

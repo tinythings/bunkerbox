@@ -17,7 +17,7 @@ pub const TUI_STATUS_PORT: u32 = 10000;
 pub const VSCOMM_BIN_DIR: &str = "/usr/local/bunkerbox/bin";
 /// Maximum payload accepted in one vsock frame.
 pub const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
-pub const REMOTE_PROTOCOL_VERSION: u16 = 1;
+pub const REMOTE_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_REMOTE_STRING_BYTES: usize = 4 * 1024;
 pub const MAX_REMOTE_TOOL_BYTES: usize = 256;
 pub const MAX_REMOTE_ARG_COUNT: usize = 256;
@@ -65,6 +65,15 @@ pub struct ExecRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestId(pub [u8; 16]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RemoteSnapshotId(pub [u8; 16]);
+
+impl RemoteSnapshotId {
+    pub fn is_zero(self) -> bool {
+        self.0 == [0; 16]
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceSessionId(pub [u8; 16]);
@@ -152,12 +161,18 @@ pub struct RemoteBuild {
     pub tool: RemoteTool,
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub snapshot_id: RemoteSnapshotId,
 }
 
 impl RemoteBuild {
-    pub fn new(cwd: WorkspaceRelativePath, tool: RemoteTool, argv: Vec<String>, env: Vec<(String, String)>) -> Result<Self, String> {
+    pub fn new(
+        cwd: WorkspaceRelativePath, tool: RemoteTool, argv: Vec<String>, env: Vec<(String, String)>, snapshot_id: RemoteSnapshotId,
+    ) -> Result<Self, String> {
         validate_remote_build_fields(&cwd, &tool, &argv, &env)?;
-        Ok(Self { cwd, tool, argv, env })
+        if snapshot_id.is_zero() {
+            return Err("remote snapshot ID must be nonzero".to_string());
+        }
+        Ok(Self { cwd, tool, argv, env, snapshot_id })
     }
 }
 
@@ -234,7 +249,8 @@ impl RemoteRequest {
             RemoteOperation::Build(build) => {
                 let cwd = remote_domain::WorkspaceRelativePath::new(build.cwd.as_str())?;
                 let tool = remote_domain::RemoteTool::new(build.tool.as_str())?;
-                let build = remote_domain::RemoteBuild::new(cwd, tool, build.argv, build.env)?;
+                let snapshot_id = remote_domain::RemoteSnapshotId::from_bytes(build.snapshot_id.0);
+                let build = remote_domain::RemoteBuild::new(cwd, tool, build.argv, build.env, snapshot_id)?;
                 Ok(remote_domain::RemoteRequest::build(request_id, session_id, build))
             }
         }
@@ -243,8 +259,12 @@ impl RemoteRequest {
 
 fn encode_remote_build(writer: &mut WireWriter, build: &RemoteBuild) -> Result<(), String> {
     validate_remote_build_fields(&build.cwd, &build.tool, &build.argv, &build.env)?;
+    if build.snapshot_id.is_zero() {
+        return Err("remote snapshot ID must be nonzero".to_string());
+    }
     writer.string(build.cwd.as_str(), MAX_REMOTE_STRING_BYTES, "remote cwd")?;
     writer.string(build.tool.as_str(), MAX_REMOTE_TOOL_BYTES, "remote tool")?;
+    writer.bytes(&build.snapshot_id.0);
     writer.count(build.argv.len(), MAX_REMOTE_ARG_COUNT, "remote argv")?;
     for arg in &build.argv {
         writer.string(arg, MAX_REMOTE_ARG_BYTES, "remote argument")?;
@@ -260,6 +280,7 @@ fn encode_remote_build(writer: &mut WireWriter, build: &RemoteBuild) -> Result<(
 fn decode_remote_build(reader: &mut WireReader<'_>) -> Result<RemoteBuild, String> {
     let cwd = WorkspaceRelativePath::new(reader.string(MAX_REMOTE_STRING_BYTES, "remote cwd")?)?;
     let tool = RemoteTool::new(reader.string(MAX_REMOTE_TOOL_BYTES, "remote tool")?)?;
+    let snapshot_id = RemoteSnapshotId(reader.array16()?);
     let argv = (0..reader.count(MAX_REMOTE_ARG_COUNT, "remote argv")?)
         .map(|_| reader.string(MAX_REMOTE_ARG_BYTES, "remote argument"))
         .collect::<Result<Vec<_>, _>>()?;
@@ -271,7 +292,7 @@ fn decode_remote_build(reader: &mut WireReader<'_>) -> Result<RemoteBuild, Strin
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    RemoteBuild::new(cwd, tool, argv, env)
+    RemoteBuild::new(cwd, tool, argv, env, snapshot_id)
 }
 
 fn validate_remote_build_fields(cwd: &WorkspaceRelativePath, tool: &RemoteTool, argv: &[String], env: &[(String, String)]) -> Result<(), String> {
@@ -484,6 +505,7 @@ impl RemoteErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteEventKind {
     SyncProgress { completed_bytes: u64, total_bytes: Option<u64> },
+    SyncCompleted { snapshot_id: RemoteSnapshotId },
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Error { code: RemoteErrorCode, message: String },
@@ -504,6 +526,9 @@ impl RemoteEvent {
             remote_domain::RemoteBackendEvent::SyncProgress { completed_bytes, total_bytes } => {
                 RemoteEventKind::SyncProgress { completed_bytes, total_bytes }
             }
+            remote_domain::RemoteBackendEvent::SyncCompleted { snapshot_id } => {
+                RemoteEventKind::SyncCompleted { snapshot_id: RemoteSnapshotId(snapshot_id.as_bytes().to_owned()) }
+            }
             remote_domain::RemoteBackendEvent::Stdout(data) => RemoteEventKind::Stdout(data),
             remote_domain::RemoteBackendEvent::Stderr(data) => RemoteEventKind::Stderr(data),
             remote_domain::RemoteBackendEvent::Error { message } => RemoteEventKind::Error { code: RemoteErrorCode::Failed, message },
@@ -518,6 +543,7 @@ impl RemoteEvent {
         writer.u16(REMOTE_PROTOCOL_VERSION);
         writer.u8(match &self.kind {
             RemoteEventKind::SyncProgress { .. } => 1,
+            RemoteEventKind::SyncCompleted { .. } => 7,
             RemoteEventKind::Stdout(_) => 2,
             RemoteEventKind::Stderr(_) => 3,
             RemoteEventKind::Error { .. } => 4,
@@ -534,6 +560,12 @@ impl RemoteEvent {
                 if let Some(total_bytes) = total_bytes {
                     writer.u64(*total_bytes);
                 }
+            }
+            RemoteEventKind::SyncCompleted { snapshot_id } => {
+                if snapshot_id.is_zero() {
+                    return Err("remote snapshot ID must be nonzero".to_string());
+                }
+                writer.bytes(&snapshot_id.0);
             }
             RemoteEventKind::Stdout(data) | RemoteEventKind::Stderr(data) => writer.blob(data, MAX_FRAME_PAYLOAD, "remote output")?,
             RemoteEventKind::Error { code, message } => {
@@ -567,6 +599,13 @@ impl RemoteEvent {
                     value => return Err(format!("invalid remote progress total flag: {value}")),
                 };
                 RemoteEventKind::SyncProgress { completed_bytes, total_bytes }
+            }
+            7 => {
+                let snapshot_id = RemoteSnapshotId(reader.array16()?);
+                if snapshot_id.is_zero() {
+                    return Err("remote snapshot ID must be nonzero".to_string());
+                }
+                RemoteEventKind::SyncCompleted { snapshot_id }
             }
             2 => RemoteEventKind::Stdout(reader.blob(MAX_FRAME_PAYLOAD, "remote stdout")?),
             3 => RemoteEventKind::Stderr(reader.blob(MAX_FRAME_PAYLOAD, "remote stderr")?),

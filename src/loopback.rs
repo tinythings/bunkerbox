@@ -1,9 +1,10 @@
 use crate::remote::{
     AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteFuture, RemoteOperation, RemoteResourcePolicy,
-    RemoteTargetId, WorkspaceSessionId,
+    RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTargetId, WorkspaceSessionId,
 };
 use crate::snapshot::{SnapshotBuilder, SnapshotHandle, SnapshotStore};
-use std::collections::BTreeMap;
+use rand::RngCore;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -28,7 +29,7 @@ pub struct RunRemoteSession {
     workspace_root: PathBuf,
     snapshot_store: SnapshotStore,
     snapshot_builder: SnapshotBuilder,
-    current_snapshot: Mutex<Option<SnapshotHandle>>,
+    snapshot_capabilities: Mutex<SnapshotCapabilityRegistry>,
     snapshot_operation: Mutex<()>,
     jobs_root: PathBuf,
 }
@@ -56,7 +57,7 @@ impl RunRemoteSession {
             workspace_root,
             snapshot_store,
             snapshot_builder,
-            current_snapshot: Mutex::new(None),
+            snapshot_capabilities: Mutex::new(SnapshotCapabilityRegistry::default()),
             snapshot_operation: Mutex::new(()),
             jobs_root,
         })
@@ -78,26 +79,59 @@ impl RunRemoteSession {
         self.snapshot_store.clone()
     }
 
-    pub fn current_snapshot(&self) -> Result<Option<SnapshotHandle>, String> {
-        self.current_snapshot.lock().map(|current| current.clone()).map_err(|_| "remote session state lock poisoned".to_string())
-    }
-
-    pub fn sync_snapshot(&self) -> Result<SnapshotHandle, String> {
+    pub fn sync_snapshot(&self) -> Result<RemoteSnapshotId, String> {
         let _operation = self.snapshot_operation.lock().map_err(|_| "remote session operation lock poisoned".to_string())?;
         let snapshot = self.snapshot_builder.build_root(&self.workspace_root, self.session_id)?;
-        let new_handle = snapshot.handle().clone();
-        let old_handle = self.current_snapshot()?.clone();
-        if let Some(old_handle) = old_handle.filter(|old| old != &new_handle) {
-            self.snapshot_store.remove(&old_handle)?;
-        }
-        self.current_snapshot.lock().map_err(|_| "remote session state lock poisoned".to_string())?.replace(new_handle.clone());
-        Ok(new_handle)
+        self.register_snapshot(snapshot.handle().clone())
     }
 
-    fn materialize_current_snapshot(&self, destination: &Path) -> Result<(), String> {
+    fn register_snapshot(&self, handle: SnapshotHandle) -> Result<RemoteSnapshotId, String> {
+        let mut registry = self.snapshot_capabilities.lock().map_err(|_| "remote snapshot registry lock poisoned".to_string())?;
+        let snapshot_id = loop {
+            let mut bytes = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut bytes);
+            let candidate = RemoteSnapshotId::from_bytes(bytes);
+            if !candidate.is_zero() && !registry.capabilities.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        registry.capabilities.insert(snapshot_id, handle.clone());
+        *registry.references.entry(handle).or_insert(0) += 1;
+        Ok(snapshot_id)
+    }
+
+    fn claim_snapshot(self: &Arc<Self>, snapshot_id: RemoteSnapshotId) -> Result<SnapshotClaim, String> {
+        let mut registry = self.snapshot_capabilities.lock().map_err(|_| "remote snapshot registry lock poisoned".to_string())?;
+        let handle = registry.capabilities.remove(&snapshot_id).ok_or_else(|| "remote snapshot capability is unavailable".to_string())?;
+        Ok(SnapshotClaim { session: self.clone(), handle })
+    }
+
+    fn release_snapshot(&self, handle: &SnapshotHandle) {
+        let should_remove = self
+            .snapshot_capabilities
+            .lock()
+            .ok()
+            .map(|mut registry| {
+                let Some(references) = registry.references.get_mut(handle) else {
+                    return false;
+                };
+                *references = references.saturating_sub(1);
+                if *references == 0 {
+                    registry.references.remove(handle);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if should_remove {
+            let _ = self.snapshot_store.remove(handle);
+        }
+    }
+
+    fn materialize_snapshot(&self, handle: &SnapshotHandle, destination: &Path) -> Result<(), String> {
         let _operation = self.snapshot_operation.lock().map_err(|_| "remote session operation lock poisoned".to_string())?;
-        let handle = self.current_snapshot()?.ok_or_else(|| "remote build requires a successful sync".to_string())?;
-        self.snapshot_store.materialize(&handle, destination).map(|_| ())
+        self.snapshot_store.materialize(handle, destination).map(|_| ())
     }
 
     fn new_job_path(&self) -> Result<PathBuf, String> {
@@ -106,6 +140,46 @@ impl RunRemoteSession {
             return Err("loopback job path already exists".to_string());
         }
         Ok(path)
+    }
+}
+
+#[derive(Default)]
+struct SnapshotCapabilityRegistry {
+    capabilities: BTreeMap<RemoteSnapshotId, SnapshotHandle>,
+    references: HashMap<SnapshotHandle, usize>,
+}
+
+struct SnapshotClaim {
+    session: Arc<RunRemoteSession>,
+    handle: SnapshotHandle,
+}
+
+impl SnapshotClaim {
+    fn handle(&self) -> &SnapshotHandle {
+        &self.handle
+    }
+
+    fn clone_for_worker(&self) -> Result<Self, String> {
+        let mut registry = self.session.snapshot_capabilities.lock().map_err(|_| "remote snapshot registry lock poisoned".to_string())?;
+        let references =
+            registry.references.get_mut(&self.handle).ok_or_else(|| "remote snapshot capability reference is unavailable".to_string())?;
+        *references = references.checked_add(1).ok_or_else(|| "remote snapshot capability reference count overflow".to_string())?;
+        Ok(Self { session: self.session.clone(), handle: self.handle.clone() })
+    }
+}
+
+impl Drop for SnapshotClaim {
+    fn drop(&mut self) {
+        self.session.release_snapshot(&self.handle);
+    }
+}
+
+impl RemoteSnapshotAuthority for RunRemoteSession {
+    fn snapshot_available(&self, session: WorkspaceSessionId, snapshot_id: RemoteSnapshotId) -> bool {
+        if session != self.session_id {
+            return false;
+        }
+        self.snapshot_capabilities.lock().map(|registry| registry.capabilities.contains_key(&snapshot_id)).unwrap_or(false)
     }
 }
 
@@ -181,23 +255,30 @@ async fn execute_sync(session: Arc<RunRemoteSession>, events: mpsc::Sender<Remot
     let sync = tokio::task::spawn_blocking(move || session.sync_snapshot())
         .await
         .map_err(|error| RemoteBackendError::Failed(format!("snapshot worker failed: {error}")))?;
-    sync.map_err(RemoteBackendError::Failed)?;
-    send_event(&events, RemoteBackendEvent::Completed { exit_code: 0 }).await
+    let snapshot_id = sync.map_err(RemoteBackendError::Failed)?;
+    send_event(&events, RemoteBackendEvent::SyncCompleted { snapshot_id }).await
 }
 
 async fn execute_build(
     session: Arc<RunRemoteSession>, tools: Arc<BTreeMap<String, PathBuf>>, target_environment: Arc<BTreeMap<String, String>>,
     resources: RemoteResourcePolicy, build: &crate::remote::RemoteBuild, events: mpsc::Sender<RemoteBackendEvent>,
 ) -> Result<(), RemoteBackendError> {
+    let snapshot = session.claim_snapshot(build.snapshot_id()).map_err(RemoteBackendError::Failed)?;
     let executable = tools
         .get(build.tool().as_str())
         .ok_or_else(|| RemoteBackendError::Spawn(format!("loopback tool is not configured: {}", build.tool().as_str())))?;
     let job_path = session.new_job_path().map_err(RemoteBackendError::Failed)?;
     let _job = JobGuard { path: job_path.clone() };
+    let materialization_claim = snapshot.clone_for_worker().map_err(RemoteBackendError::Failed)?;
     let destination = job_path.clone();
+    let snapshot_handle = snapshot.handle().clone();
     tokio::task::spawn_blocking({
         let session = session.clone();
-        move || session.materialize_current_snapshot(&destination)
+        move || {
+            let result = session.materialize_snapshot(&snapshot_handle, &destination);
+            drop(materialization_claim);
+            result
+        }
     })
     .await
     .map_err(|error| RemoteBackendError::Failed(format!("materialization worker failed: {error}")))?

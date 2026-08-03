@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -20,7 +21,24 @@ pub const DEFAULT_REMOTE_ENVIRONMENT: &[&str] = &["CC", "CXX", "AR", "RUSTFLAGS"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestId(pub [u8; 16]);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RemoteSnapshotId([u8; 16]);
+
+impl RemoteSnapshotId {
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.0 == [0; 16]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorkspaceSessionId(pub [u8; 16]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,10 +95,13 @@ pub struct RemoteBuild {
     tool: RemoteTool,
     argv: Vec<String>,
     env: Vec<(String, String)>,
+    snapshot_id: RemoteSnapshotId,
 }
 
 impl RemoteBuild {
-    pub fn new(cwd: WorkspaceRelativePath, tool: RemoteTool, argv: Vec<String>, env: Vec<(String, String)>) -> Result<Self, String> {
+    pub fn new(
+        cwd: WorkspaceRelativePath, tool: RemoteTool, argv: Vec<String>, env: Vec<(String, String)>, snapshot_id: RemoteSnapshotId,
+    ) -> Result<Self, String> {
         validate_count(argv.len(), MAX_REMOTE_ARG_COUNT, "remote argv")?;
         argv.iter().try_for_each(|arg| validate_string("remote argument", arg, MAX_REMOTE_ARG_BYTES))?;
         validate_count(env.len(), MAX_REMOTE_ENV_COUNT, "remote environment")?;
@@ -88,7 +109,10 @@ impl RemoteBuild {
             validate_environment_key(key)?;
             validate_environment_value(value)
         })?;
-        Ok(Self { cwd, tool, argv, env })
+        if snapshot_id.is_zero() {
+            return Err("remote snapshot ID must be nonzero".to_string());
+        }
+        Ok(Self { cwd, tool, argv, env, snapshot_id })
     }
 
     pub fn cwd(&self) -> &WorkspaceRelativePath {
@@ -105,6 +129,10 @@ impl RemoteBuild {
 
     pub fn env(&self) -> &[(String, String)] {
         &self.env
+    }
+
+    pub fn snapshot_id(&self) -> RemoteSnapshotId {
+        self.snapshot_id
     }
 }
 
@@ -263,6 +291,7 @@ pub enum RemoteAuthorizationError {
     ForbiddenEnvironment(String),
     EnvironmentNotAllowed(String),
     DuplicateEnvironment(String),
+    SnapshotNotAllowed,
 }
 
 impl RemoteAuthorizationError {
@@ -271,18 +300,23 @@ impl RemoteAuthorizationError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct RemoteAuthorizationPolicy {
     allowed_target: RemoteTargetId,
     allowed_session: WorkspaceSessionId,
     allowed_tools: BTreeMap<String, RemoteToolPolicy>,
     environment: RemoteEnvironmentPolicy,
+    snapshot_authority: Option<Arc<dyn RemoteSnapshotAuthority>>,
+}
+
+pub trait RemoteSnapshotAuthority: Send + Sync {
+    fn snapshot_available(&self, session: WorkspaceSessionId, snapshot_id: RemoteSnapshotId) -> bool;
 }
 
 impl RemoteAuthorizationPolicy {
     pub fn new(allowed_target: RemoteTargetId, allowed_session: WorkspaceSessionId, allowed_tools: Vec<String>) -> Self {
         let allowed_tools = allowed_tools.into_iter().map(|tool| (tool, RemoteToolPolicy::new(true))).collect();
-        Self { allowed_target, allowed_session, allowed_tools, environment: RemoteEnvironmentPolicy::default() }
+        Self { allowed_target, allowed_session, allowed_tools, environment: RemoteEnvironmentPolicy::default(), snapshot_authority: None }
     }
 
     pub fn from_policies(
@@ -296,7 +330,12 @@ impl RemoteAuthorizationPolicy {
                 return Err(format!("duplicate remote tool policy: {tool}"));
             }
         }
-        Ok(Self { allowed_target, allowed_session, allowed_tools, environment })
+        Ok(Self { allowed_target, allowed_session, allowed_tools, environment, snapshot_authority: None })
+    }
+
+    pub fn with_snapshot_authority(mut self, authority: Arc<dyn RemoteSnapshotAuthority>) -> Self {
+        self.snapshot_authority = Some(authority);
+        self
     }
 
     pub fn allowed_tools(&self) -> impl Iterator<Item = &str> {
@@ -314,6 +353,9 @@ impl RemoteAuthorizationPolicy {
         let request = match request.operation() {
             RemoteOperation::Sync => request,
             RemoteOperation::Build(build) => {
+                if self.snapshot_authority.as_ref().is_none_or(|authority| !authority.snapshot_available(self.allowed_session, build.snapshot_id())) {
+                    return Err(RemoteAuthorizationError::SnapshotNotAllowed);
+                }
                 let Some(tool_policy) = self.allowed_tools.get(build.tool().as_str()).copied() else {
                     return Err(RemoteAuthorizationError::ToolNotAllowed(build.tool().as_str().to_string()));
                 };
@@ -321,7 +363,7 @@ impl RemoteAuthorizationPolicy {
                     return Err(RemoteAuthorizationError::ToolArgumentsNotAllowed(build.tool().as_str().to_string()));
                 }
                 let environment = self.environment.filter(build.env())?;
-                let filtered = RemoteBuild::new(build.cwd.clone(), build.tool.clone(), build.argv.clone(), environment)
+                let filtered = RemoteBuild::new(build.cwd.clone(), build.tool.clone(), build.argv.clone(), environment, build.snapshot_id())
                     .map_err(RemoteAuthorizationError::InvalidEnvironment)?;
                 RemoteRequest::build(request.request_id, request.workspace_session_id, filtered)
             }
@@ -334,6 +376,7 @@ impl RemoteAuthorizationPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteBackendEvent {
     SyncProgress { completed_bytes: u64, total_bytes: Option<u64> },
+    SyncCompleted { snapshot_id: RemoteSnapshotId },
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Error { message: String },

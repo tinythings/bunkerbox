@@ -170,7 +170,7 @@ impl SnapshotExclusionPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SnapshotHandle {
     session_id: WorkspaceSessionId,
     snapshot_id: SnapshotId,

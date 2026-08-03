@@ -226,10 +226,13 @@ run_app() {{
 }}
 
 VSCOMM_BIN="/usr/local/bunkerbox/bin"
+if [ -x "$VSCOMM_BIN/bunkerbox-remote" ]; then
+  "$VSCOMM_BIN/bunkerbox-remote" install
+fi
 if [ -x "$VSCOMM_BIN/bunkerbox-vscomm" ]; then
   "$VSCOMM_BIN/bunkerbox-vscomm" install
-  export PATH="$VSCOMM_BIN:$PATH"
 fi
+export PATH="$VSCOMM_BIN:$PATH"
 
 if ! command -v bunkerbox-status >/dev/null 2>&1; then
   bunkerbox-status() {{ :; }}
@@ -286,6 +289,11 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
     fs::copy(&vscomm_path, &dest).map_err(|err| format!("failed to copy vscomm binary {}: {err}", dest.display()))?;
     fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
 
+    let remote_path = find_remote_binary()?;
+    let dest = build_dir.join("bunkerbox-remote");
+    fs::copy(&remote_path, &dest).map_err(|err| format!("failed to copy remote binary {}: {err}", dest.display()))?;
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).map_err(|err| format!("failed to chmod {}: {err}", dest.display()))?;
+
     let status_path = find_status_binary()?;
     let dest = build_dir.join("bunkerbox-status");
     fs::copy(&status_path, &dest).map_err(|err| format!("failed to copy status binary {}: {err}", dest.display()))?;
@@ -295,7 +303,11 @@ fn write_build_context(config: &ImageConfig, build_dir: &Path) -> Result<(), Str
         if file.path.is_absolute() || file.path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
             return Err(format!("unsafe build file path: {}", file.path.display()));
         }
-        if file.path == Path::new("bunker-entrypoint") || file.path == Path::new("bunkerbox-vscomm") || file.path == Path::new("bunkerbox-status") {
+        if file.path == Path::new("bunker-entrypoint")
+            || file.path == Path::new("bunkerbox-vscomm")
+            || file.path == Path::new("bunkerbox-status")
+            || file.path == Path::new("bunkerbox-remote")
+        {
             return Err(format!("image config files must not override reserved file: {}", file.path.display()));
         }
 
@@ -333,6 +345,15 @@ fn find_status_binary() -> Result<PathBuf, String> {
         Ok(path)
     } else {
         Err("bunkerbox-status not found in target/dist/. Run: make dev".into())
+    }
+}
+
+fn find_remote_binary() -> Result<PathBuf, String> {
+    let path = dist_dir()?.join("bunkerbox-remote");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err("bunkerbox-remote not found in target/dist/. Run: make dev".into())
     }
 }
 
@@ -451,3 +472,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../bunkerbox-image_ut.rs"]
+mod tests;

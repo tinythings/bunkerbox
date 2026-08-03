@@ -20,6 +20,8 @@ use std::thread;
 pub struct WorkspaceBinding<'a> {
     pub path: &'a Path,
     pub remote_session: WorkspaceSessionId,
+    pub remote_tools: &'a [String],
+    pub remote_environment: &'a [String],
 }
 
 const BRIDGE_SUBNET: &str = "10.247.0.0/24";
@@ -197,6 +199,12 @@ pub fn run(
     if vsock_enabled {
         container_env.push(format!("BUNKERBOX_TOOLCHAIN_PORT={TOOLCHAIN_PORT}"));
         container_env.push(format!("BUNKERBOX_REMOTE_SESSION={}", workspace.remote_session.to_hex()));
+        if !workspace.remote_tools.is_empty() {
+            container_env.push(format!("BUNKERBOX_REMOTE_TOOLS={}", workspace.remote_tools.join(",")));
+        }
+        if !workspace.remote_environment.is_empty() {
+            container_env.push(format!("BUNKERBOX_REMOTE_ENV_NAMES={}", workspace.remote_environment.join(",")));
+        }
     }
 
     if let Some(ref cmds) = config.command {

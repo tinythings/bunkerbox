@@ -151,7 +151,8 @@ impl VsockDaemon {
             }
             (None, None) => RemoteAuthorizationPolicy::new(session.target(), session.session_id(), allowed_tools),
             _ => return Err("remote tool and environment policies must be configured together".to_string()),
-        };
+        }
+        .with_snapshot_authority(session.clone());
         let remote_context = RemoteExecutionContext { target: session.target(), workspace_session_id: session.session_id() };
         let backend = LoopbackBackend::new(session, tools)
             .with_target_environment(target_environment)

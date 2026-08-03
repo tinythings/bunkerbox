@@ -1,6 +1,10 @@
 use super::*;
 use bunkerbox::vscomm::{Frame, RemoteEvent, RemoteEventKind};
 
+fn snapshot_id() -> bunkerbox::remote::RemoteSnapshotId {
+    bunkerbox::remote::RemoteSnapshotId::from_bytes([9; 16])
+}
+
 struct MemoryStream {
     input: io::Cursor<Vec<u8>>,
     output: Vec<u8>,
@@ -53,6 +57,7 @@ fn build_request_preserves_logical_cwd_and_arguments() {
         "src".into(),
         RequestId([1; 16]),
         WorkspaceSessionId([2; 16]),
+        snapshot_id(),
     )
     .unwrap();
     let frame = request.to_frame().unwrap();
@@ -66,15 +71,18 @@ fn build_request_preserves_logical_cwd_and_arguments() {
 #[test]
 fn sync_success_uses_existing_remote_helper_and_returns_status() {
     let request_id = RequestId([3; 16]);
-    let mut stream = MemoryStream::new(vec![RemoteEvent { request_id, kind: RemoteEventKind::Completed { exit_code: 0 } }]);
+    let mut stream = MemoryStream::new(vec![RemoteEvent {
+        request_id,
+        kind: RemoteEventKind::SyncCompleted { snapshot_id: bunkerbox::vscomm::RemoteSnapshotId([9; 16]) },
+    }]);
     let status = execute_remote_request_to(
         &mut stream,
-        build_request(RemoteCommand::Sync, String::new(), request_id, WorkspaceSessionId([2; 16])).unwrap(),
+        build_request(RemoteCommand::Sync, String::new(), request_id, WorkspaceSessionId([2; 16]), snapshot_id()).unwrap(),
         &mut Vec::new(),
         &mut Vec::new(),
     )
     .unwrap();
-    assert_eq!(status, 0);
+    assert_eq!(status, RemoteCompletion::Synced(snapshot_id()));
     assert!(Frame::read(&mut io::Cursor::new(stream.output)).is_ok());
 }
 
@@ -96,6 +104,7 @@ fn build_success_preserves_output_bytes_and_nonzero_exit_code() {
             "src".into(),
             request_id,
             WorkspaceSessionId([2; 16]),
+            snapshot_id(),
         )
         .unwrap(),
         &mut stdout,
@@ -103,7 +112,7 @@ fn build_success_preserves_output_bytes_and_nonzero_exit_code() {
     )
     .unwrap();
 
-    assert_eq!(status, 17);
+    assert_eq!(status, RemoteCompletion::Completed(17));
     assert_eq!(stdout, vec![b'o', b'\n', 0xff]);
     assert_eq!(stderr, b"err\n");
 }
@@ -117,7 +126,7 @@ fn remote_failures_return_errors_without_local_fallback() {
         let mut stream = MemoryStream::new(vec![RemoteEvent { request_id, kind }]);
         let result = execute_remote_request_to(
             &mut stream,
-            build_request(RemoteCommand::Sync, String::new(), request_id, WorkspaceSessionId([2; 16])).unwrap(),
+            build_request(RemoteCommand::Sync, String::new(), request_id, WorkspaceSessionId([2; 16]), snapshot_id()).unwrap(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -138,12 +147,13 @@ fn rejected_tool_and_mismatched_response_fail_closed() {
         String::new(),
         request_id,
         WorkspaceSessionId([2; 16]),
+        snapshot_id(),
     )
     .unwrap();
     assert_eq!(execute_remote_request_to(&mut stream, request, &mut Vec::new(), &mut Vec::new()).unwrap_err(), "authorization rejected");
 
     let mut stream = MemoryStream::new(vec![RemoteEvent { request_id: RequestId([8; 16]), kind: RemoteEventKind::Completed { exit_code: 0 } }]);
-    let request = build_request(RemoteCommand::Sync, String::new(), request_id, WorkspaceSessionId([2; 16])).unwrap();
+    let request = build_request(RemoteCommand::Sync, String::new(), request_id, WorkspaceSessionId([2; 16]), snapshot_id()).unwrap();
     assert_eq!(execute_remote_request_to(&mut stream, request, &mut Vec::new(), &mut Vec::new()).unwrap_err(), "remote event request ID mismatch");
 }
 
@@ -151,4 +161,81 @@ fn rejected_tool_and_mismatched_response_fail_closed() {
 fn logical_cwd_is_workspace_relative_only() {
     assert_eq!(logical_workspace_cwd(Path::new("/workspace/project/src")).unwrap(), "project/src");
     assert!(logical_workspace_cwd(Path::new("/tmp/project")).is_err());
+}
+
+#[test]
+fn configured_remote_make_installation_precedes_native_path_resolution() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("bunkerbox-remote");
+    std::fs::write(&executable, b"remote").unwrap();
+    install_remote_make_link(root.path(), &executable, true).unwrap();
+    assert_eq!(std::fs::read_link(root.path().join("make")).unwrap(), executable);
+}
+
+#[test]
+fn disabled_remote_make_removes_only_its_managed_link() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("bunkerbox-remote");
+    std::fs::write(&executable, b"remote").unwrap();
+    install_remote_make_link(root.path(), &executable, true).unwrap();
+    install_remote_make_link(root.path(), &executable, false).unwrap();
+    assert!(!root.path().join("make").exists());
+
+    std::fs::write(root.path().join("make"), b"native").unwrap();
+    install_remote_make_link(root.path(), &executable, false).unwrap();
+    assert_eq!(std::fs::read(root.path().join("make")).unwrap(), b"native");
+}
+
+#[test]
+fn configured_remote_make_does_not_overwrite_unmanaged_entry() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("bunkerbox-remote");
+    std::fs::write(&executable, b"remote").unwrap();
+    std::fs::write(root.path().join("make"), b"native").unwrap();
+    assert!(install_remote_make_link(root.path(), &executable, true).is_err());
+    assert_eq!(std::fs::read(root.path().join("make")).unwrap(), b"native");
+}
+
+#[test]
+fn transparent_build_syncs_first_and_reuses_that_capability() {
+    let session = WorkspaceSessionId([2; 16]);
+    let capability = snapshot_id();
+    let mut requests = Vec::new();
+    let result = run_build_with_sync_using(
+        "src".into(),
+        "make".into(),
+        vec!["release".into(), "space arg".into()],
+        vec![("CC".into(), "cc".into())],
+        session,
+        |request| {
+            requests.push(request.clone());
+            if requests.len() == 1 {
+                Ok(RemoteCompletion::Synced(capability))
+            } else {
+                Ok(RemoteCompletion::Completed(17))
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result, 17);
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(&requests[0].operation, bunkerbox::vscomm::RemoteOperation::Sync(_)));
+    let bunkerbox::vscomm::RemoteOperation::Build(ref build) = requests[1].operation else { panic!("expected build") };
+    assert_eq!(build.tool.as_str(), "make");
+    assert_eq!(build.cwd.as_str(), "src");
+    assert_eq!(build.argv, ["release", "space arg"]);
+    assert_eq!(build.snapshot_id, bunkerbox::vscomm::RemoteSnapshotId([9; 16]));
+    assert_eq!(build.env, [("CC".into(), "cc".into())]);
+}
+
+#[test]
+fn transparent_build_does_not_build_after_sync_failure() {
+    let mut calls = 0;
+    let result = run_build_with_sync_using("src".into(), "make".into(), vec!["release".into()], Vec::new(), WorkspaceSessionId([2; 16]), |_| {
+        calls += 1;
+        Err("sync failed".to_string())
+    });
+    assert_eq!(result, Err("sync failed".to_string()));
+    assert_eq!(calls, 1);
 }

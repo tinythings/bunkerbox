@@ -1,5 +1,5 @@
 use super::{handle_response, handle_response_to, Frame, FrameType};
-use bunkerbox::remote_client::{execute_remote_request_to, remote_build_request, remote_sync_request};
+use bunkerbox::remote_client::{execute_remote_request_to, remote_build_request, remote_sync_request, RemoteCompletion};
 use bunkerbox::vscomm::{Frame as RemoteFrame, RemoteEvent, RemoteEventKind, RequestId, WorkspaceSessionId};
 use std::io::{self, Read, Write};
 
@@ -71,7 +71,16 @@ fn preserve_exit_status() {
 #[test]
 fn explicit_remote_client_preserves_streams_status_and_request_id() {
     let request_id = RequestId([9; 16]);
-    let request = remote_build_request(request_id, WorkspaceSessionId([8; 16]), "src", "make", vec!["release mode".into()], vec![]).unwrap();
+    let request = remote_build_request(
+        request_id,
+        WorkspaceSessionId([8; 16]),
+        "src",
+        "make",
+        vec!["release mode".into()],
+        vec![],
+        bunkerbox::remote::RemoteSnapshotId::from_bytes([9; 16]),
+    )
+    .unwrap();
     let responses = vec![
         RemoteEvent { request_id, kind: RemoteEventKind::Stdout(b"out".to_vec()) }.to_frame().unwrap(),
         RemoteEvent { request_id, kind: RemoteEventKind::Stderr(b"err".to_vec()) }.to_frame().unwrap(),
@@ -81,7 +90,7 @@ fn explicit_remote_client_preserves_streams_status_and_request_id() {
     let mut stdout = FlushWriter { bytes: Vec::new(), flushes: 0 };
     let mut stderr = FlushWriter { bytes: Vec::new(), flushes: 0 };
 
-    assert_eq!(execute_remote_request_to(&mut stream, request, &mut stdout, &mut stderr).unwrap(), 23);
+    assert_eq!(execute_remote_request_to(&mut stream, request, &mut stdout, &mut stderr).unwrap(), RemoteCompletion::Completed(23));
     assert_eq!(stdout.bytes, b"out");
     assert_eq!(stderr.bytes, b"err");
     assert_eq!(stdout.flushes, 1);

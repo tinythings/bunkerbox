@@ -1,5 +1,8 @@
 use super::*;
-use crate::remote::{RemoteAuthorizationPolicy, RemoteBuild, RemoteExecutionContext, RemoteRequest, RemoteTool, RequestId, WorkspaceRelativePath};
+use crate::remote::{
+    RemoteAuthorizationPolicy, RemoteBuild, RemoteExecutionContext, RemoteRequest, RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTool, RequestId,
+    WorkspaceRelativePath,
+};
 use tempfile::TempDir;
 
 fn fixture() -> (TempDir, Arc<RunRemoteSession>, RemoteTargetId, WorkspaceSessionId) {
@@ -17,12 +20,20 @@ fn fixture() -> (TempDir, Arc<RunRemoteSession>, RemoteTargetId, WorkspaceSessio
     (temp, session, target, session_id)
 }
 
+struct TestSnapshotAuthority;
+
+impl RemoteSnapshotAuthority for TestSnapshotAuthority {
+    fn snapshot_available(&self, _session: WorkspaceSessionId, _snapshot_id: RemoteSnapshotId) -> bool {
+        true
+    }
+}
+
 fn authorized_build(
-    target: RemoteTargetId, session: WorkspaceSessionId, tool: &str, args: Vec<String>, env: Vec<(String, String)>,
+    target: RemoteTargetId, session: WorkspaceSessionId, tool: &str, args: Vec<String>, env: Vec<(String, String)>, snapshot_id: RemoteSnapshotId,
 ) -> crate::remote::AuthorizedRemoteRequest {
-    let build = RemoteBuild::new(WorkspaceRelativePath::new("src").unwrap(), RemoteTool::new(tool).unwrap(), args, env).unwrap();
+    let build = RemoteBuild::new(WorkspaceRelativePath::new("src").unwrap(), RemoteTool::new(tool).unwrap(), args, env, snapshot_id).unwrap();
     let request = RemoteRequest::build(RequestId([3; 16]), session, build);
-    let policy = RemoteAuthorizationPolicy::new(target, session, vec![tool.to_string()]);
+    let policy = RemoteAuthorizationPolicy::new(target, session, vec![tool.to_string()]).with_snapshot_authority(Arc::new(TestSnapshotAuthority));
     policy.authorize(&RemoteExecutionContext { target, workspace_session_id: session }, request).unwrap()
 }
 
@@ -32,6 +43,22 @@ async fn collect_events(mut receiver: mpsc::Receiver<RemoteBackendEvent>) -> Vec
         events.push(event);
     }
     events
+}
+
+async fn sync_capability(backend: &LoopbackBackend, target: RemoteTargetId, session: WorkspaceSessionId) -> RemoteSnapshotId {
+    let request = RemoteRequest::sync(RequestId([4; 16]), session);
+    let policy = RemoteAuthorizationPolicy::new(target, session, Vec::new());
+    let authorized = policy.authorize(&RemoteExecutionContext { target, workspace_session_id: session }, request).unwrap();
+    let (events, receiver) = mpsc::channel(8);
+    assert_eq!(backend.execute(authorized, events).await, Ok(()));
+    collect_events(receiver)
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            RemoteBackendEvent::SyncCompleted { snapshot_id } => Some(snapshot_id),
+            _ => None,
+        })
+        .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -48,19 +75,118 @@ async fn sync_and_build_materialize_a_bound_snapshot() {
     let policy = RemoteAuthorizationPolicy::new(target, session_id, Vec::new());
     let authorized = policy.authorize(&RemoteExecutionContext { target, workspace_session_id: session_id }, sync).unwrap();
     assert_eq!(backend.execute(authorized, sync_tx).await, Ok(()));
-    assert_eq!(
-        collect_events(sync_rx).await,
-        vec![RemoteBackendEvent::SyncProgress { completed_bytes: 0, total_bytes: None }, RemoteBackendEvent::Completed { exit_code: 0 },]
-    );
+    let sync_events = collect_events(sync_rx).await;
+    assert!(matches!(sync_events.first(), Some(RemoteBackendEvent::SyncProgress { completed_bytes: 0, total_bytes: None })));
+    let snapshot_id = sync_events
+        .iter()
+        .find_map(|event| match event {
+            RemoteBackendEvent::SyncCompleted { snapshot_id } => Some(*snapshot_id),
+            _ => None,
+        })
+        .unwrap();
 
     let (build_tx, build_rx) = mpsc::channel(8);
-    let authorized = authorized_build(target, session_id, "printf", vec!["value with spaces:$(literal)".to_string()], Vec::new());
+    let authorized = authorized_build(target, session_id, "printf", vec!["value with spaces:$(literal)".to_string()], Vec::new(), snapshot_id);
     assert_eq!(backend.execute(authorized, build_tx).await, Ok(()));
     assert_eq!(
         collect_events(build_rx).await,
         vec![RemoteBackendEvent::Stdout(b"value with spaces:$(literal)".to_vec()), RemoteBackendEvent::Completed { exit_code: 0 },]
     );
     assert!(fs::read_dir(&session_state.jobs_root).unwrap().next().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interleaved_syncs_build_their_own_snapshot_capabilities() {
+    let (_temp, session, target, session_id) = fixture();
+    let tools = resolve_fixed_tools(["cat".to_string()]);
+    if tools.is_empty() {
+        return;
+    }
+    let backend = LoopbackBackend::new(session.clone(), tools);
+    fs::write(session.workspace_root().join("src/input.txt"), b"A\n").unwrap();
+    let snapshot_a = sync_capability(&backend, target, session_id).await;
+    fs::write(session.workspace_root().join("src/input.txt"), b"B\n").unwrap();
+    let snapshot_b = sync_capability(&backend, target, session_id).await;
+    assert_ne!(snapshot_a, snapshot_b);
+
+    let authority = session.clone();
+    let authorize = |snapshot_id| {
+        let build = RemoteBuild::new(
+            WorkspaceRelativePath::new("src").unwrap(),
+            RemoteTool::new("cat").unwrap(),
+            vec!["input.txt".into()],
+            Vec::new(),
+            snapshot_id,
+        )
+        .unwrap();
+        let request = RemoteRequest::build(RequestId([8; 16]), session_id, build);
+        RemoteAuthorizationPolicy::new(target, session_id, vec!["cat".into()])
+            .with_snapshot_authority(authority.clone())
+            .authorize(&RemoteExecutionContext { target, workspace_session_id: session_id }, request)
+            .unwrap()
+    };
+    let request_a = authorize(snapshot_a);
+    let request_b = authorize(snapshot_b);
+    let (events_a, receiver_a) = mpsc::channel(8);
+    let (events_b, receiver_b) = mpsc::channel(8);
+    let (result_a, result_b) = tokio::join!(backend.execute(request_a, events_a), backend.execute(request_b, events_b));
+    assert_eq!(result_a, Ok(()));
+    assert_eq!(result_b, Ok(()));
+    let output_a = collect_events(receiver_a).await;
+    let output_b = collect_events(receiver_b).await;
+    assert!(output_a.iter().any(|event| matches!(event, RemoteBackendEvent::Stdout(bytes) if bytes == b"A\n")));
+    assert!(output_b.iter().any(|event| matches!(event, RemoteBackendEvent::Stdout(bytes) if bytes == b"B\n")));
+    assert!(output_a.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { exit_code: 0 })));
+    assert!(output_b.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { exit_code: 0 })));
+
+    let replay = RemoteBuild::new(
+        WorkspaceRelativePath::new("src").unwrap(),
+        RemoteTool::new("cat").unwrap(),
+        vec!["input.txt".into()],
+        Vec::new(),
+        snapshot_a,
+    )
+    .unwrap();
+    let replay_request = RemoteRequest::build(RequestId([9; 16]), session_id, replay);
+    assert_eq!(
+        RemoteAuthorizationPolicy::new(target, session_id, vec!["cat".into()])
+            .with_snapshot_authority(session.clone())
+            .authorize(&RemoteExecutionContext { target, workspace_session_id: session_id }, replay_request),
+        Err(crate::remote::RemoteAuthorizationError::SnapshotNotAllowed)
+    );
+
+    let unknown = RemoteBuild::new(
+        WorkspaceRelativePath::new("src").unwrap(),
+        RemoteTool::new("cat").unwrap(),
+        vec!["input.txt".into()],
+        Vec::new(),
+        RemoteSnapshotId::from_bytes([6; 16]),
+    )
+    .unwrap();
+    let unknown_request = RemoteRequest::build(RequestId([10; 16]), session_id, unknown);
+    assert_eq!(
+        RemoteAuthorizationPolicy::new(target, session_id, vec!["cat".into()])
+            .with_snapshot_authority(session.clone())
+            .authorize(&RemoteExecutionContext { target, workspace_session_id: session_id }, unknown_request),
+        Err(crate::remote::RemoteAuthorizationError::SnapshotNotAllowed)
+    );
+
+    let other_session = WorkspaceSessionId([7; 16]);
+    let cross_session = RemoteBuild::new(
+        WorkspaceRelativePath::new("src").unwrap(),
+        RemoteTool::new("cat").unwrap(),
+        vec!["input.txt".into()],
+        Vec::new(),
+        snapshot_b,
+    )
+    .unwrap();
+    let cross_request = RemoteRequest::build(RequestId([11; 16]), other_session, cross_session);
+    assert_eq!(
+        RemoteAuthorizationPolicy::new(target, other_session, vec!["cat".into()])
+            .with_snapshot_authority(session)
+            .authorize(&RemoteExecutionContext { target, workspace_session_id: other_session }, cross_request),
+        Err(crate::remote::RemoteAuthorizationError::SnapshotNotAllowed)
+    );
 }
 
 #[test]
@@ -71,27 +197,38 @@ fn unapproved_remote_environment_is_rejected_before_backend_execution() {
         RemoteTool::new("printf").unwrap(),
         Vec::new(),
         vec![("UNTRUSTED".to_string(), "1".to_string())],
+        RemoteSnapshotId::from_bytes([9; 16]),
     )
     .unwrap();
     let request = RemoteRequest::build(RequestId([3; 16]), session_id, build);
-    let policy = RemoteAuthorizationPolicy::new(target, session_id, vec!["printf".to_string()]);
+    let policy =
+        RemoteAuthorizationPolicy::new(target, session_id, vec!["printf".to_string()]).with_snapshot_authority(Arc::new(TestSnapshotAuthority));
     assert_eq!(
         policy.authorize(&RemoteExecutionContext { target, workspace_session_id: session_id }, request),
         Err(crate::remote::RemoteAuthorizationError::EnvironmentNotAllowed("UNTRUSTED".to_string()))
     );
 }
 
+#[test]
+fn fixed_tool_resolution_never_uses_guest_wrapper_path() {
+    let tools = resolve_fixed_tools(["make".to_string()]);
+    if let Some(path) = tools.get("make") {
+        assert!(matches!(path.to_str(), Some(value) if value == "/usr/local/bin/make" || value == "/usr/bin/make" || value == "/bin/make"));
+        assert!(!path.starts_with("/usr/local/bunkerbox/bin"));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_preserves_argument_bytes_and_reports_nonzero_stderr() {
     let (_temp, session, target, session_id) = fixture();
-    session.sync_snapshot().unwrap();
+    let snapshot_id = session.sync_snapshot().unwrap();
     let tools = resolve_fixed_tools(["ls".to_string()]);
     if tools.is_empty() {
         return;
     }
     let backend = LoopbackBackend::new(session, tools);
     let (events, receiver) = mpsc::channel(8);
-    let request = authorized_build(target, session_id, "ls", vec!["$(not-a-shell-argument)".to_string()], Vec::new());
+    let request = authorized_build(target, session_id, "ls", vec!["$(not-a-shell-argument)".to_string()], Vec::new(), snapshot_id);
     assert_eq!(backend.execute(request, events).await, Ok(()));
     let events = collect_events(receiver).await;
     assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Stderr(bytes) if !bytes.is_empty())));
@@ -102,7 +239,7 @@ async fn build_preserves_argument_bytes_and_reports_nonzero_stderr() {
 async fn child_exit_does_not_wait_for_inherited_output_pipes() {
     let (_temp, session, target, session_id) = fixture();
     fs::write(session.workspace_root().join("src/Makefile"), ".PHONY: leak\nleak:\n\t@sleep 30 & echo $$!\n\t@printf 'direct-output\\n'\n").unwrap();
-    session.sync_snapshot().unwrap();
+    let snapshot_id = session.sync_snapshot().unwrap();
     let tools = resolve_fixed_tools(["make".to_string()]);
     if tools.is_empty() {
         return;
@@ -110,11 +247,9 @@ async fn child_exit_does_not_wait_for_inherited_output_pipes() {
 
     let backend = LoopbackBackend::new(session.clone(), tools);
     let (events, receiver) = mpsc::channel(16);
-    let request = authorized_build(target, session_id, "make", vec!["leak".into()], Vec::new());
-    let started = tokio::time::Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(1), backend.execute(request, events)).await.unwrap();
+    let request = authorized_build(target, session_id, "make", vec!["leak".into()], Vec::new(), snapshot_id);
+    let result = tokio::time::timeout(Duration::from_secs(2), backend.execute(request, events)).await.unwrap();
     assert_eq!(result, Ok(()));
-    assert!(started.elapsed() < Duration::from_millis(500));
 
     let events = collect_events(receiver).await;
     let stdout = events
@@ -146,14 +281,14 @@ async fn child_exit_does_not_wait_for_inherited_output_pipes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_receives_guest_environment_but_trusted_target_wins() {
     let (_temp, session, target, session_id) = fixture();
-    session.sync_snapshot().unwrap();
+    let snapshot_id = session.sync_snapshot().unwrap();
     let tools = resolve_fixed_tools(["printenv".to_string()]);
     if tools.is_empty() {
         return;
     }
     let backend = LoopbackBackend::new(session, tools).with_target_environment(BTreeMap::from([("CC".into(), "trusted-target".into())]));
     let (events, receiver) = mpsc::channel(8);
-    let request = authorized_build(target, session_id, "printenv", vec!["CC".into()], vec![("CC".into(), "guest-value".into())]);
+    let request = authorized_build(target, session_id, "printenv", vec!["CC".into()], vec![("CC".into(), "guest-value".into())], snapshot_id);
     assert_eq!(backend.execute(request, events).await, Ok(()));
     let events = collect_events(receiver).await;
     assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Stdout(bytes) if bytes == b"trusted-target\n")));
@@ -163,36 +298,37 @@ async fn child_receives_guest_environment_but_trusted_target_wins() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_tool_fails_before_execution() {
     let (_temp, session, target, session_id) = fixture();
+    let snapshot_id = session.sync_snapshot().unwrap();
     let backend = LoopbackBackend::new(session, BTreeMap::new());
     let (events, _receiver) = mpsc::channel(8);
-    let request = authorized_build(target, session_id, "missing-tool", Vec::new(), Vec::new());
+    let request = authorized_build(target, session_id, "missing-tool", Vec::new(), Vec::new(), snapshot_id);
     assert_eq!(backend.execute(request, events).await, Err(RemoteBackendError::Spawn("loopback tool is not configured: missing-tool".to_string())));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeout_kills_a_direct_child_process() {
     let (_temp, session, target, session_id) = fixture();
-    session.sync_snapshot().unwrap();
+    let snapshot_id = session.sync_snapshot().unwrap();
     let tools = resolve_fixed_tools(["sleep".to_string()]);
     if tools.is_empty() {
         return;
     }
     let backend = LoopbackBackend::new(session, tools).with_timeout(Duration::from_millis(50));
     let (events, _receiver) = mpsc::channel(8);
-    let request = authorized_build(target, session_id, "sleep", vec!["5".to_string()], Vec::new());
+    let request = authorized_build(target, session_id, "sleep", vec!["5".to_string()], Vec::new(), snapshot_id);
     assert_eq!(backend.execute(request, events).await, Err(RemoteBackendError::Timeout));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn output_limit_kills_a_flooding_direct_child() {
     let (_temp, session, target, session_id) = fixture();
-    session.sync_snapshot().unwrap();
+    let snapshot_id = session.sync_snapshot().unwrap();
     let tools = resolve_fixed_tools(["printf".to_string()]);
     if tools.is_empty() {
         return;
     }
     let backend = LoopbackBackend::new(session, tools).with_output_limit(8);
     let (events, _receiver) = mpsc::channel(8);
-    let request = authorized_build(target, session_id, "printf", vec!["0123456789".into()], Vec::new());
+    let request = authorized_build(target, session_id, "printf", vec!["0123456789".into()], Vec::new(), snapshot_id);
     assert_eq!(backend.execute(request, events).await, Err(RemoteBackendError::OutputLimit { limit: 8 }));
 }

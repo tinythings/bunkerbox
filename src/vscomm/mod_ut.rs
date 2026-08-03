@@ -19,7 +19,7 @@ fn workspace_session_hex_rejects_non_ascii_without_panicking() {
 }
 
 fn build(argv: Vec<String>, env: Vec<(String, String)>) -> Result<RemoteBuild, String> {
-    RemoteBuild::new(WorkspaceRelativePath::new("src").unwrap(), RemoteTool::new("make").unwrap(), argv, env)
+    RemoteBuild::new(WorkspaceRelativePath::new("src").unwrap(), RemoteTool::new("make").unwrap(), argv, env, RemoteSnapshotId([9; 16]))
 }
 
 fn raw_build_frame(argv_count: u16, arg: Option<&str>, env_count: u16, env: Option<(&str, &str)>) -> Frame {
@@ -99,6 +99,8 @@ fn remote_build_round_trips_structured_arguments_and_environment() {
     );
     let decoded = RemoteRequest::from_frame(request.to_frame().unwrap()).unwrap();
     assert_eq!(decoded, request);
+    let RemoteOperation::Build(build) = decoded.operation else { panic!("expected build") };
+    assert_eq!(build.snapshot_id, RemoteSnapshotId([9; 16]));
 }
 
 #[test]
@@ -106,6 +108,7 @@ fn every_remote_event_round_trips() {
     let request_id = ids().0;
     let events = vec![
         RemoteEventKind::SyncProgress { completed_bytes: 4, total_bytes: Some(9) },
+        RemoteEventKind::SyncCompleted { snapshot_id: RemoteSnapshotId([9; 16]) },
         RemoteEventKind::Stdout(b"out".to_vec()),
         RemoteEventKind::Stderr(b"err".to_vec()),
         RemoteEventKind::Error { code: RemoteErrorCode::Failed, message: "failed".into() },
@@ -194,6 +197,24 @@ fn oversized_environment_key_and_value_are_rejected() {
 }
 
 #[test]
+fn zero_remote_snapshot_id_is_rejected() {
+    assert!(RemoteBuild::new(
+        WorkspaceRelativePath::new("src").unwrap(),
+        RemoteTool::new("make").unwrap(),
+        Vec::new(),
+        Vec::new(),
+        RemoteSnapshotId([0; 16]),
+    )
+    .is_err());
+}
+
+#[test]
+fn zero_sync_completion_snapshot_id_is_rejected() {
+    let event = RemoteEvent { request_id: ids().0, kind: RemoteEventKind::SyncCompleted { snapshot_id: RemoteSnapshotId([0; 16]) } };
+    assert!(event.to_frame().is_err());
+}
+
+#[test]
 fn control_data_in_remote_environment_value_is_rejected() {
     assert!(build(Vec::new(), vec![("CC".into(), "bad\nvalue".into())]).is_err());
     assert!(RemoteRequest::from_frame(raw_build_frame(0, None, 1, Some(("CC", "bad\nvalue")))).is_err());
@@ -231,6 +252,7 @@ fn protocol_request_converts_to_transport_independent_domain_request() {
     assert_eq!(build.tool().as_str(), "make");
     assert_eq!(build.argv(), ["--release"]);
     assert_eq!(build.env(), [("MODE".into(), "debug".into())]);
+    assert_eq!(build.snapshot_id(), crate::remote::RemoteSnapshotId::from_bytes([9; 16]));
 }
 
 #[test]

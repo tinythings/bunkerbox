@@ -87,6 +87,17 @@ fn sync_success_uses_existing_remote_helper_and_returns_status() {
 }
 
 #[test]
+fn standalone_sync_uses_diagnostic_non_retaining_request() {
+    let session = WorkspaceSessionId([2; 16]);
+    sync_snapshot_using(session, |request| {
+        let bunkerbox::vscomm::RemoteOperation::Sync(sync) = request.operation else { panic!("expected sync") };
+        assert!(!sync.retain_capability);
+        Ok(RemoteCompletion::Completed(0))
+    })
+    .unwrap();
+}
+
+#[test]
 fn build_success_preserves_output_bytes_and_nonzero_exit_code() {
     let request_id = RequestId([6; 16]);
     let mut stream = MemoryStream::new(vec![

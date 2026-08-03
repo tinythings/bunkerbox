@@ -87,6 +87,25 @@ fn remote_sync_round_trips() {
     let request = RemoteRequest::sync(request_id, session_id);
     let decoded = RemoteRequest::from_frame(request.to_frame().unwrap()).unwrap();
     assert_eq!(decoded, request);
+    let RemoteOperation::Sync(sync) = decoded.operation else { panic!("expected sync") };
+    assert!(sync.retain_capability);
+}
+
+#[test]
+fn diagnostic_remote_sync_does_not_retain_capability() {
+    let (request_id, session_id) = ids();
+    let request = RemoteRequest::diagnostic_sync(request_id, session_id);
+    let decoded = RemoteRequest::from_frame(request.to_frame().unwrap()).unwrap();
+    let RemoteOperation::Sync(sync) = decoded.operation else { panic!("expected sync") };
+    assert!(!sync.retain_capability);
+}
+
+#[test]
+fn invalid_remote_sync_capability_flag_is_rejected() {
+    let (request_id, session_id) = ids();
+    let mut frame = RemoteRequest::diagnostic_sync(request_id, session_id).to_frame().unwrap();
+    frame.payload[40] = 2;
+    assert!(RemoteRequest::from_frame(frame).unwrap_err().contains("invalid remote sync capability flag"));
 }
 
 #[test]

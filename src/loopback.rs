@@ -18,6 +18,8 @@ use tokio::time::sleep;
 
 pub const LOOPBACK_BUILD_TIMEOUT: Duration = crate::remote::DEFAULT_REMOTE_BUILD_TIMEOUT;
 const LOOPBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+const POST_CHILD_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const POST_CHILD_EXIT_FINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct RunRemoteSession {
@@ -235,37 +237,92 @@ async fn execute_build(
     let stdout = child.stdout.take().ok_or_else(|| RemoteBackendError::Failed("loopback child has no stdout".to_string()))?;
     let stderr = child.stderr.take().ok_or_else(|| RemoteBackendError::Failed("loopback child has no stderr".to_string()))?;
     let output_bytes = Arc::new(AtomicU64::new(0));
-    let mut stdout_task =
-        Box::pin(tokio::spawn(pump(stdout, RemoteStream::Stdout, events.clone(), output_bytes.clone(), resources.max_output_bytes)));
-    let mut stderr_task = Box::pin(tokio::spawn(pump(stderr, RemoteStream::Stderr, events.clone(), output_bytes, resources.max_output_bytes)));
+    let mut stdout_task = tokio::spawn(pump(stdout, RemoteStream::Stdout, events.clone(), output_bytes.clone(), resources.max_output_bytes));
+    let mut stderr_task = tokio::spawn(pump(stderr, RemoteStream::Stderr, events.clone(), output_bytes, resources.max_output_bytes));
     let mut child_wait = Box::pin(child.wait());
     let mut timeout_sleep = Box::pin(sleep(resources.build_timeout));
+    let mut post_exit_drain_sleep = Box::pin(sleep(POST_CHILD_EXIT_DRAIN_TIMEOUT));
+    let mut final_drain_sleep = Box::pin(sleep(POST_CHILD_EXIT_FINAL_DRAIN_TIMEOUT));
     let mut child_status = None;
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut failure = None;
+    let mut post_exit_drain_active = false;
+    let mut final_drain_active = false;
+    let mut group_killed = false;
 
     while child_status.is_none() || !stdout_done || !stderr_done {
         tokio::select! {
             status = &mut child_wait, if child_status.is_none() => {
-                child_status = Some(status.map_err(|error| RemoteBackendError::Failed(format!("wait for loopback tool: {error}"))));
+                let status = status.map_err(|error| RemoteBackendError::Failed(format!("wait for loopback tool: {error}")));
+                child_status = Some(status);
+                if failure.is_some() || child_status.as_ref().is_some_and(Result::is_err) {
+                    kill_process_group(process_group.as_ref());
+                    group_killed = true;
+                    final_drain_sleep.as_mut().reset(tokio::time::Instant::now() + POST_CHILD_EXIT_FINAL_DRAIN_TIMEOUT);
+                    final_drain_active = true;
+                } else {
+                    // The child is the process-group leader. Keep draining useful
+                    // pipe data briefly, while terminating descendants that
+                    // inherited the build descriptors.
+                    terminate_process_group(process_group.as_ref());
+                    post_exit_drain_sleep.as_mut().reset(tokio::time::Instant::now() + POST_CHILD_EXIT_DRAIN_TIMEOUT);
+                    post_exit_drain_active = true;
+                }
             }
             result = &mut stdout_task, if !stdout_done => {
                 stdout_done = true;
-                if let Err(error) = join_pump(result).await { failure.get_or_insert(error); kill_process_group(process_group.as_ref()); }
+                if let Err(error) = join_pump(result).await {
+                    failure.get_or_insert(error);
+                    kill_process_group(process_group.as_ref());
+                    group_killed = true;
+                    post_exit_drain_active = false;
+                    if child_status.is_some() {
+                        final_drain_sleep.as_mut().reset(tokio::time::Instant::now() + POST_CHILD_EXIT_FINAL_DRAIN_TIMEOUT);
+                        final_drain_active = true;
+                    }
+                }
             }
             result = &mut stderr_task, if !stderr_done => {
                 stderr_done = true;
-                if let Err(error) = join_pump(result).await { failure.get_or_insert(error); kill_process_group(process_group.as_ref()); }
+                if let Err(error) = join_pump(result).await {
+                    failure.get_or_insert(error);
+                    kill_process_group(process_group.as_ref());
+                    group_killed = true;
+                    post_exit_drain_active = false;
+                    if child_status.is_some() {
+                        final_drain_sleep.as_mut().reset(tokio::time::Instant::now() + POST_CHILD_EXIT_FINAL_DRAIN_TIMEOUT);
+                        final_drain_active = true;
+                    }
+                }
             }
             _ = &mut timeout_sleep, if child_status.is_none() => {
                 failure.get_or_insert(RemoteBackendError::Timeout);
                 kill_process_group(process_group.as_ref());
+                group_killed = true;
+            }
+            _ = &mut post_exit_drain_sleep, if post_exit_drain_active => {
+                post_exit_drain_active = false;
+                kill_process_group(process_group.as_ref());
+                group_killed = true;
+                final_drain_sleep.as_mut().reset(tokio::time::Instant::now() + POST_CHILD_EXIT_FINAL_DRAIN_TIMEOUT);
+                final_drain_active = true;
+            }
+            _ = &mut final_drain_sleep, if final_drain_active => {
+                final_drain_active = false;
+                if !stdout_done {
+                    if let Some(error) = abort_pump(&mut stdout_task).await { failure.get_or_insert(error); }
+                    stdout_done = true;
+                }
+                if !stderr_done {
+                    if let Some(error) = abort_pump(&mut stderr_task).await { failure.get_or_insert(error); }
+                    stderr_done = true;
+                }
             }
         }
     }
 
-    if failure.is_none() {
+    if failure.is_none() || !group_killed {
         kill_process_group(process_group.as_ref());
     }
     if let Some(mut process_group) = process_group {
@@ -313,6 +370,18 @@ async fn join_pump(result: Result<Result<(), RemoteBackendError>, tokio::task::J
     result.map_err(|error| RemoteBackendError::Failed(format!("loopback output task failed: {error}")))?
 }
 
+async fn abort_pump(task: &mut tokio::task::JoinHandle<Result<(), RemoteBackendError>>) -> Option<RemoteBackendError> {
+    if !task.is_finished() {
+        task.abort();
+    }
+    match task.await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(error) if error.is_cancelled() => None,
+        Err(error) => Some(RemoteBackendError::Failed(format!("loopback output task failed: {error}"))),
+    }
+}
+
 async fn send_event(events: &mpsc::Sender<RemoteBackendEvent>, event: RemoteBackendEvent) -> Result<(), RemoteBackendError> {
     events.send(event).await.map_err(|_| RemoteBackendError::Cancelled)
 }
@@ -341,10 +410,22 @@ impl Drop for ProcessGroupGuard {
 }
 
 fn kill_process_group(group: Option<&ProcessGroupGuard>) {
+    signal_process_group(group, libc::SIGTERM);
+    signal_process_group(group, libc::SIGKILL);
+}
+
+fn terminate_process_group(group: Option<&ProcessGroupGuard>) {
+    signal_process_group(group, libc::SIGTERM);
+}
+
+fn signal_process_group(group: Option<&ProcessGroupGuard>, signal: libc::c_int) {
     if let Some(group) = group {
-        unsafe {
-            libc::kill(-group.pgid, libc::SIGTERM);
-            libc::kill(-group.pgid, libc::SIGKILL);
+        if group.pgid > 0 {
+            // A negative PID targets the Unix process group, so this remains
+            // effective after the original group leader has exited.
+            unsafe {
+                libc::kill(-group.pgid, signal);
+            }
         }
     }
 }

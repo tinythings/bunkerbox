@@ -17,11 +17,13 @@ pub fn run_bwrap(args: &[&str]) -> Output {
     Command::new("bwrap").args(args).output().expect("spawn bwrap")
 }
 
+#[allow(dead_code)]
 pub fn assert_success(output: &Output) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "expected success, stderr: {stderr}");
 }
 
+#[allow(dead_code)]
 pub fn assert_failure(output: &Output) {
     assert!(!output.status.success(), "expected failure");
 }

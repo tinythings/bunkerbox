@@ -1,11 +1,13 @@
 use crate::cfg::EnvMode;
 use crate::logging;
-use crate::proxy::FilterProxy;
+use crate::proxy::{FilterProxy, UnixProxyHandle};
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
 use crate::vscomm::{validate_exec_request, validate_process_path, validate_process_string, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
+use rand::Rng;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -21,18 +23,25 @@ enum ChildEvent {
     LauncherFailed(String),
 }
 
+#[derive(Debug)]
+struct SandboxProxyConfig {
+    socket_path: PathBuf,
+    netrelay_path: PathBuf,
+}
+
 struct VsockSession {
     passthrough: Arc<Vec<String>>,
     env_mode: EnvMode,
     workspace: PathBuf,
     merged_profile: Option<Arc<MergedProfile>>,
-    has_proxy: bool,
+    proxy_config: Option<Arc<SandboxProxyConfig>>,
 }
 
 pub struct VsockDaemon {
     join_handle: tokio::task::JoinHandle<()>,
     shutdown: tokio::sync::oneshot::Sender<()>,
-    proxy_handle: Option<tokio::task::JoinHandle<()>>,
+    sandbox_proxy: Option<UnixProxyHandle>,
+    sandbox_proxy_dir: Option<PathBuf>,
 }
 
 impl VsockDaemon {
@@ -56,21 +65,43 @@ impl VsockDaemon {
             Some(Arc::new(merged))
         };
 
-        let has_proxy = !allow.is_empty();
-        let proxy_handle = if has_proxy {
+        let mut sandbox_proxy: Option<UnixProxyHandle> = None;
+        let mut sandbox_proxy_dir: Option<PathBuf> = None;
+        let mut proxy_config: Option<SandboxProxyConfig> = None;
+
+        if merged_profile.is_some() && !allow.is_empty() {
             let rt = tokio::runtime::Handle::current();
-            Some(rt.block_on(async {
-                let proxy = FilterProxy::new(allow);
-                proxy.bind().await
-            })?)
-        } else {
-            None
-        };
 
-        let session = Arc::new(VsockSession { passthrough: Arc::new(passthrough), env_mode, workspace, merged_profile, has_proxy });
+            let netrelay_path = find_netrelay_binary()?;
 
-        let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, TOOLCHAIN_PORT))
-            .map_err(|e| format!("failed to bind toolchain vsock port {TOOLCHAIN_PORT}: {e}"))?;
+            let dir = make_proxy_runtime_dir()?;
+            sandbox_proxy_dir = Some(dir.clone());
+
+            let socket_path = dir.join("proxy.sock");
+            sandbox_proxy = Some(rt.block_on(FilterProxy::new(allow).bind_unix(&socket_path)).inspect_err(|_| {
+                let _ = std::fs::remove_dir(&dir);
+            })?);
+
+            proxy_config = Some(SandboxProxyConfig { socket_path, netrelay_path });
+        }
+
+        let session = Arc::new(VsockSession {
+            passthrough: Arc::new(passthrough),
+            env_mode,
+            workspace,
+            merged_profile,
+            proxy_config: proxy_config.map(Arc::new),
+        });
+
+        let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, TOOLCHAIN_PORT)).map_err(|e| {
+            if let Some(h) = sandbox_proxy.take() {
+                h.stop();
+            }
+            if let Some(d) = sandbox_proxy_dir.take() {
+                let _ = std::fs::remove_dir_all(&d);
+            }
+            format!("failed to bind toolchain vsock port {TOOLCHAIN_PORT}: {e}")
+        })?;
 
         let join_handle = tokio::spawn(async move {
             let result = daemon_loop(session, listener, shutdown_rx).await;
@@ -79,14 +110,17 @@ impl VsockDaemon {
             }
         });
 
-        Ok(Self { join_handle, shutdown: shutdown_tx, proxy_handle })
+        Ok(Self { join_handle, shutdown: shutdown_tx, sandbox_proxy, sandbox_proxy_dir })
     }
 
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
         let _ = self.join_handle.await;
-        if let Some(handle) = self.proxy_handle {
-            handle.abort();
+        if let Some(h) = self.sandbox_proxy {
+            h.stop();
+        }
+        if let Some(d) = self.sandbox_proxy_dir {
+            let _ = std::fs::remove_dir_all(&d);
         }
     }
 }
@@ -274,7 +308,7 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
             cmd.arg("--ro-bind").arg(&resolved).arg("/bin/sh");
         }
 
-        if !session.has_proxy && matches!(merged.network, NetworkMode::None) {
+        if matches!(merged.network, NetworkMode::None) {
             cmd.arg("--unshare-net");
         }
 
@@ -296,7 +330,13 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
         cmd.arg("--setenv").arg("PATH").arg("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
         cmd.arg("--setenv").arg("HOME").arg("/home");
 
-        if session.has_proxy {
+        if let Some(ref cfg) = session.proxy_config {
+            cmd.arg("--dir").arg("/run/bunkerbox");
+            cmd.arg("--ro-bind").arg(&cfg.netrelay_path).arg("/run/bunkerbox/netrelay");
+            cmd.arg("--ro-bind").arg(&cfg.socket_path).arg("/run/bunkerbox/proxy.sock");
+        }
+
+        if session.proxy_config.is_some() {
             let proxy_url = "http://127.0.0.1:20000";
             cmd.arg("--setenv").arg("HTTP_PROXY").arg(proxy_url);
             cmd.arg("--setenv").arg("HTTPS_PROXY").arg(proxy_url);
@@ -328,6 +368,12 @@ fn build_command(session: &VsockSession, req: &ExecRequest, host_cwd: &Path, san
 
         cmd.arg("--json-status-fd").arg(BWRAP_STATUS_FD.to_string());
         cmd.arg("--");
+        if session.proxy_config.is_some() {
+            cmd.arg("/run/bunkerbox/netrelay");
+            cmd.arg("--socket");
+            cmd.arg("/run/bunkerbox/proxy.sock");
+            cmd.arg("--");
+        }
         cmd.arg(&req.command);
         for arg in &req.args {
             cmd.arg(arg);
@@ -514,6 +560,33 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, frame: &Frame) ->
     writer.flush().await.map_err(|e| format!("flush: {e}"))?;
 
     Ok(())
+}
+
+fn find_netrelay_binary() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locate self: {e}"))?;
+    let dir = exe.parent().ok_or("no binary directory")?;
+    let sibling = dir.join("bunkerbox-netrelay");
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    Err("bunkerbox-netrelay not found. Run: make dev".into())
+}
+
+fn make_proxy_runtime_dir() -> Result<PathBuf, String> {
+    let mut rng = rand::thread_rng();
+    let base = std::env::temp_dir();
+    for _ in 0..10 {
+        let random: u32 = rng.gen();
+        let path = base.join(format!("bunkerbox-daemon-{}-{:08x}", std::process::id(), random));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("mkdir {}: {e}", path.display())),
+        }
+    }
+    Err("failed to create exclusive proxy runtime directory after 10 attempts".to_string())
 }
 
 #[cfg(test)]

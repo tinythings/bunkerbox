@@ -43,25 +43,31 @@ ensure-toolchain:
 
 dev: ensure-toolchain
 	cargo build --bin bunkerbox --bin bunkerbox-image
+	cargo build --bin bunkerbox-netrelay --target $(VSCOMM_TARGET)
 	cargo build --bin bunkerbox-vscomm --target $(VSCOMM_TARGET)
 	cargo build --bin bunkerbox-status --target $(VSCOMM_TARGET)
 	rm -rf target/dist
 	mkdir -p target/dist
 	cp target/debug/bunkerbox target/dist/
 	cp target/debug/bunkerbox-image target/dist/
+	cp target/$(VSCOMM_TARGET)/debug/bunkerbox-netrelay target/dist/
 	cp target/$(VSCOMM_TARGET)/debug/bunkerbox-vscomm target/dist/
 	cp target/$(VSCOMM_TARGET)/debug/bunkerbox-status target/dist/
+	cp target/$(VSCOMM_TARGET)/debug/bunkerbox-netrelay target/debug/bunkerbox-netrelay
 
 release: ensure-toolchain
 	cargo build --bin bunkerbox --bin bunkerbox-image --release
+	cargo build --bin bunkerbox-netrelay --target $(VSCOMM_TARGET) --release
 	cargo build --bin bunkerbox-vscomm --target $(VSCOMM_TARGET) --release
 	cargo build --bin bunkerbox-status --target $(VSCOMM_TARGET) --release
 	rm -rf target/dist
 	mkdir -p target/dist
 	cp target/release/bunkerbox target/dist/
 	cp target/release/bunkerbox-image target/dist/
+	cp target/$(VSCOMM_TARGET)/release/bunkerbox-netrelay target/dist/
 	cp target/$(VSCOMM_TARGET)/release/bunkerbox-vscomm target/dist/
 	cp target/$(VSCOMM_TARGET)/release/bunkerbox-status target/dist/
+	cp target/$(VSCOMM_TARGET)/release/bunkerbox-netrelay target/release/bunkerbox-netrelay
 
 check:
 	cargo fmt --all

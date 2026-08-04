@@ -369,7 +369,7 @@ fn local_exec_request_still_builds_on_the_local_path() {
         env_mode: EnvMode::Paranoid,
         workspace: workspace.path().to_path_buf(),
         merged_profile: None,
-        has_proxy: false,
+        proxy_config: None,
         remote_broker: Arc::new(remote_broker(Arc::new(RecordingBackend { calls: Mutex::new(Vec::new()), emit: Vec::new(), result: None }))),
     };
     let request = crate::vscomm::ExecRequest { cwd: "/workspace".into(), command: "true".into(), args: Vec::new(), env: Vec::new() };

@@ -143,7 +143,7 @@ async fn raw_connect_blocked_with_proxy_enabled() {
         }
     });
 
-    let _proxy = FilterProxy::new(vec!["localhost".into()]).bind_unix(&sock_path).await.unwrap();
+    let _proxy = FilterProxy::new_test_no_destination_check(vec!["localhost".into()]).bind_unix(&sock_path).await.unwrap();
 
     let src = write_temp_source("raw_connect.c", RAW_CONNECT_C);
 
@@ -190,7 +190,7 @@ async fn allowed_proxied_http_succeeds() {
         }
     });
 
-    let _proxy = FilterProxy::new(vec!["127.0.0.1".into()]).bind_unix(&sock_path).await.unwrap();
+    let _proxy = FilterProxy::new_test_no_destination_check(vec!["127.0.0.1".into()]).bind_unix(&sock_path).await.unwrap();
 
     let netrelay_path = std::env::current_exe().unwrap().parent().unwrap().join("bunkerbox-netrelay");
     if !netrelay_path.is_file() {
@@ -249,7 +249,7 @@ async fn denied_proxied_http_fails() {
         }
     });
 
-    let _proxy = FilterProxy::new(vec!["only-this-host.example".into()]).bind_unix(&sock_path).await.unwrap();
+    let _proxy = FilterProxy::new_test_no_destination_check(vec!["only-this-host.example".into()]).bind_unix(&sock_path).await.unwrap();
 
     let netrelay_path = std::env::current_exe().unwrap().parent().unwrap().join("bunkerbox-netrelay");
     if !netrelay_path.is_file() {
@@ -309,7 +309,7 @@ fn startup_cleanup_removes_owned_resources() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("proxy.sock");
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let handle = rt.block_on(FilterProxy::new(vec!["localhost".into()]).bind_unix(&sock_path)).unwrap();
+    let handle = rt.block_on(FilterProxy::new_test_no_destination_check(vec!["localhost".into()]).bind_unix(&sock_path)).unwrap();
     assert!(sock_path.exists());
 
     handle.stop();

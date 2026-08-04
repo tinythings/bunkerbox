@@ -14,7 +14,7 @@ async fn proxy_allows_connect_to_allowed_host() {
         sock.write_all(&buf[..n]).await.unwrap();
     });
 
-    let (handle, proxy_port) = FilterProxy::new(vec!["localhost".into()]).bind_on(0).await.unwrap();
+    let (handle, proxy_port) = FilterProxy::new_test_no_destination_check(vec!["localhost".into()]).bind_on(0).await.unwrap();
 
     let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
 
@@ -35,7 +35,7 @@ async fn proxy_allows_connect_to_allowed_host() {
 
 #[tokio::test]
 async fn proxy_blocks_connect_to_denied_host() {
-    let (handle, proxy_port) = FilterProxy::new(vec!["only.this.host".into()]).bind_on(0).await.unwrap();
+    let (handle, proxy_port) = FilterProxy::new_test_no_destination_check(vec!["only.this.host".into()]).bind_on(0).await.unwrap();
 
     let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
 
@@ -58,7 +58,7 @@ async fn proxy_forwards_plain_http_to_allowed_host() {
         sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nworld").await.unwrap();
     });
 
-    let (handle, proxy_port) = FilterProxy::new(vec!["localhost".into()]).bind_on(0).await.unwrap();
+    let (handle, proxy_port) = FilterProxy::new_test_no_destination_check(vec!["localhost".into()]).bind_on(0).await.unwrap();
 
     let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
 

@@ -48,3 +48,7 @@ path = "src/bin/bunkerbox-vscomm.rs"
 [[bin]]
 name = "bunkerbox-status"
 path = "src/bin/bunkerbox-status.rs"
+
+[[bin]]
+name = "bunkerbox-netrelay"
+path = "src/bin/bunkerbox-netrelay.rs"

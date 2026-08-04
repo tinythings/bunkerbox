@@ -1,10 +1,41 @@
 use crate::logging;
 use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixListener};
 
 pub const PORT: u16 = 20000;
 const BIND_ADDR: &str = "127.0.0.1";
+
+pub struct UnixProxyHandle {
+    task: tokio::task::JoinHandle<()>,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl UnixProxyHandle {
+    pub fn stop(self) {
+        self.task.abort();
+        self.remove_if_unchanged();
+    }
+
+    fn remove_if_unchanged(&self) {
+        if let Ok(meta) = std::fs::symlink_metadata(&self.path) {
+            if meta.dev() == self.dev && meta.ino() == self.ino && meta.file_type().is_socket() {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+impl Drop for UnixProxyHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.remove_if_unchanged();
+    }
+}
 
 pub struct FilterProxy {
     allow: Vec<String>,
@@ -48,9 +79,42 @@ impl FilterProxy {
 
         Ok((handle, bound_port))
     }
+
+    pub async fn bind_unix(self, path: impl AsRef<Path>) -> Result<UnixProxyHandle, String> {
+        let path = path.as_ref().to_path_buf();
+
+        let listener = UnixListener::bind(&path).map_err(|e| format!("failed to bind proxy on {}: {e}", path.display()))?;
+
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("failed to stat socket {}: {e}", path.display()))?;
+
+        let allow = self.allow;
+
+        let task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _peer)) => {
+                        let allow = allow.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_client(stream, &allow).await {
+                                logging::diagnostic(&format!("bunkerbox-proxy: client failed: {err}"));
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        logging::diagnostic(&format!("bunkerbox-proxy: accept error: {e}"));
+                    }
+                }
+            }
+        });
+
+        Ok(UnixProxyHandle { task, path, dev: meta.dev(), ino: meta.ino() })
+    }
 }
 
-async fn handle_client(mut client: TcpStream, allow: &[String]) -> Result<(), String> {
+async fn handle_client<C>(mut client: C, allow: &[String]) -> Result<(), String>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     let mut buf = [0u8; 8192];
     let n = client.read(&mut buf).await.map_err(|e| format!("read request: {e}"))?;
 
@@ -96,15 +160,7 @@ async fn handle_client(mut client: TcpStream, allow: &[String]) -> Result<(), St
         upstream.write_all(&buf[..n]).await.map_err(|e| format!("write upstream: {e}"))?;
     }
 
-    let (mut cr, mut cw) = client.into_split();
-    let (mut ur, mut uw) = upstream.into_split();
-
-    let c_to_u = tokio::spawn(async move { tokio::io::copy(&mut cr, &mut uw).await });
-    let u_to_c = tokio::spawn(async move { tokio::io::copy(&mut ur, &mut cw).await });
-
-    let _ = tokio::try_join!(c_to_u, u_to_c);
-
-    Ok(())
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await.map(|_| ()).map_err(|e| format!("relay error: {e}"))
 }
 
 fn parse_host_port(target: &str) -> Result<(String, String), String> {

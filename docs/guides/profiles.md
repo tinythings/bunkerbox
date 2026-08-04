@@ -135,7 +135,11 @@ etc.). `${HOME}` expands to `/home`; `${USER}` and `${TERM}` use the host
 runtime values when present.
 
 **`network`** — currently only `none` is supported. The sandboxed command has
-no network access.
+no direct network access. When a runtime `allow` list is configured, mediated
+HTTP access is available through `bunkerbox-netrelay` and the host FilterProxy
+via a mounted AF_UNIX socket. This path is kernel-enforced through the
+`--unshare-net` namespace; ignoring `HTTP_PROXY` does not restore direct
+network access.
 
 **`shell`** — the absolute path to the shell used when the command specifies
 `/bin/sh` as its interpreter. Defaults to `/bin/sh`.

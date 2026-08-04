@@ -96,10 +96,12 @@ active, they merge: the union of all binaries and paths is available to the
 sandboxed command.
 
 Inside the sandbox, the command sees a scratch `/home`, an empty `/tmp`, its
-own `/proc`, no network, and only the binaries and paths you explicitly
-allowed. Home-relative cache paths are deliberate writable carryover paths;
-profile declarations are trusted host policy, not a complete rogue-process
-capability model.
+own `/proc`, no direct network access, and only the binaries and paths you
+explicitly allowed. When an allowlist is active, mediated HTTP(S) proxying
+is available through the kernel-enforced `--unshare-net` namespace; raw
+sockets cannot bypass it. Home-relative cache paths are deliberate writable
+carryover paths; profile declarations are trusted host policy, not a complete
+rogue-process capability model.
 
 See the [Profiles guide](guides/profiles.md) for the full reference.
 

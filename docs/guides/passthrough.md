@@ -155,10 +155,43 @@ spawning it.
 Bubblewrap uses Linux user namespaces to build a thin, unprivileged container
 around the command. The daemon reads the profile and translates it into
 filesystem and network boundaries: only the binaries you allowed are visible,
-only the directories you declared are accessible, and the network is blocked
-unless you opened it. The command gets a clean environment and a scratch home
-directory — it cannot read your SSH keys, your AWS tokens, or anything else on
-your host.
+only the directories you declared are accessible. The command gets a clean
+environment, a scratch home directory, and its own `/proc` and `/dev`. It
+cannot read your SSH keys, your AWS tokens, or anything else on your
+host.
+
+**Network isolation.** Every profiled passthrough command runs with
+`--unshare-net`. The sandbox has no direct host or Internet networking.
+Raw `socket()` / `connect()` calls cannot reach any IP destination.
+
+When a runtime `allow` list is configured, a mediated HTTP proxy path is
+available:
+
+```text
+target inside bwrap
+  → TCP 127.0.0.1:20000
+  → bunkerbox-netrelay
+  → mounted AF_UNIX socket
+  → host FilterProxy
+  → resolved and validated destination
+```
+
+`bunkerbox-netrelay` is a static helper that listens on the isolated bwrap
+loopback and forwards every connection to the host FilterProxy through a
+mounted pathname Unix socket. FilterProxy enforces the hostname allowlist,
+resolves DNS once, validates every concrete destination address against the
+address policy, and connects only to allowed public destinations.
+
+`HTTP_PROXY` and `HTTPS_PROXY` environment variables are compatibility
+hints for well-behaved tools. They are **not** the security boundary.
+Ignoring proxy environment variables does not restore direct network access.
+The kernel network-namespace isolation (`--unshare-net`) is the boundary.
+
+Without an allowlist, no proxy or relay infrastructure is created and the
+sandboxed command has no network access at all.
+
+No iptables, veth pairs, or root networking machinery is required for
+this path.
 
 When profiles are empty (the default), passthrough commands run directly on
 the host with no sandbox wrapping.

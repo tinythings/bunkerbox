@@ -47,10 +47,8 @@ impl FilterProxy {
         Self { allow, check_destinations: true }
     }
 
-    /// Creates a FilterProxy without destination address validation.
-    /// For integration tests that use localhost upstreams.
-    #[doc(hidden)]
-    pub fn new_test_no_destination_check(allow: Vec<String>) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn new_test_no_destination_check(allow: Vec<String>) -> Self {
         Self { allow, check_destinations: false }
     }
 

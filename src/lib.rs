@@ -13,3 +13,7 @@ pub mod tui;
 pub mod vscomm;
 pub mod workspace;
 pub mod wrap;
+
+#[cfg(test)]
+#[path = "passthrough_network_ut.rs"]
+mod passthrough_network_tests;

@@ -36,14 +36,14 @@ request_headers:
 #[test]
 fn auth_backend_plugin() {
     let yaml = r#"
-name: tabnine
+name: example
 config:
-  host: https://tabnine.example.com
+  host: https://example.com
 "#;
     let a = deser_auth_backend(yaml);
     match a {
         AuthBackendConfig::Plugin(p) => {
-            assert_eq!(p.name, "tabnine");
+            assert_eq!(p.name, "example");
         }
         _ => panic!("expected plugin"),
     }
@@ -130,14 +130,12 @@ auth:
 "#;
     let a = deser_auth_backend(yaml);
     match a {
-        AuthBackendConfig::Declarative(d) => {
-            match d.auth {
-                AuthFlow::OAuth2 { ref scopes, .. } => {
-                    assert_eq!(scopes, &vec!["read".to_string(), "write".to_string()]);
-                }
-                _ => panic!("expected oauth2"),
+        AuthBackendConfig::Declarative(d) => match d.auth {
+            AuthFlow::OAuth2 { ref scopes, .. } => {
+                assert_eq!(scopes, &vec!["read".to_string(), "write".to_string()]);
             }
-        }
+            _ => panic!("expected oauth2"),
+        },
         _ => panic!("expected declarative"),
     }
 }

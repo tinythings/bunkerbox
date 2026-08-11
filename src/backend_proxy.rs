@@ -22,12 +22,7 @@ pub struct CachedToken {
     pub expires_at: Instant,
 }
 
-pub fn spawn_refresh_loop(
-    jwt: Arc<RwLock<Option<CachedToken>>>,
-    auth: Arc<AuthFlow>,
-    host: String,
-    refresh_credential: Option<String>,
-) {
+pub fn spawn_refresh_loop(jwt: Arc<RwLock<Option<CachedToken>>>, auth: Arc<AuthFlow>, host: String, refresh_credential: Option<String>) {
     let Some(refresh_credential) = refresh_credential else { return };
 
     actix_rt::spawn(async move {
@@ -78,7 +73,7 @@ pub async fn get_token(state: web::Data<ProxyState>) -> HttpResponse {
 
 pub async fn proxy_models(state: web::Data<ProxyState>, _req: HttpRequest) -> HttpResponse {
     let token = current_token(&state);
-    let client = Client::default();
+    let client = upstream_client();
     let target = format!("{}/chat/v2/models", state.host);
 
     proxy_log(&state, &format!("GET {target}"));
@@ -99,7 +94,7 @@ pub async fn proxy_models(state: web::Data<ProxyState>, _req: HttpRequest) -> Ht
             match upstream.body().limit(8_000_000).await {
                 Ok(bytes) => {
                     proxy_log(&state, &format!("→ {status} ({} bytes)", bytes.len()));
-                    let translated = translate_tabnine_models(&bytes);
+                    let translated = translate_models(&bytes);
                     HttpResponse::build(status).body(translated)
                 }
                 Err(e) => {
@@ -115,12 +110,12 @@ pub async fn proxy_models(state: web::Data<ProxyState>, _req: HttpRequest) -> Ht
     }
 }
 
-fn translate_tabnine_models(body: &[u8]) -> Vec<u8> {
-    let Ok(tabnine) = serde_json::from_slice::<serde_json::Value>(body) else {
+fn translate_models(body: &[u8]) -> Vec<u8> {
+    let Ok(upstream) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.to_vec();
     };
 
-    let Some(models) = tabnine.get("models").and_then(|m| m.as_array()) else {
+    let Some(models) = upstream.get("models").and_then(|m| m.as_array()) else {
         return body.to_vec();
     };
 
@@ -128,21 +123,35 @@ fn translate_tabnine_models(body: &[u8]) -> Vec<u8> {
         .iter()
         .filter_map(|m| {
             let id = m.get("id")?.as_str()?;
+            let capabilities = m.get("capabilities")?.as_array()?;
+            if !capabilities.iter().any(|capability| capability.as_str() == Some("agent"))
+                || m.get("isAgentEnabled").and_then(|enabled| enabled.as_bool()) == Some(false)
+            {
+                return None;
+            }
             let name = m.get("name").and_then(|n| n.as_str()).unwrap_or(id);
             Some(serde_json::json!({
                 "id": id,
                 "object": "model",
                 "created": 0,
-                "owned_by": "tabnine",
+                "owned_by": "upstream",
                 "name": name
             }))
         })
         .collect();
 
-    let openai = serde_json::json!({
+    let default = upstream
+        .get("default")
+        .or_else(|| upstream.get("defaultModel"))
+        .and_then(|value| value.as_str())
+        .filter(|id| data.iter().any(|model| model.get("id").and_then(|value| value.as_str()) == Some(*id)));
+    let mut openai = serde_json::json!({
         "object": "list",
         "data": data
     });
+    if let Some(default) = default {
+        openai["default"] = serde_json::Value::String(default.to_string());
+    }
 
     openai.to_string().into_bytes()
 }
@@ -153,7 +162,7 @@ pub async fn proxy_chat_completions(state: web::Data<ProxyState>, body: web::Byt
 
 async fn proxy_upstream(state: &web::Data<ProxyState>, path: &str, body: web::Bytes) -> HttpResponse {
     let token = current_token(state);
-    let client = Client::default();
+    let client = upstream_client();
     let target = format!("{}{path}", state.host);
 
     proxy_log(state, &format!("POST {target}"));
@@ -169,8 +178,9 @@ async fn proxy_upstream(state: &web::Data<ProxyState>, path: &str, body: web::By
         req = req.insert_header((name.as_str(), value.as_str()));
     }
 
-    match req.send_body(body.to_vec()).await {
-        Ok(mut upstream) => {
+    let body = normalize_chat_request(body);
+    match req.send_body(body).await {
+        Ok(upstream) => {
             let status = upstream.status();
             let mut resp = HttpResponse::build(status);
             for (key, val) in upstream.headers() {
@@ -178,22 +188,34 @@ async fn proxy_upstream(state: &web::Data<ProxyState>, path: &str, body: web::By
                     resp.insert_header((key.clone(), val.clone()));
                 }
             }
-            match upstream.body().limit(128_000_000).await {
-                Ok(bytes) => {
-                    proxy_log(state, &format!("→ {status} ({} bytes)", bytes.len()));
-                    resp.body(bytes)
-                }
-                Err(e) => {
-                    proxy_log(state, &format!("→ body read error: {e}"));
-                    HttpResponse::BadGateway().body(e.to_string())
-                }
-            }
+            proxy_log(state, &format!("→ {status}"));
+            resp.streaming(upstream)
         }
         Err(e) => {
             proxy_log(state, &format!("→ ERROR: {e}"));
             HttpResponse::BadGateway().body(e.to_string())
         }
     }
+}
+
+fn upstream_client() -> Client {
+    Client::builder().timeout(std::time::Duration::from_secs(600)).finish()
+}
+
+fn normalize_chat_request(body: web::Bytes) -> Vec<u8> {
+    let Ok(mut request) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body.to_vec();
+    };
+
+    let Some(request) = request.as_object_mut() else {
+        return body.to_vec();
+    };
+    if !request.contains_key("max_completion_tokens") {
+        if let Some(max_tokens) = request.remove("max_tokens") {
+            request.insert("max_completion_tokens".into(), max_tokens);
+        }
+    }
+    serde_json::to_vec(&request).unwrap_or_else(|_| body.to_vec())
 }
 
 fn proxy_log(state: &web::Data<ProxyState>, msg: &str) {
@@ -208,3 +230,7 @@ fn proxy_log(state: &web::Data<ProxyState>, msg: &str) {
 fn current_token(state: &web::Data<ProxyState>) -> String {
     state.jwt.read().unwrap().as_ref().map(|t| t.token.clone()).unwrap_or_default()
 }
+
+#[cfg(test)]
+#[path = "backend_proxy_ut.rs"]
+mod backend_proxy_tests;

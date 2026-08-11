@@ -3,8 +3,8 @@ mod backend_auth;
 #[path = "../backend_proxy.rs"]
 mod backend_proxy;
 
-use std::fs::File;
 use std::fs;
+use std::fs::File;
 use std::io::Write;
 use std::os::fd::FromRawFd;
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use actix_web::{web, App, HttpServer};
 
 use backend_auth::AuthFlow;
-use backend_proxy::{CachedToken, ProxyState, spawn_refresh_loop};
+use backend_proxy::{spawn_refresh_loop, CachedToken, ProxyState};
 
 #[derive(Debug, serde::Deserialize)]
 struct SidecarConfig {
@@ -59,10 +59,21 @@ async fn run() -> Result<(), String> {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--config" => { config_path = args.get(i + 1).cloned(); i += 2; }
-            "--status-fd" => { status_fd_raw = args.get(i + 1).and_then(|v| v.parse().ok()); i += 2; }
-            "--log" => { log_path = args.get(i + 1).cloned(); i += 2; }
-            _ => { i += 1; }
+            "--config" => {
+                config_path = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--status-fd" => {
+                status_fd_raw = args.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--log" => {
+                log_path = args.get(i + 1).cloned();
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
 
@@ -75,9 +86,7 @@ async fn run() -> Result<(), String> {
 
     match config.backend {
         InnerConfig::Declarative(decl) => run_declarative(decl, &mut status_fd, log_path).await,
-        InnerConfig::Plugin { name, .. } => {
-            Err(format!("plugin '{name}' run directly: bunkerbox-auth-backend-{name}"))
-        }
+        InnerConfig::Plugin { name, .. } => Err(format!("plugin '{name}' run directly: bunkerbox-auth-backend-{name}")),
     }
 }
 
@@ -85,9 +94,7 @@ async fn run_declarative(decl: DeclarativeCfg, status_fd: &mut File, log_path: O
     let host = decl.host.trim_end_matches('/').to_string();
 
     let log_file = log_path
-        .map(|p| {
-            std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("open log {p}: {e}"))
-        })
+        .map(|p| std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("open log {p}: {e}")))
         .transpose()?
         .map(|f| Arc::new(Mutex::new(f)));
 

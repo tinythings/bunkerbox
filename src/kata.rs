@@ -1,7 +1,7 @@
+use crate::auth_backend::AuthBackendHandle;
 use crate::cfg::{HomeMode, NetworkMode, RuntimeConfig};
 use crate::vscomm::TOOLCHAIN_PORT;
 use crate::workspace::WorkspaceHandle;
-use crate::auth_backend::AuthBackendHandle;
 use aes_gcm::aead::consts::U12;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -41,8 +41,7 @@ fn cleanup_partial_session(session_dir: Option<&PathBuf>, home_path: Option<&Pat
 }
 
 pub fn run(
-    config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, share_dir: &Path, app_name: &str, vsock_enabled: bool,
-    status_fd: RawFd,
+    config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, share_dir: &Path, app_name: &str, vsock_enabled: bool, status_fd: RawFd,
 ) -> Result<(), String> {
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));

@@ -55,7 +55,9 @@ impl AuthBackendHandle {
     }
 
     pub fn shutdown(&mut self) {
-        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM); }
+        unsafe {
+            libc::kill(self.child.id() as i32, libc::SIGTERM);
+        }
         let _ = self.child.wait();
     }
 }
@@ -160,11 +162,15 @@ fn read_auth_port(child: &mut Child, timeout: Duration) -> Result<u16, String> {
         match reader.read_line(&mut line) {
             Ok(0) => {
                 let status = child.wait();
-                let stderr = child.stderr.take().and_then(|mut s| {
-                    use std::io::Read;
-                    let mut buf = String::new();
-                    s.read_to_string(&mut buf).ok().map(|_| buf.trim().to_string())
-                }).unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .and_then(|mut s| {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        s.read_to_string(&mut buf).ok().map(|_| buf.trim().to_string())
+                    })
+                    .unwrap_or_default();
                 let detail = if stderr.is_empty() {
                     format!("exit code: {}", status.map(|s| s.code().unwrap_or(-1).to_string()).unwrap_or_else(|_| "unknown".into()))
                 } else {

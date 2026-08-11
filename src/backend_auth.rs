@@ -51,16 +51,39 @@ pub struct InitialAuth {
 pub fn authenticate(config: &AuthFlow, host: &str, status_fd: &mut File) -> Result<InitialAuth, String> {
     match config {
         AuthFlow::Env { variable } => authenticate_env(variable),
-        AuthFlow::OAuth2 { authorize_url, token_url, refresh_url, client_id, scopes, response_field, expires_in_field } => {
-            authenticate_oauth2(host, authorize_url, token_url, refresh_url.as_deref(), client_id, scopes, response_field, expires_in_field.as_deref(), status_fd)
-        }
+        AuthFlow::OAuth2 { authorize_url, token_url, refresh_url, client_id, scopes, response_field, expires_in_field } => authenticate_oauth2(
+            host,
+            authorize_url,
+            token_url,
+            refresh_url.as_deref(),
+            client_id,
+            scopes,
+            response_field,
+            expires_in_field.as_deref(),
+            status_fd,
+        ),
         AuthFlow::CustomTokenExchange {
-            login_url, manual_url, exchange_url, exchange_body_template, refresh_token_field,
-            refresh_url, refresh_body_template, id_token_field, expires_in_field,
+            login_url,
+            manual_url,
+            exchange_url,
+            exchange_body_template,
+            refresh_token_field,
+            refresh_url,
+            refresh_body_template,
+            id_token_field,
+            expires_in_field,
         } => authenticate_custom_token(
-            host, login_url, manual_url.as_deref(), exchange_url, exchange_body_template,
-            refresh_token_field, refresh_url, refresh_body_template, id_token_field,
-            expires_in_field.as_deref(), status_fd,
+            host,
+            login_url,
+            manual_url.as_deref(),
+            exchange_url,
+            exchange_body_template,
+            refresh_token_field,
+            refresh_url,
+            refresh_body_template,
+            id_token_field,
+            expires_in_field.as_deref(),
+            status_fd,
         ),
     }
 }
@@ -87,15 +110,14 @@ fn authenticate_env(variable: &str) -> Result<InitialAuth, String> {
 }
 
 fn authenticate_oauth2(
-    host: &str, authorize_url_template: &str, token_url: &str, refresh_url: Option<&str>,
-    client_id: &str, scopes: &[String], response_field: &str, expires_in_field: Option<&str>,
-    status_fd: &mut File,
+    host: &str, authorize_url_template: &str, token_url: &str, refresh_url: Option<&str>, client_id: &str, scopes: &[String], response_field: &str,
+    expires_in_field: Option<&str>, status_fd: &mut File,
 ) -> Result<InitialAuth, String> {
     let code_verifier = random_string(64);
     let code_challenge = base64_url_no_pad(sha256(code_verifier.as_bytes()));
 
     let (callback_port, code) = start_callback(status_fd, "code")?;
-    let redirect_uri = format!("http://127.0.0.1:{callback_port}/callback");
+    let redirect_uri = format!("http://localhost:{callback_port}/authcallback");
 
     let authorize_url = resolve_template(authorize_url_template, host, &redirect_uri, "", "");
     let mut url = format!(
@@ -107,7 +129,8 @@ fn authenticate_oauth2(
 
     status_line(status_fd, "Opening browser for login...");
     webbrowser::open(&url).map_err(|e| format!("browser: {e}"))?;
-    let code: Result<String, String> = code.recv_timeout(std::time::Duration::from_secs(300)).map_err(|_: std::sync::mpsc::RecvTimeoutError| "login timed out".to_string())?;
+    let code: Result<String, String> =
+        code.recv_timeout(std::time::Duration::from_secs(300)).map_err(|_: std::sync::mpsc::RecvTimeoutError| "login timed out".to_string())?;
     let code = code?;
     status_line(status_fd, "Exchanging authorization code...");
 
@@ -129,8 +152,7 @@ fn authenticate_oauth2(
 }
 
 fn refresh_oauth2(
-    host: &str, refresh_url: &str, _token_url: &str, client_id: &str, refresh_token_val: &str,
-    response_field: &str, expires_in_field: Option<&str>,
+    host: &str, refresh_url: &str, _token_url: &str, client_id: &str, refresh_token_val: &str, response_field: &str, expires_in_field: Option<&str>,
 ) -> Result<InitialAuth, String> {
     let url = resolve_template(refresh_url, host, "", "", "");
     let body = serde_json::json!({
@@ -152,10 +174,8 @@ fn refresh_oauth2(
 }
 
 fn authenticate_custom_token(
-    host: &str, login_url_template: &str, manual_url: Option<&str>,
-    exchange_url: &str, exchange_body_template: &str, refresh_token_field_val: &str,
-    refresh_url_str: &str, refresh_body_template: &str, id_token_field: &str,
-    expires_in_field: Option<&str>, status_fd: &mut File,
+    host: &str, login_url_template: &str, manual_url: Option<&str>, exchange_url: &str, exchange_body_template: &str, refresh_token_field_val: &str,
+    refresh_url_str: &str, refresh_body_template: &str, id_token_field: &str, expires_in_field: Option<&str>, status_fd: &mut File,
 ) -> Result<InitialAuth, String> {
     let (callback_port, custom_token) = start_callback(status_fd, "custom_token")?;
     let redirect_uri = format!("http://127.0.0.1:{callback_port}/callback");
@@ -200,8 +220,7 @@ fn authenticate_custom_token(
 }
 
 fn refresh_custom_token(
-    host: &str, refresh_url: &str, refresh_body_template: &str, refresh_credential: &str,
-    id_token_field: &str, expires_in_field: Option<&str>,
+    host: &str, refresh_url: &str, refresh_body_template: &str, refresh_credential: &str, id_token_field: &str, expires_in_field: Option<&str>,
 ) -> Result<InitialAuth, String> {
     let url = resolve_template(refresh_url, host, "", "", "");
     let body = resolve_template(refresh_body_template, host, "", "", refresh_credential);
@@ -210,7 +229,11 @@ fn refresh_custom_token(
     let token = extract_string(&response, id_token_field)?;
     let expires_in = expires_in_field.and_then(|f| extract_u64(&response, f).ok());
 
-    Ok(InitialAuth { token, expires_at: expires_in.map(|s| Instant::now() + std::time::Duration::from_secs(s)), refresh_credential: Some(refresh_credential.into()) })
+    Ok(InitialAuth {
+        token,
+        expires_at: expires_in.map(|s| Instant::now() + std::time::Duration::from_secs(s)),
+        refresh_credential: Some(refresh_credential.into()),
+    })
 }
 
 fn start_callback(_status_fd: &mut File, param: &str) -> Result<(u16, std::sync::mpsc::Receiver<Result<String, String>>), String> {
@@ -223,7 +246,10 @@ fn start_callback(_status_fd: &mut File, param: &str) -> Result<(u16, std::sync:
         let mut incoming = listener.incoming();
         let mut stream = match incoming.next() {
             Some(Ok(s)) => s,
-            _ => { let _ = tx.send(Err("callback connection failed".into())); return; }
+            _ => {
+                let _ = tx.send(Err("callback connection failed".into()));
+                return;
+            }
         };
 
         let mut reader = BufReader::new(&mut stream);
@@ -252,7 +278,11 @@ fn read_token_from_stdin(prompt: &str) -> Result<String, String> {
     let mut input = String::new();
     io::stdin().read_line(&mut input).map_err(|e| format!("read: {e}"))?;
     let token = input.trim().to_string();
-    if token.is_empty() { Err("token required".into()) } else { Ok(token) }
+    if token.is_empty() {
+        Err("token required".into())
+    } else {
+        Ok(token)
+    }
 }
 
 fn parse_query_param(query: &str, param: &str) -> Option<String> {
@@ -273,7 +303,9 @@ fn url_decode(s: &str) -> String {
             b'%' => {
                 let hi = chars.next().and_then(hex_val);
                 let lo = chars.next().and_then(hex_val);
-                if let (Some(h), Some(l)) = (hi, lo) { result.push((h << 4 | l) as char); }
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    result.push((h << 4 | l) as char);
+                }
             }
             b'+' => result.push(' '),
             _ => result.push(b as char),
@@ -298,19 +330,19 @@ fn status_line(status_fd: &mut File, message: &str) {
 }
 
 fn resolve_template(template: &str, host: &str, callback_url: &str, custom_token: &str, refresh_token: &str) -> String {
-    template.replace("{host}", host).replace("{callback_url}", callback_url).replace("{custom_token}", custom_token).replace("{refresh_token}", refresh_token)
+    template
+        .replace("{host}", host)
+        .replace("{callback_url}", callback_url)
+        .replace("{custom_token}", custom_token)
+        .replace("{refresh_token}", refresh_token)
 }
 
 fn post_json(url: &str, body: &str, timeout_secs: u32) -> Result<serde_json::Value, String> {
-    let tls = ureq::tls::TlsConfig::builder()
-        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-        .build();
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(tls)
-        .timeout_global(Some(std::time::Duration::from_secs(timeout_secs as u64)))
-        .build()
-        .into();
-    let resp = agent.post(url)
+    let tls = ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build();
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().tls_config(tls).timeout_global(Some(std::time::Duration::from_secs(timeout_secs as u64))).build().into();
+    let resp = agent
+        .post(url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .send(body)

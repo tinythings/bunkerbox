@@ -1,6 +1,7 @@
 use crate::cfg::{HomeMode, NetworkMode, RuntimeConfig};
 use crate::vscomm::TOOLCHAIN_PORT;
 use crate::workspace::WorkspaceHandle;
+use crate::auth_backend::AuthBackendHandle;
 use aes_gcm::aead::consts::U12;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -40,8 +41,8 @@ fn cleanup_partial_session(session_dir: Option<&PathBuf>, home_path: Option<&Pat
 }
 
 pub fn run(
-    config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, _share_dir: &Path, app_name: &str, vsock_enabled: bool,
-    _status_fd: RawFd,
+    config: &RuntimeConfig, workspace: WorkspaceHandle, container_name: &str, share_dir: &Path, app_name: &str, vsock_enabled: bool,
+    status_fd: RawFd,
 ) -> Result<(), String> {
     if !config.oci.is_file() {
         return Err(format!("OCI archive not found: {}", config.oci.display()));
@@ -157,6 +158,16 @@ pub fn run(
 
     let bridge_firewall = config.network == Some(NetworkMode::Bridge) && config.allow.is_some();
 
+    let mut auth_backend_handle: Option<AuthBackendHandle> = None;
+    if let Some(ref auth_ref) = config.auth_backend {
+        if config.network != Some(NetworkMode::Bridge) {
+            crate::logging::log("warning: auth backend requires bridge network mode, ignoring");
+        } else {
+            crate::logging::log("Starting auth backend...");
+            auth_backend_handle = Some(AuthBackendHandle::start(auth_ref, share_dir, status_fd)?);
+        }
+    }
+
     let resolv_conf = if config.network.is_some() {
         crate::logging::log("Writing resolv.conf...");
         Some(write_resolv_conf()?)
@@ -191,6 +202,10 @@ pub fn run(
 
     if vsock_enabled {
         container_env.push(format!("BUNKERBOX_TOOLCHAIN_PORT={TOOLCHAIN_PORT}"));
+    }
+
+    if let Some(ref handle) = auth_backend_handle {
+        container_env.push(format!("BUNKERBOX_AUTH_BACKEND_URL={}", handle.url()));
     }
 
     if let Some(ref cmds) = config.command {
@@ -278,6 +293,10 @@ pub fn run(
     let result = run_command_interactive("sudo", &args);
 
     crate::logging::log("Container stopped");
+    if let Some(mut handle) = auth_backend_handle {
+        crate::logging::log("Shutting down auth backend...");
+        handle.shutdown();
+    }
     if bridge_firewall {
         let _ = remove_bridge_egress_firewall();
     }

@@ -109,6 +109,7 @@ fn authenticate_env(variable: &str) -> Result<InitialAuth, String> {
     Ok(InitialAuth { token, expires_at: None, refresh_credential: None })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authenticate_oauth2(
     host: &str, authorize_url_template: &str, token_url: &str, refresh_url: Option<&str>, client_id: &str, scopes: &[String], response_field: &str,
     expires_in_field: Option<&str>, status_fd: &mut File,
@@ -173,6 +174,7 @@ fn refresh_oauth2(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authenticate_custom_token(
     host: &str, login_url_template: &str, manual_url: Option<&str>, exchange_url: &str, exchange_body_template: &str, refresh_token_field_val: &str,
     refresh_url_str: &str, refresh_body_template: &str, id_token_field: &str, expires_in_field: Option<&str>, status_fd: &mut File,
@@ -264,7 +266,7 @@ fn start_callback(_status_fd: &mut File, param: &str) -> Result<(u16, std::sync:
         let val = parse_query_param(query, &param);
         let body = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 64\r\n\r\nAuthentication complete. Close this tab.";
         let _ = stream.write_all(body);
-        let _ = tx.send(val.ok_or_else(|| format!("missing {param} in callback")).map(String::from));
+        let _ = tx.send(val.ok_or_else(|| format!("missing {param} in callback")));
     });
 
     Ok((port, rx))
@@ -289,7 +291,7 @@ fn parse_query_param(query: &str, param: &str) -> Option<String> {
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         if parts.next() == Some(param) {
-            return parts.next().map(|v| url_decode(v));
+            return parts.next().map(url_decode);
         }
     }
     None

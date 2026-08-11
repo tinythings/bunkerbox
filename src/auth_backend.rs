@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,7 +15,7 @@ pub struct AuthBackendHandle {
 impl AuthBackendHandle {
     pub fn start(auth_ref: &AuthRef, share_dir: &Path, status_fd: RawFd) -> Result<Self, String> {
         let config = match auth_ref {
-            AuthRef::Inline(cfg) => cfg.clone(),
+            AuthRef::Inline(cfg) => (**cfg).clone(),
             AuthRef::Named(name) => load_named_config(name, share_dir)?,
         };
 
@@ -78,7 +78,8 @@ fn find_builtin_auth() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("locate self: {e}"))?;
 
     if let Some(dir) = exe.parent() {
-        for name in &["bunkerbox-auth-backend"] {
+        {
+            let name = &"bunkerbox-auth-backend";
             let candidate = dir.join(name);
             if candidate.is_file() {
                 return Ok(candidate);

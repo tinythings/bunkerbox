@@ -24,7 +24,7 @@ struct SidecarConfig {
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum InnerConfig {
     #[serde(rename = "declarative")]
-    Declarative(DeclarativeCfg),
+    Declarative(Box<DeclarativeCfg>),
     #[serde(rename = "plugin")]
     #[allow(dead_code)]
     Plugin { name: String, config: serde_json::Value },
@@ -85,7 +85,7 @@ async fn run() -> Result<(), String> {
     let config: SidecarConfig = serde_json::from_str(&config_json).map_err(|e| format!("parse config: {e}"))?;
 
     match config.backend {
-        InnerConfig::Declarative(decl) => run_declarative(decl, &mut status_fd, log_path).await,
+        InnerConfig::Declarative(decl) => run_declarative(*decl, &mut status_fd, log_path).await,
         InnerConfig::Plugin { name, .. } => Err(format!("plugin '{name}' run directly: bunkerbox-auth-backend-{name}")),
     }
 }

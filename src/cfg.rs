@@ -86,14 +86,14 @@ pub enum EnvMode {
 #[serde(untagged)]
 pub enum AuthRef {
     Named(String),
-    Inline(AuthBackendConfig),
+    Inline(Box<AuthBackendConfig>),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum AuthBackendConfig {
     Plugin(AuthPlugin),
-    Declarative(AuthDeclarative),
+    Declarative(Box<AuthDeclarative>),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

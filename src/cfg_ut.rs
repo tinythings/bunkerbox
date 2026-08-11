@@ -8,10 +8,6 @@ fn deser_auth_flow(yaml: &str) -> AuthFlow {
     serde_yaml::from_str(yaml).expect("deserialize AuthFlow")
 }
 
-fn deser_auth_ref(yaml: &str) -> AuthRef {
-    serde_yaml::from_str(yaml).expect("deserialize AuthRef")
-}
-
 #[test]
 fn auth_ref_inline_declarative() {
     let yaml = r#"

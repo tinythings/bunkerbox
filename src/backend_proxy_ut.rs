@@ -29,3 +29,27 @@ fn translates_max_tokens_without_changing_model() {
     assert_eq!(request["max_completion_tokens"], 123);
     assert!(request.get("max_tokens").is_none());
 }
+
+#[test]
+fn propagates_max_context_length() {
+    let body = br#"{"models":[{"id":"big","capabilities":["agent"],"modelProperties":{"maxContextLength":250000}}]}"#;
+
+    let models: serde_json::Value = serde_json::from_slice(&translate_models(body)).unwrap();
+    assert_eq!(models["data"][0]["context_window"], 250000);
+}
+
+#[test]
+fn omits_context_window_when_missing() {
+    let body = br#"{"models":[{"id":"plain","capabilities":["agent"]}]}"#;
+
+    let models: serde_json::Value = serde_json::from_slice(&translate_models(body)).unwrap();
+    assert!(models["data"][0].get("context_window").is_none());
+}
+
+#[test]
+fn ignores_non_numeric_max_context_length() {
+    let body = br#"{"models":[{"id":"weird","capabilities":["agent"],"modelProperties":{"maxContextLength":"lots"}}]}"#;
+
+    let models: serde_json::Value = serde_json::from_slice(&translate_models(body)).unwrap();
+    assert!(models["data"][0].get("context_window").is_none());
+}

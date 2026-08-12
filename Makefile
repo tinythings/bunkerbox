@@ -59,7 +59,7 @@ dev: ensure-toolchain
 		if [ -f "$$dir/Cargo.toml" ]; then \
 			echo "Building contrib plugin: $$dir"; \
 			cargo build --manifest-path "$$dir/Cargo.toml" && \
-			find "$$dir/target/debug/" -maxdepth 1 -type f -executable -name "bunkerbox-auth-backend-*" -exec cp {} target/dist/ \; ; \
+			find "$$dir/target/debug/" -maxdepth 1 -type f -executable -name "auth-backend-*" -exec cp {} target/dist/ \; ; \
 		fi \
 	done
 
@@ -81,7 +81,7 @@ release: ensure-toolchain
 		if [ -f "$$dir/Cargo.toml" ]; then \
 			echo "Building contrib plugin (release): $$dir"; \
 			cargo build --manifest-path "$$dir/Cargo.toml" --release && \
-			find "$$dir/target/release/" -maxdepth 1 -type f -executable -name "bunkerbox-auth-backend-*" -exec cp {} target/dist/ \; ; \
+			find "$$dir/target/release/" -maxdepth 1 -type f -executable -name "auth-backend-*" -exec cp {} target/dist/ \; ; \
 		fi \
 	done
 

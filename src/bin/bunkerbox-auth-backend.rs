@@ -86,7 +86,7 @@ async fn run() -> Result<(), String> {
 
     match config.backend {
         InnerConfig::Declarative(decl) => run_declarative(*decl, &mut status_fd, log_path).await,
-        InnerConfig::Plugin { name, .. } => Err(format!("plugin '{name}' run directly: bunkerbox-auth-backend-{name}")),
+        InnerConfig::Plugin { name, .. } => Err(format!("plugin '{name}' run directly: auth-backend-{name}")),
     }
 }
 

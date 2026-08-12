@@ -20,8 +20,8 @@ impl AuthBackendHandle {
         };
 
         let binary = match &config {
-            AuthBackendConfig::Declarative(_) => find_builtin_auth()?,
-            AuthBackendConfig::Plugin(p) => discover_auth_plugin(&p.name)?,
+            AuthBackendConfig::Declarative(_) => find_builtin_auth(share_dir)?,
+            AuthBackendConfig::Plugin(p) => discover_auth_plugin(&p.name, share_dir)?,
         };
 
         let config_json = config_to_json(&config)?;
@@ -74,12 +74,20 @@ fn load_named_config(name: &str, share_dir: &Path) -> Result<AuthBackendConfig, 
     serde_yaml::from_str(&contents).map_err(|e| format!("failed to parse {}: {e}", path.display()))
 }
 
-fn find_builtin_auth() -> Result<PathBuf, String> {
+fn find_builtin_auth(share_dir: &Path) -> Result<PathBuf, String> {
+    let name = "bunkerbox-auth-backend";
+
+    {
+        let candidate = share_dir.join("bin").join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
     let exe = std::env::current_exe().map_err(|e| format!("locate self: {e}"))?;
 
     if let Some(dir) = exe.parent() {
         {
-            let name = &"bunkerbox-auth-backend";
             let candidate = dir.join(name);
             if candidate.is_file() {
                 return Ok(candidate);
@@ -87,15 +95,22 @@ fn find_builtin_auth() -> Result<PathBuf, String> {
         }
     }
 
-    if let Some(path) = find_on_path("bunkerbox-auth-backend") {
+    if let Some(path) = find_on_path(name) {
         return Ok(path);
     }
 
     Err("bunkerbox-auth-backend not found. Run: make dev".into())
 }
 
-fn discover_auth_plugin(name: &str) -> Result<PathBuf, String> {
-    let bin_name = format!("bunkerbox-auth-backend-{name}");
+fn discover_auth_plugin(name: &str, share_dir: &Path) -> Result<PathBuf, String> {
+    let bin_name = format!("auth-backend-{name}");
+
+    {
+        let candidate = share_dir.join("bin").join(&bin_name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

@@ -75,9 +75,32 @@ fn discover_auth_plugin_errors_for_unknown_name() {
     unsafe {
         std::env::set_var("PATH", dir.path().as_os_str());
     }
-    let result = discover_auth_plugin("nonexistent-plugin-xyz");
+    let result = discover_auth_plugin("nonexistent-plugin-xyz", dir.path());
     unsafe {
         std::env::remove_var("PATH");
     }
     assert!(result.is_err());
+}
+
+#[test]
+fn discover_auth_plugin_finds_binary_in_share_bin() {
+    let dir = TempDir::with_prefix("bb-test-plugin-share").unwrap();
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    let exe = bin_dir.join("auth-backend-litellm");
+    {
+        let mut f = std::fs::File::create(&exe).unwrap();
+        f.write_all(b"#!/bin/sh\necho ok\n").unwrap();
+    }
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    unsafe {
+        std::env::set_var("PATH", "/nonexistent-xyz");
+    }
+    let found = discover_auth_plugin("litellm", dir.path());
+    unsafe {
+        std::env::remove_var("PATH");
+    }
+
+    assert_eq!(found.unwrap(), exe);
 }

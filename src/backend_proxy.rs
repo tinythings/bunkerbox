@@ -94,6 +94,7 @@ pub async fn proxy_models(state: web::Data<ProxyState>, _req: HttpRequest) -> Ht
             match upstream.body().limit(8_000_000).await {
                 Ok(bytes) => {
                     proxy_log(&state, &format!("→ {status} ({} bytes)", bytes.len()));
+                    log_model_contexts(&state, &bytes);
                     let translated = translate_models(&bytes);
                     HttpResponse::build(status).body(translated)
                 }
@@ -130,13 +131,17 @@ fn translate_models(body: &[u8]) -> Vec<u8> {
                 return None;
             }
             let name = m.get("name").and_then(|n| n.as_str()).unwrap_or(id);
-            Some(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "id": id,
                 "object": "model",
                 "created": 0,
                 "owned_by": "upstream",
                 "name": name
-            }))
+            });
+            if let Some(context) = model_context(m) {
+                entry["context_window"] = serde_json::Value::from(context);
+            }
+            Some(entry)
         })
         .collect();
 
@@ -154,6 +159,26 @@ fn translate_models(body: &[u8]) -> Vec<u8> {
     }
 
     openai.to_string().into_bytes()
+}
+
+fn model_context(model: &serde_json::Value) -> Option<u64> {
+    model.get("modelProperties").and_then(|p| p.get("maxContextLength")).and_then(|v| v.as_u64())
+}
+
+fn log_model_contexts(state: &web::Data<ProxyState>, body: &[u8]) {
+    let Ok(upstream) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+    let Some(models) = upstream.get("models").and_then(|m| m.as_array()) else {
+        return;
+    };
+    for model in models {
+        let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        match model_context(model) {
+            Some(n) => proxy_log(state, &format!("  model {id}: context {n}")),
+            None => proxy_log(state, &format!("  model {id}: context unknown")),
+        }
+    }
 }
 
 pub async fn proxy_chat_completions(state: web::Data<ProxyState>, body: web::Bytes) -> HttpResponse {

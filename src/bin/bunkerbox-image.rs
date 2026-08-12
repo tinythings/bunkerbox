@@ -169,7 +169,7 @@ fn write_runtime_conf(config: &ImageConfig) -> Result<(), String> {
             }
         }
 
-        let conf_name = format!("{}.conf", config.command.first().map(|c| c.as_str()).unwrap_or(&config.name));
+        let conf_name = format!("{}.conf", config.name);
         let conf_path = config.output.with_file_name(conf_name);
         let yaml = serde_yaml::to_string(&mapping).map_err(|e| format!("failed to serialize runtime conf: {e}"))?;
         fs::write(&conf_path, yaml).map_err(|e| format!("failed to write {}: {e}", conf_path.display()))?;

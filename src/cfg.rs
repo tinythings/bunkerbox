@@ -2,7 +2,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use crate::vscomm::buildsys::{self, PassthroughMode};
 
@@ -81,6 +82,69 @@ pub enum EnvMode {
     Paranoid,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum AuthRef {
+    Named(String),
+    Inline(Box<AuthBackendConfig>),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum AuthBackendConfig {
+    Plugin(AuthPlugin),
+    Declarative(Box<AuthDeclarative>),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuthPlugin {
+    pub name: String,
+    #[serde(default)]
+    pub config: serde_yaml::Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuthDeclarative {
+    pub host: String,
+    pub auth: AuthFlow,
+    #[serde(default)]
+    pub request_headers: IndexMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum AuthFlow {
+    Env {
+        variable: String,
+    },
+    #[serde(rename = "oauth2")]
+    OAuth2 {
+        authorize_url: String,
+        token_url: String,
+        #[serde(default)]
+        refresh_url: Option<String>,
+        client_id: String,
+        #[serde(default)]
+        scopes: Vec<String>,
+        response_field: String,
+        #[serde(default)]
+        expires_in_field: Option<String>,
+    },
+    CustomTokenExchange {
+        login_url: String,
+        #[serde(default)]
+        manual_url: Option<String>,
+        exchange_url: String,
+        exchange_body_template: String,
+        refresh_token_field: String,
+        refresh_url: String,
+        refresh_body_template: String,
+        id_token_field: String,
+        #[serde(default)]
+        expires_in_field: Option<String>,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RuntimeConfig {
     pub oci: PathBuf,
@@ -99,6 +163,8 @@ pub struct RuntimeConfig {
     pub session_cleanup: Option<Vec<String>>,
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    #[serde(default, rename = "auth-backend")]
+    pub auth_backend: Option<AuthRef>,
 }
 
 impl RuntimeConfig {

@@ -42,32 +42,48 @@ ensure-toolchain:
 	rustup target add $(VSCOMM_TARGET)
 
 dev: ensure-toolchain
-	cargo build --bin bunkerbox --bin bunkerbox-image
 	cargo build --bin bunkerbox-netrelay --target $(VSCOMM_TARGET)
 	cargo build --bin bunkerbox-vscomm --target $(VSCOMM_TARGET)
 	cargo build --bin bunkerbox-status --target $(VSCOMM_TARGET)
+	cargo build --bin bunkerbox --bin bunkerbox-image --bin bunkerbox-auth-backend --features auth-backend
 	rm -rf target/dist
 	mkdir -p target/dist
 	cp target/debug/bunkerbox target/dist/
 	cp target/debug/bunkerbox-image target/dist/
+	cp target/debug/bunkerbox-auth-backend target/dist/
 	cp target/$(VSCOMM_TARGET)/debug/bunkerbox-netrelay target/dist/
 	cp target/$(VSCOMM_TARGET)/debug/bunkerbox-vscomm target/dist/
 	cp target/$(VSCOMM_TARGET)/debug/bunkerbox-status target/dist/
 	cp target/$(VSCOMM_TARGET)/debug/bunkerbox-netrelay target/debug/bunkerbox-netrelay
+	@for dir in contrib/*/; do \
+		if [ -f "$$dir/Cargo.toml" ]; then \
+			echo "Building contrib plugin: $$dir"; \
+			cargo build --manifest-path "$$dir/Cargo.toml" && \
+			find "$$dir/target/debug/" -maxdepth 1 -type f -executable -name "auth-backend-*" -exec cp {} target/dist/ \; ; \
+		fi \
+	done
 
 release: ensure-toolchain
-	cargo build --bin bunkerbox --bin bunkerbox-image --release
 	cargo build --bin bunkerbox-netrelay --target $(VSCOMM_TARGET) --release
 	cargo build --bin bunkerbox-vscomm --target $(VSCOMM_TARGET) --release
 	cargo build --bin bunkerbox-status --target $(VSCOMM_TARGET) --release
+	cargo build --bin bunkerbox --bin bunkerbox-image --bin bunkerbox-auth-backend --features auth-backend --release
 	rm -rf target/dist
 	mkdir -p target/dist
 	cp target/release/bunkerbox target/dist/
 	cp target/release/bunkerbox-image target/dist/
+	cp target/release/bunkerbox-auth-backend target/dist/
 	cp target/$(VSCOMM_TARGET)/release/bunkerbox-netrelay target/dist/
 	cp target/$(VSCOMM_TARGET)/release/bunkerbox-vscomm target/dist/
 	cp target/$(VSCOMM_TARGET)/release/bunkerbox-status target/dist/
 	cp target/$(VSCOMM_TARGET)/release/bunkerbox-netrelay target/release/bunkerbox-netrelay
+	@for dir in contrib/*/; do \
+		if [ -f "$$dir/Cargo.toml" ]; then \
+			echo "Building contrib plugin (release): $$dir"; \
+			cargo build --manifest-path "$$dir/Cargo.toml" --release && \
+			find "$$dir/target/release/" -maxdepth 1 -type f -executable -name "auth-backend-*" -exec cp {} target/dist/ \; ; \
+		fi \
+	done
 
 check:
 	cargo fmt --all
@@ -75,6 +91,11 @@ check:
 
 test:
 	cargo nextest run
+	@for dir in contrib/*/; do \
+		if [ -f "$$dir/Cargo.toml" ]; then \
+			cargo test --manifest-path "$$dir/Cargo.toml" || exit 1; \
+		fi \
+	done
 
 integration-test: dev
 	cargo nextest run --test test_base --test test_sandbox

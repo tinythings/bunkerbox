@@ -1,3 +1,4 @@
+pub mod auth_backend;
 pub mod cfg;
 pub mod cfgsetup;
 pub mod clidef;

@@ -4,11 +4,15 @@ version = "0.4.1"
 edition = "2021"
 
 [dependencies]
+actix-rt = { version = "2", optional = true }
+actix-web = { version = "4", optional = true }
 aes-gcm = "0.10"
+awc = { version = "3", features = ["openssl"], optional = true }
 base64 = "0.22"
 clap = "4"
 colored = "3"
 glob = "0.3"
+indexmap = { version = "2", features = ["serde"] }
 libc = "0.2"
 pbkdf2 = "0.12"
 rand = "0.8"
@@ -20,8 +24,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync",
 tokio-vsock = "0.7"
 ratatui = "0.30"
 crossterm = "0.28"
+uuid = { version = "1", features = ["v4"] }
 vt100 = "0.16"
 ratatui-glamour = "0.3"
+webbrowser = { version = "1", optional = true }
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
+
+[features]
+auth-backend = ["actix-rt", "actix-web", "awc", "ureq", "webbrowser"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -52,3 +62,8 @@ path = "src/bin/bunkerbox-status.rs"
 [[bin]]
 name = "bunkerbox-netrelay"
 path = "src/bin/bunkerbox-netrelay.rs"
+
+[[bin]]
+name = "bunkerbox-auth-backend"
+path = "src/bin/bunkerbox-auth-backend.rs"
+required-features = ["auth-backend"]

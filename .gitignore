@@ -19,3 +19,4 @@ kata-static-*.tar.zst
 /demo/goose/goose
 .bunkerbox/
 demo/crush/crush
+contrib/

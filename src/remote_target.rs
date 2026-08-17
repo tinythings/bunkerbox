@@ -1,3 +1,4 @@
+use crate::artifact::{ArtifactLimits, ArtifactPolicy};
 use serde::de::{self, MapAccess, Visitor};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -40,6 +41,7 @@ pub struct ResourceLimits {
     pub sync_timeout: Duration,
     pub build_timeout: Duration,
     pub max_output_bytes: u64,
+    pub artifact: ArtifactLimits,
 }
 
 impl ResourceLimits {
@@ -61,6 +63,10 @@ impl ResourceLimits {
 
     pub fn max_output_bytes(&self) -> u64 {
         self.max_output_bytes
+    }
+
+    pub fn artifact_limits(&self) -> ArtifactLimits {
+        self.artifact
     }
 }
 
@@ -155,6 +161,7 @@ impl SshTarget {
 pub struct ProjectBinding {
     pub backend: BackendMode,
     pub target: Option<String>,
+    pub artifacts: ArtifactPolicy,
 }
 
 impl ProjectBinding {
@@ -164,6 +171,10 @@ impl ProjectBinding {
 
     pub fn target(&self) -> Option<&str> {
         self.target.as_deref()
+    }
+
+    pub fn artifacts(&self) -> &ArtifactPolicy {
+        &self.artifacts
     }
 }
 
@@ -176,6 +187,7 @@ pub struct ResolvedBackend {
     pub project_root: PathBuf,
     pub backend: BackendMode,
     pub target: Option<SshTarget>,
+    pub artifacts: ArtifactPolicy,
 }
 
 impl fmt::Debug for ResolvedBackend {
@@ -204,6 +216,10 @@ impl ResolvedBackend {
 
     pub fn target(&self) -> Option<&SshTarget> {
         self.target.as_ref()
+    }
+
+    pub fn artifacts(&self) -> &ArtifactPolicy {
+        &self.artifacts
     }
 }
 
@@ -283,11 +299,18 @@ impl RemoteTargetConfig {
         let binding = self.projects.get(&canonical).ok_or_else(|| format!("project has no remote backend binding: {}", canonical.display()))?;
 
         match binding.backend {
-            BackendMode::Loopback => Ok(ResolvedBackend { project_root: canonical, backend: BackendMode::Loopback, target: None }),
+            BackendMode::Loopback => {
+                Ok(ResolvedBackend { project_root: canonical, backend: BackendMode::Loopback, target: None, artifacts: binding.artifacts.clone() })
+            }
             BackendMode::Ssh => {
                 let target_name = binding.target.as_deref().ok_or_else(|| "SSH project binding is missing a target".to_string())?;
                 let target = self.targets.get(target_name).ok_or_else(|| format!("unknown SSH target '{target_name}'"))?;
-                Ok(ResolvedBackend { project_root: canonical, backend: BackendMode::Ssh, target: Some(target.clone()) })
+                Ok(ResolvedBackend {
+                    project_root: canonical,
+                    backend: BackendMode::Ssh,
+                    target: Some(target.clone()),
+                    artifacts: binding.artifacts.clone(),
+                })
             }
         }
     }
@@ -309,16 +332,17 @@ impl RemoteTargetConfig {
         let mut projects = BTreeMap::new();
         for (project, binding) in raw.projects.0 {
             let canonical = validate_project_binding_path(&project)?;
-            validate_project_binding(&binding)?;
+            let artifacts = validate_project_binding(&binding)?;
             if binding.backend == BackendMode::Ssh {
                 let Some(target_name) = binding.target.as_deref() else {
                     return Err("SSH project binding requires a target".to_string());
                 };
-                if !targets.contains_key(target_name) {
-                    return Err(format!("unknown SSH target '{target_name}'"));
-                }
+                let target = targets.get(target_name).ok_or_else(|| format!("unknown SSH target '{target_name}'"))?;
+                artifacts.validate_limits(target.resources().artifact_limits())?;
+            } else {
+                artifacts.validate_limits(ArtifactLimits::default())?;
             }
-            if projects.insert(canonical, binding.into_public()).is_some() {
+            if projects.insert(canonical, binding.into_public(artifacts)).is_some() {
                 return Err("duplicate project binding after canonicalization".to_string());
             }
         }
@@ -468,12 +492,21 @@ struct RawProjectBinding {
     backend: BackendMode,
     #[serde(default)]
     target: Option<String>,
+    #[serde(default)]
+    artifacts: Option<RawArtifacts>,
 }
 
 impl RawProjectBinding {
-    fn into_public(self) -> ProjectBinding {
-        ProjectBinding { backend: self.backend, target: self.target }
+    fn into_public(self, artifacts: ArtifactPolicy) -> ProjectBinding {
+        ProjectBinding { backend: self.backend, target: self.target, artifacts }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawArtifacts {
+    #[serde(default)]
+    paths: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -493,6 +526,14 @@ struct RawResources {
     build_timeout: RawQuantity,
     #[serde(rename = "max-output-bytes", alias = "max-output", alias = "max_output_bytes", alias = "max_output")]
     max_output: RawQuantity,
+    #[serde(default, rename = "artifact-timeout-seconds", alias = "artifact-timeout", alias = "artifact_timeout")]
+    artifact_timeout: Option<RawQuantity>,
+    #[serde(default, rename = "max-artifact-bytes", alias = "max-artifact-bytes-per-file", alias = "max_artifact_bytes")]
+    max_artifact_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-artifact-total-bytes", alias = "max_artifact_total_bytes")]
+    max_artifact_total_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-artifact-entries", alias = "max_artifact_entries")]
+    max_artifact_entries: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -557,14 +598,14 @@ fn validate_target(name: String, raw: RawTarget) -> Result<SshTarget, String> {
     })
 }
 
-fn validate_project_binding(binding: &RawProjectBinding) -> Result<(), String> {
+fn validate_project_binding(binding: &RawProjectBinding) -> Result<ArtifactPolicy, String> {
     if let Some(target) = &binding.target {
         validate_name("project target name", target)?;
     }
     if binding.backend == BackendMode::Ssh && binding.target.is_none() {
         return Err("SSH project binding requires a target".to_string());
     }
-    Ok(())
+    binding.artifacts.as_ref().map_or_else(|| Ok(ArtifactPolicy::default()), |artifacts| ArtifactPolicy::new(artifacts.paths.clone()))
 }
 
 fn validate_resources(raw: RawResources) -> Result<ResourceLimits, String> {
@@ -572,7 +613,16 @@ fn validate_resources(raw: RawResources) -> Result<ResourceLimits, String> {
     let sync_timeout = parse_duration("sync-timeout", raw.sync_timeout)?;
     let build_timeout = parse_duration("build-timeout", raw.build_timeout)?;
     let max_output_bytes = parse_size("max-output", raw.max_output)?;
-    Ok(ResourceLimits { connect_timeout, sync_timeout, build_timeout, max_output_bytes })
+    let defaults = ArtifactLimits::default();
+    let artifact_timeout = raw.artifact_timeout.map_or(Ok(defaults.timeout), |value| parse_duration("artifact-timeout", value))?;
+    let max_artifact_bytes = raw.max_artifact_bytes.map_or(Ok(defaults.max_file_bytes), |value| parse_size("max-artifact-bytes", value))?;
+    let max_artifact_total_bytes =
+        raw.max_artifact_total_bytes.map_or(Ok(defaults.max_total_bytes), |value| parse_size("max-artifact-total-bytes", value))?;
+    let max_artifact_entries = raw
+        .max_artifact_entries
+        .map_or(Ok(defaults.max_entries), |value| usize::try_from(value).map_err(|_| "max-artifact-entries is too large".to_string()))?;
+    let artifact = ArtifactLimits::new(artifact_timeout, max_artifact_entries, max_artifact_bytes, max_artifact_total_bytes)?;
+    Ok(ResourceLimits { connect_timeout, sync_timeout, build_timeout, max_output_bytes, artifact })
 }
 
 fn parse_duration(field: &str, quantity: RawQuantity) -> Result<Duration, String> {

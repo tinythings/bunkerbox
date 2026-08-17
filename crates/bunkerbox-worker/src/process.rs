@@ -94,7 +94,7 @@ impl Drop for JobWorkspace {
 pub fn cleanup_stale_jobs(parent: &File) -> io::Result<()> {
     for lock_name in platform::list_names(parent)?.into_iter().take(MAX_STALE_JOBS) {
         let Some(name) = lock_name.strip_suffix(".lock") else { continue };
-        if !name.starts_with("job-") {
+        if !name.starts_with("job-") && !name.starts_with("artifact-") {
             continue;
         }
         let Ok(lock) = platform::open_lock_at(parent, &lock_name) else { continue };

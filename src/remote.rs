@@ -423,6 +423,8 @@ pub enum RemoteFailureClass {
     WorkerVersion,
     WorkerProtocol,
     SnapshotTransfer,
+    ArtifactManifest,
+    ArtifactTransfer,
     Disconnect,
     Cleanup,
 }
@@ -438,6 +440,8 @@ impl RemoteFailureClass {
             Self::WorkerVersion => "worker version",
             Self::WorkerProtocol => "worker protocol",
             Self::SnapshotTransfer => "snapshot transfer",
+            Self::ArtifactManifest => "artifact manifest",
+            Self::ArtifactTransfer => "artifact transfer",
             Self::Disconnect => "disconnect",
             Self::Cleanup => "cleanup",
         }

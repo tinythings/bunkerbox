@@ -1,3 +1,4 @@
+use crate::artifact::{ArtifactLimits, ArtifactPolicy, ArtifactPublication, LocalArtifactSpool};
 use crate::remote::{
     AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteFuture, RemoteOperation, RemoteResourcePolicy,
     RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTargetId, WorkspaceSessionId,
@@ -74,6 +75,10 @@ impl RunRemoteSession {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    pub(crate) fn jobs_root(&self) -> &Path {
+        &self.jobs_root
     }
 
     pub fn snapshot_store(&self) -> SnapshotStore {
@@ -309,6 +314,8 @@ pub struct LoopbackBackend {
     tools: Arc<BTreeMap<String, PathBuf>>,
     target_environment: Arc<BTreeMap<String, String>>,
     resources: RemoteResourcePolicy,
+    artifact_policy: ArtifactPolicy,
+    artifact_limits: ArtifactLimits,
 }
 
 impl LoopbackBackend {
@@ -318,6 +325,8 @@ impl LoopbackBackend {
             tools: Arc::new(tools),
             target_environment: Arc::new(trusted_target_environment()),
             resources: RemoteResourcePolicy::default(),
+            artifact_policy: ArtifactPolicy::default(),
+            artifact_limits: ArtifactLimits::default(),
         }
     }
 
@@ -337,6 +346,12 @@ impl LoopbackBackend {
         self.target_environment = Arc::new(trusted);
         self
     }
+
+    pub fn with_artifacts(mut self, policy: ArtifactPolicy, limits: ArtifactLimits) -> Self {
+        self.artifact_policy = policy;
+        self.artifact_limits = limits;
+        self
+    }
 }
 
 impl RemoteBackend for LoopbackBackend {
@@ -347,13 +362,25 @@ impl RemoteBackend for LoopbackBackend {
         let tools = self.tools.clone();
         let target_environment = self.target_environment.clone();
         let resources = self.resources;
+        let artifact_policy = self.artifact_policy.clone();
+        let artifact_limits = self.artifact_limits;
+        let request_id = request.request_id().0;
+        let options = LoopbackBuildOptions { resources, artifact_policy, artifact_limits, request_id };
         Box::pin(async move {
             match request.request().operation() {
                 RemoteOperation::Sync(sync) => execute_sync(session, sync.retain_capability(), events).await,
-                RemoteOperation::Build(build) => execute_build(session, tools, target_environment, resources, build, events).await,
+                RemoteOperation::Build(build) => execute_build(session, tools, target_environment, options, build, events).await,
             }
         })
     }
+}
+
+#[derive(Clone)]
+struct LoopbackBuildOptions {
+    resources: RemoteResourcePolicy,
+    artifact_policy: ArtifactPolicy,
+    artifact_limits: ArtifactLimits,
+    request_id: [u8; 16],
 }
 
 async fn execute_sync(
@@ -371,8 +398,9 @@ async fn execute_sync(
 
 async fn execute_build(
     session: Arc<RunRemoteSession>, tools: Arc<BTreeMap<String, PathBuf>>, target_environment: Arc<BTreeMap<String, String>>,
-    resources: RemoteResourcePolicy, build: &crate::remote::RemoteBuild, events: mpsc::Sender<RemoteBackendEvent>,
+    options: LoopbackBuildOptions, build: &crate::remote::RemoteBuild, events: mpsc::Sender<RemoteBackendEvent>,
 ) -> Result<(), RemoteBackendError> {
+    let LoopbackBuildOptions { resources, artifact_policy, artifact_limits, request_id } = options;
     let snapshot = session.claim_snapshot(build.snapshot_id()).map_err(RemoteBackendError::Failed)?;
     let executable = tools
         .get(build.tool().as_str())
@@ -523,7 +551,49 @@ async fn execute_build(
         return Err(error);
     }
     let status = child_status.unwrap()?;
-    send_event(&events, RemoteBackendEvent::Completed { exit_code: status.code().unwrap_or(-1) }).await
+    let exit_code = status.code().unwrap_or(-1);
+    if exit_code == 0 && artifact_policy.is_enabled() {
+        let job_root = job_path.clone();
+        let workspace_root = session.workspace_root().to_path_buf();
+        let spool_parent = session.jobs_root().to_path_buf();
+        let policy = artifact_policy;
+        let limits = artifact_limits;
+        let retrieval = tokio::time::timeout(
+            limits.timeout,
+            tokio::task::spawn_blocking(move || {
+                let spool = LocalArtifactSpool::capture(&job_root, &spool_parent, &policy, limits)
+                    .map_err(|error| RemoteBackendError::Transport { class: crate::remote::RemoteFailureClass::ArtifactManifest, message: error })?;
+                let manifest = spool.manifest().clone();
+                let mut publication = ArtifactPublication::new(&workspace_root, request_id, manifest)
+                    .map_err(|error| RemoteBackendError::Transport { class: crate::remote::RemoteFailureClass::ArtifactTransfer, message: error })?;
+                for index in 0..spool.manifest().entries().len() {
+                    let mut source = spool.open_entry(index).map_err(|error| RemoteBackendError::Transport {
+                        class: crate::remote::RemoteFailureClass::ArtifactTransfer,
+                        message: error,
+                    })?;
+                    publication.copy_from_reader(index, &mut source).map_err(|error| RemoteBackendError::Transport {
+                        class: crate::remote::RemoteFailureClass::ArtifactTransfer,
+                        message: error,
+                    })?;
+                }
+                publication
+                    .publish()
+                    .map_err(|error| RemoteBackendError::Transport { class: crate::remote::RemoteFailureClass::ArtifactTransfer, message: error })
+            }),
+        )
+        .await;
+        match retrieval {
+            Ok(Ok(result)) => result?,
+            Ok(Err(error)) => return Err(RemoteBackendError::Failed(format!("artifact worker failed: {error}"))),
+            Err(_) => {
+                return Err(RemoteBackendError::Transport {
+                    class: crate::remote::RemoteFailureClass::ArtifactTransfer,
+                    message: "artifact retrieval timed out".to_string(),
+                })
+            }
+        }
+    }
+    send_event(&events, RemoteBackendEvent::Completed { exit_code }).await
 }
 
 #[derive(Clone, Copy)]

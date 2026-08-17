@@ -1,7 +1,8 @@
 use crate::platform;
 use bunkerbox_worker_protocol::{
-    validate_upload_manifest, WorkerDigest, WorkerEntryKind, WorkerProtocolError, WorkerRelativePath, WorkerSessionId, WorkerUploadEntry,
-    WorkerUploadId, MAX_WORKER_MANIFEST_BYTES,
+    validate_upload_manifest, WorkerArtifactEntry, WorkerArtifactPath, WorkerArtifactSetId, WorkerDigest, WorkerEntryKind, WorkerProtocolError,
+    WorkerRelativePath, WorkerSessionId, WorkerUploadEntry, WorkerUploadId, MAX_WORKER_ARTIFACT_FILE_BYTES, MAX_WORKER_ARTIFACT_TOTAL_BYTES,
+    MAX_WORKER_MANIFEST_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -292,6 +293,118 @@ impl StoredUpload {
     }
 }
 
+pub struct ArtifactSpool {
+    parent: File,
+    name: String,
+    root: File,
+    lock: File,
+    files: File,
+    artifact_set_id: WorkerArtifactSetId,
+    entries: Vec<WorkerArtifactEntry>,
+    total_bytes: u64,
+}
+
+impl ArtifactSpool {
+    pub fn capture(parent: &File, job_root: &File, paths: &[WorkerArtifactPath], max_file_bytes: u64, max_total_bytes: u64) -> Result<Self, String> {
+        if max_file_bytes == 0 || max_file_bytes > MAX_WORKER_ARTIFACT_FILE_BYTES {
+            return Err("worker artifact per-file limit is invalid".to_string());
+        }
+        if max_total_bytes == 0 || max_total_bytes > MAX_WORKER_ARTIFACT_TOTAL_BYTES {
+            return Err("worker artifact total limit is invalid".to_string());
+        }
+        let (name, lock_name, lock, root) = reserve_artifact_root(parent)?;
+        let files = match private_directory(&root, FILES_DIRECTORY) {
+            Ok(files) => files,
+            Err(error) => {
+                let _ = platform::remove_tree_at(parent, &name);
+                let _ = platform::unlink_at(parent, &lock_name, 0);
+                return Err(error);
+            }
+        };
+
+        let result = (|| {
+            let mut entries = Vec::with_capacity(paths.len());
+            let mut total_bytes = 0u64;
+            for path in paths {
+                let source = open_relative_file(job_root, path.as_str())?;
+                let before = platform::stat_fd(source.as_raw_fd()).map_err(|error| format!("stat worker artifact {}: {error}", path.as_str()))?;
+                validate_artifact_source(&before, path.as_str())?;
+                let size = u64::try_from(before.st_size).map_err(|_| format!("worker artifact size is invalid: {}", path.as_str()))?;
+                if size > max_file_bytes {
+                    return Err(format!("worker artifact exceeds per-file limit: {}", path.as_str()));
+                }
+                total_bytes = total_bytes.checked_add(size).ok_or_else(|| "worker artifact total size overflow".to_string())?;
+                if total_bytes > max_total_bytes {
+                    return Err("worker artifacts exceed total size limit".to_string());
+                }
+                let mode = (before.st_mode as u32) & 0o777;
+                if let Some((parents, _)) = path.as_str().rsplit_once('/') {
+                    ensure_directory(&files, parents, 0o700)?;
+                }
+                let destination = create_relative_file(&files, path.as_str(), mode)?;
+                let digest = copy_artifact(&source, &destination, size, path.as_str())?;
+                let after = platform::stat_fd(source.as_raw_fd()).map_err(|error| format!("restat worker artifact {}: {error}", path.as_str()))?;
+                if after.st_dev != before.st_dev
+                    || after.st_ino != before.st_ino
+                    || after.st_size != before.st_size
+                    || after.st_mode & 0o777 != before.st_mode & 0o777
+                    || after.st_nlink != before.st_nlink
+                {
+                    return Err(format!("worker artifact changed during capture: {}", path.as_str()));
+                }
+                entries.push(WorkerArtifactEntry::new(path.as_str().to_string(), mode, size, digest).map_err(protocol_error)?);
+            }
+            let artifact_set_id = artifact_set_id(&name, &entries, total_bytes);
+            Ok((artifact_set_id, entries, total_bytes))
+        })();
+
+        match result {
+            Ok((artifact_set_id, entries, total_bytes)) => Ok(Self {
+                parent: parent.try_clone().map_err(|error| format!("clone worker jobs directory: {error}"))?,
+                name,
+                root,
+                lock,
+                files,
+                artifact_set_id,
+                entries,
+                total_bytes,
+            }),
+            Err(error) => {
+                let _ = platform::remove_tree_at(parent, &name);
+                let _ = platform::unlink_at(parent, &lock_name, 0);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn artifact_set_id(&self) -> WorkerArtifactSetId {
+        self.artifact_set_id
+    }
+
+    pub fn entries(&self) -> &[WorkerArtifactEntry] {
+        &self.entries
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    pub fn open_entry(&self, index: usize) -> Result<File, String> {
+        let entry = self.entries.get(index).ok_or_else(|| "worker artifact index is out of range".to_string())?;
+        let file = open_relative_file(&self.files, entry.path().as_str())?;
+        let metadata = platform::stat_fd(file.as_raw_fd()).map_err(|error| format!("stat worker artifact spool: {error}"))?;
+        validate_regular_file(&metadata, entry.size(), entry.mode(), entry.path().as_str())?;
+        Ok(file)
+    }
+}
+
+impl Drop for ArtifactSpool {
+    fn drop(&mut self) {
+        let _ = (&self.root, &self.lock, &self.files);
+        let _ = platform::remove_tree_at(&self.parent, &self.name);
+    }
+}
+
 struct PendingFile {
     file: File,
     size: u64,
@@ -439,6 +552,97 @@ fn private_directory(parent: &File, name: &str) -> Result<File, String> {
     let directory = platform::open_dir_at(parent, name).map_err(|error| format!("open private worker directory {name}: {error}"))?;
     platform::validate_private_directory(&directory, &format!("worker directory {name}"))?;
     Ok(directory)
+}
+
+fn reserve_artifact_root(parent: &File) -> Result<(String, String, File, File), String> {
+    for _ in 0..32 {
+        let name = format!("artifact-{}-{}", unsafe { libc::getpid() }, next_job_id());
+        let lock_name = format!("{name}.lock");
+        let lock = match platform::create_file_at(parent, &lock_name, 0o600) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create worker artifact lock: {error}")),
+        };
+        if !platform::lock_exclusive(&lock).map_err(|error| format!("lock worker artifact spool: {error}"))? {
+            let _ = platform::unlink_at(parent, &lock_name, 0);
+            continue;
+        }
+        if let Err(error) = platform::create_dir_at(parent, &name, 0o700) {
+            let _ = platform::unlink_at(parent, &lock_name, 0);
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(format!("create worker artifact spool: {error}"));
+        }
+        let root = match platform::open_dir_at(parent, &name) {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = platform::remove_tree_at(parent, &name);
+                let _ = platform::unlink_at(parent, &lock_name, 0);
+                return Err(format!("open worker artifact spool: {error}"));
+            }
+        };
+        if let Err(error) = platform::validate_private_directory(&root, "worker artifact spool") {
+            let _ = platform::remove_tree_at(parent, &name);
+            let _ = platform::unlink_at(parent, &lock_name, 0);
+            return Err(error);
+        }
+        return Ok((name, lock_name, lock, root));
+    }
+    Err("could not reserve a worker artifact spool".to_string())
+}
+
+fn validate_artifact_source(metadata: &libc::stat, path: &str) -> Result<(), String> {
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_nlink != 1 {
+        return Err(format!("worker artifact is not a private regular file: {path}"));
+    }
+    if metadata.st_size < 0 {
+        return Err(format!("worker artifact has an invalid size: {path}"));
+    }
+    Ok(())
+}
+
+fn copy_artifact(source: &File, destination: &File, expected_size: u64, path: &str) -> Result<WorkerDigest, String> {
+    let mut source = source.try_clone().map_err(|error| format!("clone worker artifact {path}: {error}"))?;
+    let mut destination = destination.try_clone().map_err(|error| format!("clone worker artifact spool {path}: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0u64;
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+    loop {
+        let count = source.read(&mut buffer).map_err(|error| format!("read worker artifact {path}: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        copied = copied.checked_add(count as u64).ok_or_else(|| "worker artifact size overflow".to_string())?;
+        if copied > expected_size {
+            return Err(format!("worker artifact grew during capture: {path}"));
+        }
+        hasher.update(&buffer[..count]);
+        destination.write_all(&buffer[..count]).map_err(|error| format!("write worker artifact spool {path}: {error}"))?;
+    }
+    if copied != expected_size {
+        return Err(format!("worker artifact size changed during capture: {path}"));
+    }
+    platform::sync_fd(&destination).map_err(|error| format!("flush worker artifact spool {path}: {error}"))?;
+    Ok(hasher.finalize().into())
+}
+
+fn artifact_set_id(name: &str, entries: &[WorkerArtifactEntry], total_bytes: u64) -> WorkerArtifactSetId {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update(total_bytes.to_le_bytes());
+    for entry in entries {
+        hasher.update(entry.path().as_str().as_bytes());
+        hasher.update(entry.size().to_le_bytes());
+        hasher.update(entry.digest());
+    }
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    if id == [0; 16] {
+        id[0] = 1;
+    }
+    WorkerArtifactSetId(id)
 }
 
 fn open_existing_private_directory(parent: &File, name: &str, label: &str) -> Result<File, String> {

@@ -1,25 +1,31 @@
 use crate::process::{self, JobWorkspace, OutputSink};
-use crate::storage::{UploadStore, UploadTransaction};
+use crate::storage::{ArtifactSpool, UploadStore, UploadTransaction};
 use bunkerbox_worker_protocol::{
-    WorkerErrorKind, WorkerMessage, WorkerOperation, WorkerRequestId, WorkerSessionId, WorkerUploadId, MAX_WORKER_ERROR_BYTES,
+    WorkerErrorKind, WorkerMessage, WorkerOperation, WorkerRequestId, WorkerSessionId, WorkerUploadId, MAX_WORKER_CHUNK_BYTES,
+    MAX_WORKER_ERROR_BYTES, WORKER_ARTIFACT_PROTOCOL_VERSION, WORKER_PROTOCOL_VERSION,
 };
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
 pub struct FrameWriter<W: Write + Send> {
     writer: Mutex<W>,
+    version: AtomicU16,
 }
 
 impl<W: Write + Send> FrameWriter<W> {
     pub fn new(writer: W) -> Self {
-        Self { writer: Mutex::new(writer) }
+        Self { writer: Mutex::new(writer), version: AtomicU16::new(WORKER_PROTOCOL_VERSION) }
+    }
+
+    pub fn set_version(&self, version: u16) {
+        self.version.store(version, Ordering::Release);
     }
 
     pub fn send_message(&self, message: &WorkerMessage) -> Result<(), String> {
         let mut writer = self.writer.lock().map_err(|_| "worker protocol writer lock poisoned".to_string())?;
-        message.write_blocking(&mut *writer).map_err(|error| error.to_string())
+        message.write_blocking_version(&mut *writer, self.version.load(Ordering::Acquire)).map_err(|error| error.to_string())
     }
 
     #[cfg(test)]
@@ -48,7 +54,7 @@ impl WorkerService {
 
     pub fn run<R: Read + Send + 'static, W: Write + Send>(&self, input: R, writer: &FrameWriter<W>) -> Result<(), String> {
         let input = InputChannel::spawn(input);
-        let Some(hello) = input.next()? else {
+        let Some((hello_version, hello)) = input.next()? else {
             return Ok(());
         };
         let (request_id, session_id, response, version) = match hello {
@@ -58,19 +64,34 @@ impl WorkerService {
         if response {
             return Err("worker received a Hello response instead of a request".to_string());
         }
-        if version != bunkerbox_worker_protocol::WORKER_PROTOCOL_VERSION {
+        if version != hello_version {
+            return Err("worker Hello version does not match frame version".to_string());
+        }
+        if version != WORKER_PROTOCOL_VERSION && version != WORKER_ARTIFACT_PROTOCOL_VERSION {
             return Err(format!("unsupported worker protocol version: {version}"));
         }
         if session_id.0 == [0; 16] {
             return Err("worker session ID must be nonzero".to_string());
         }
-        writer.send_message(&WorkerMessage::hello(request_id, session_id, true))?;
+        writer.set_version(version);
+        writer.send_message(&WorkerMessage::hello_for_version(request_id, session_id, true, version))?;
 
         let mut active_upload: Option<ActiveUpload> = None;
         loop {
-            let Some(message) = input.next()? else {
+            let Some((message_version, message)) = input.next()? else {
                 return Ok(());
             };
+            if message_version != version {
+                send_error(
+                    writer,
+                    message.request_id(),
+                    session_id,
+                    WorkerOperation::Protocol,
+                    WorkerErrorKind::WorkerProtocol,
+                    "worker frame version changed during connection",
+                )?;
+                return Ok(());
+            }
             if message.session_id() != session_id {
                 send_error(
                     writer,
@@ -145,7 +166,7 @@ impl WorkerService {
                     }
                 },
                 WorkerMessage::Build { request_id, session_id, build } => {
-                    self.handle_build(&input, writer, request_id, session_id, build)?;
+                    self.handle_build(&input, writer, request_id, session_id, build, version)?;
                     return Ok(());
                 }
                 _ => {
@@ -165,7 +186,7 @@ impl WorkerService {
 
     fn handle_build<W: Write + Send>(
         &self, input: &InputChannel, writer: &FrameWriter<W>, request_id: WorkerRequestId, session_id: WorkerSessionId,
-        build: bunkerbox_worker_protocol::WorkerBuild,
+        build: bunkerbox_worker_protocol::WorkerBuild, protocol_version: u16,
     ) -> Result<(), String> {
         let upload = match self.store.open_completed(session_id, build.upload_token()) {
             Ok(upload) => upload,
@@ -193,34 +214,161 @@ impl WorkerService {
                 return Ok(());
             }
         };
-        writer.send_message(&WorkerMessage::completed(request_id, session_id, WorkerOperation::Build, exit_code))?;
-
-        let Some(cleanup) = input.next()? else {
-            return Ok(());
-        };
-        match cleanup {
-            WorkerMessage::Cleanup { request_id: cleanup_request, session_id: cleanup_session, upload_token }
-                if cleanup_request == request_id && cleanup_session == session_id && upload_token == build.upload_token() =>
+        let artifact_spool = if exit_code == 0 && !build.artifact_paths().is_empty() {
+            match ArtifactSpool::capture(&jobs, job.root(), build.artifact_paths(), build.artifact_max_file_bytes(), build.artifact_max_total_bytes())
             {
-                match self.store.cleanup(session_id, upload_token) {
-                    Ok(()) => writer.send_message(&WorkerMessage::completed(request_id, session_id, WorkerOperation::Cleanup, 0)),
-                    Err(error) => send_error(writer, request_id, session_id, WorkerOperation::Cleanup, WorkerErrorKind::Cleanup, &error),
+                Ok(spool) => Some(spool),
+                Err(error) => {
+                    send_error(writer, request_id, session_id, WorkerOperation::Artifact, WorkerErrorKind::Artifact, &error)?;
+                    return self.wait_for_cleanup(
+                        input,
+                        writer,
+                        BuildCleanup { request_id, session_id, upload_token: build.upload_token(), protocol_version },
+                    );
                 }
             }
-            other => send_error(
-                writer,
-                other.request_id(),
+        } else {
+            None
+        };
+
+        writer.send_message(&WorkerMessage::completed(request_id, session_id, WorkerOperation::Build, exit_code))?;
+        if let Some(spool) = artifact_spool {
+            writer.send_message(&WorkerMessage::ArtifactManifest {
+                request_id,
                 session_id,
-                WorkerOperation::Cleanup,
-                WorkerErrorKind::WorkerProtocol,
-                "unexpected worker cleanup message",
-            ),
+                artifact_set_id: spool.artifact_set_id(),
+                entries: spool.entries().to_vec(),
+                total_bytes: spool.total_bytes(),
+            })?;
+            return self.wait_for_artifacts(
+                input,
+                writer,
+                BuildCleanup { request_id, session_id, upload_token: build.upload_token(), protocol_version },
+                spool,
+            );
+        }
+        self.wait_for_cleanup(input, writer, BuildCleanup { request_id, session_id, upload_token: build.upload_token(), protocol_version })
+    }
+
+    fn wait_for_cleanup<W: Write + Send>(&self, input: &InputChannel, writer: &FrameWriter<W>, cleanup: BuildCleanup) -> Result<(), String> {
+        let BuildCleanup { request_id, session_id, upload_token, protocol_version } = cleanup;
+        loop {
+            let Some((version, cleanup)) = input.next()? else {
+                return Ok(());
+            };
+            if version != protocol_version {
+                return Err("worker cleanup frame version changed".to_string());
+            }
+            match cleanup {
+                WorkerMessage::Cleanup { request_id: cleanup_request, session_id: cleanup_session, upload_token: received_upload }
+                    if cleanup_request == request_id && cleanup_session == session_id && received_upload == upload_token =>
+                {
+                    return match self.store.cleanup(session_id, received_upload) {
+                        Ok(()) => writer.send_message(&WorkerMessage::completed(request_id, session_id, WorkerOperation::Cleanup, 0)),
+                        Err(error) => send_error(writer, request_id, session_id, WorkerOperation::Cleanup, WorkerErrorKind::Cleanup, &error),
+                    };
+                }
+                other => {
+                    send_error(
+                        writer,
+                        other.request_id(),
+                        session_id,
+                        WorkerOperation::Cleanup,
+                        WorkerErrorKind::WorkerProtocol,
+                        "unexpected worker cleanup message",
+                    )?;
+                }
+            }
+        }
+    }
+
+    fn wait_for_artifacts<W: Write + Send>(
+        &self, input: &InputChannel, writer: &FrameWriter<W>, cleanup: BuildCleanup, spool: ArtifactSpool,
+    ) -> Result<(), String> {
+        let BuildCleanup { request_id, session_id, upload_token, protocol_version } = cleanup;
+        let mut fetched = vec![false; spool.entries().len()];
+        loop {
+            let Some((version, message)) = input.next()? else {
+                return Ok(());
+            };
+            if version != protocol_version {
+                return Err("worker artifact frame version changed".to_string());
+            }
+            match message {
+                WorkerMessage::FetchArtifact { request_id: fetch_request, session_id: fetch_session, artifact_set_id, entry_index }
+                    if fetch_session == session_id && artifact_set_id == spool.artifact_set_id() =>
+                {
+                    let index = usize::try_from(entry_index).map_err(|_| "worker artifact index is invalid".to_string())?;
+                    if index >= fetched.len() || fetched[index] {
+                        send_error(
+                            writer,
+                            fetch_request,
+                            session_id,
+                            WorkerOperation::Artifact,
+                            WorkerErrorKind::Artifact,
+                            "worker artifact was fetched more than once or is out of range",
+                        )?;
+                        continue;
+                    }
+                    let mut file = match spool.open_entry(index) {
+                        Ok(file) => file,
+                        Err(error) => {
+                            send_error(writer, fetch_request, session_id, WorkerOperation::Artifact, WorkerErrorKind::Artifact, &error)?;
+                            continue;
+                        }
+                    };
+                    let mut offset = 0u64;
+                    let mut buffer = [0u8; MAX_WORKER_CHUNK_BYTES];
+                    loop {
+                        let count = file.read(&mut buffer).map_err(|error| format!("read worker artifact: {error}"))?;
+                        if count == 0 {
+                            break;
+                        }
+                        writer.send_message(&WorkerMessage::ArtifactChunk {
+                            request_id: fetch_request,
+                            session_id,
+                            artifact_set_id,
+                            entry_index,
+                            offset,
+                            data: buffer[..count].to_vec(),
+                        })?;
+                        offset = offset.checked_add(count as u64).ok_or_else(|| "worker artifact offset overflow".to_string())?;
+                    }
+                    writer.send_message(&WorkerMessage::ArtifactComplete { request_id: fetch_request, session_id, artifact_set_id, entry_index })?;
+                    fetched[index] = true;
+                }
+                WorkerMessage::Cleanup { request_id: cleanup_request, session_id: cleanup_session, upload_token: received_upload }
+                    if cleanup_request == request_id && cleanup_session == session_id && received_upload == upload_token =>
+                {
+                    return match self.store.cleanup(session_id, received_upload) {
+                        Ok(()) => writer.send_message(&WorkerMessage::completed(request_id, session_id, WorkerOperation::Cleanup, 0)),
+                        Err(error) => send_error(writer, request_id, session_id, WorkerOperation::Cleanup, WorkerErrorKind::Cleanup, &error),
+                    };
+                }
+                other => {
+                    send_error(
+                        writer,
+                        other.request_id(),
+                        session_id,
+                        WorkerOperation::Artifact,
+                        WorkerErrorKind::WorkerProtocol,
+                        "unexpected worker artifact message",
+                    )?;
+                }
+            }
         }
     }
 }
 
+struct BuildCleanup {
+    request_id: WorkerRequestId,
+    session_id: WorkerSessionId,
+    upload_token: WorkerUploadId,
+    protocol_version: u16,
+}
+
 struct InputChannel {
-    receiver: Receiver<Result<Option<WorkerMessage>, String>>,
+    receiver: Receiver<Result<Option<(u16, WorkerMessage)>, String>>,
     eof_seen: Arc<AtomicBool>,
     pending: Arc<AtomicUsize>,
 }
@@ -233,7 +381,7 @@ impl InputChannel {
         let pending = Arc::new(AtomicUsize::new(0));
         let pending_for_thread = pending.clone();
         std::thread::spawn(move || loop {
-            match bunkerbox_worker_protocol::WorkerMessage::read_blocking_optional(&mut input) {
+            match bunkerbox_worker_protocol::WorkerMessage::read_blocking_optional_versioned(&mut input) {
                 Ok(Some(message)) => {
                     pending_for_thread.fetch_add(1, Ordering::Release);
                     if sender.send(Ok(Some(message))).is_err() {
@@ -255,7 +403,7 @@ impl InputChannel {
         Self { receiver, eof_seen, pending }
     }
 
-    fn next(&self) -> Result<Option<WorkerMessage>, String> {
+    fn next(&self) -> Result<Option<(u16, WorkerMessage)>, String> {
         let result = self.receiver.recv().map_err(|_| "worker input reader stopped".to_string())?;
         if matches!(&result, Ok(Some(_))) {
             self.pending.fetch_sub(1, Ordering::AcqRel);

@@ -21,6 +21,7 @@ pub const WORKER_PROTOCOL_MAGIC: [u8; 4] = *b"BBWK";
 pub const WORKER_MAGIC: [u8; 4] = WORKER_PROTOCOL_MAGIC;
 pub const WORKER_PROTOCOL_VERSION: u16 = 1;
 pub const WORKER_VERSION: u16 = WORKER_PROTOCOL_VERSION;
+pub const WORKER_ARTIFACT_PROTOCOL_VERSION: u16 = 2;
 pub const WORKER_FRAME_HEADER_LEN: usize = 4 + 2 + 1 + 4;
 pub const WORKER_FRAME_HEADER_SIZE: usize = WORKER_FRAME_HEADER_LEN;
 pub const WORKER_ID_LEN: usize = 16;
@@ -59,6 +60,10 @@ pub const MAX_WORKER_MANIFEST_BYTES: usize = 512 * 1024;
 pub const MAX_WORKER_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_WORKER_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_WORKER_ERROR_BYTES: usize = 4 * 1024;
+pub const MAX_WORKER_ARTIFACT_ENTRIES: usize = 256;
+pub const MAX_WORKER_ARTIFACT_PATH_BYTES: usize = MAX_WORKER_PATH_BYTES;
+pub const MAX_WORKER_ARTIFACT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_WORKER_ARTIFACT_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerProtocolError {
@@ -127,6 +132,7 @@ macro_rules! worker_id {
 worker_id!(WorkerRequestId);
 worker_id!(WorkerSessionId);
 worker_id!(WorkerUploadId);
+worker_id!(WorkerArtifactSetId);
 
 pub type RequestId = WorkerRequestId;
 pub type SessionId = WorkerSessionId;
@@ -150,6 +156,10 @@ pub enum WorkerFrameKind {
     Stderr = 10,
     Completed = 11,
     Error = 12,
+    ArtifactManifest = 13,
+    FetchArtifact = 14,
+    ArtifactChunk = 15,
+    ArtifactComplete = 16,
 }
 
 impl WorkerFrameKind {
@@ -171,6 +181,10 @@ impl WorkerFrameKind {
             10 => Some(Self::Stderr),
             11 => Some(Self::Completed),
             12 => Some(Self::Error),
+            13 => Some(Self::ArtifactManifest),
+            14 => Some(Self::FetchArtifact),
+            15 => Some(Self::ArtifactChunk),
+            16 => Some(Self::ArtifactComplete),
             _ => None,
         }
     }
@@ -192,6 +206,7 @@ pub enum WorkerOperation {
     Build = 2,
     Cleanup = 3,
     Sync = 4,
+    Artifact = 5,
 }
 
 impl WorkerOperation {
@@ -206,6 +221,7 @@ impl WorkerOperation {
             2 => Ok(Self::Build),
             3 => Ok(Self::Cleanup),
             4 => Ok(Self::Sync),
+            5 => Ok(Self::Artifact),
             _ => Err(invalid(format!("unknown worker operation: {value}"))),
         }
     }
@@ -219,6 +235,7 @@ pub enum WorkerErrorKind {
     Build = 3,
     Cleanup = 4,
     Sync = 5,
+    Artifact = 6,
 }
 
 pub type WorkerErrorClass = WorkerErrorKind;
@@ -238,6 +255,7 @@ impl WorkerErrorKind {
             3 => Ok(Self::Build),
             4 => Ok(Self::Cleanup),
             5 => Ok(Self::Sync),
+            6 => Ok(Self::Artifact),
             _ => Err(invalid(format!("unknown worker error kind: {value}"))),
         }
     }
@@ -337,6 +355,76 @@ impl TryFrom<String> for WorkerExecutablePath {
 
     fn try_from(value: String) -> WorkerResult<Self> {
         Self::new(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkerArtifactPath(String);
+
+impl WorkerArtifactPath {
+    pub fn new(value: impl Into<String>) -> WorkerResult<Self> {
+        let value = value.into();
+        validate_relative_path("worker artifact path", &value, false)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for WorkerArtifactPath {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl TryFrom<String> for WorkerArtifactPath {
+    type Error = WorkerProtocolError;
+
+    fn try_from(value: String) -> WorkerResult<Self> {
+        Self::new(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerArtifactEntry {
+    pub path: WorkerArtifactPath,
+    pub mode: u32,
+    pub size: u64,
+    pub digest: WorkerDigest,
+}
+
+impl WorkerArtifactEntry {
+    pub fn new(path: impl Into<String>, mode: u32, size: u64, digest: WorkerDigest) -> WorkerResult<Self> {
+        let entry = Self { path: WorkerArtifactPath::new(path)?, mode, size, digest };
+        entry.validate()
+    }
+
+    pub fn validate(&self) -> WorkerResult<Self> {
+        if self.mode & !0o777 != 0 {
+            return Err(invalid(format!("worker artifact mode has unsupported bits: {:o}", self.mode)));
+        }
+        if self.size > MAX_WORKER_ARTIFACT_FILE_BYTES {
+            return Err(invalid(format!("worker artifact exceeds maximum file size {MAX_WORKER_ARTIFACT_FILE_BYTES}")));
+        }
+        Ok(self.clone())
+    }
+
+    pub fn path(&self) -> &WorkerArtifactPath {
+        &self.path
+    }
+
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn digest(&self) -> &WorkerDigest {
+        &self.digest
     }
 }
 
@@ -442,6 +530,9 @@ pub struct WorkerBuild {
     pub guest_env: Vec<(String, String)>,
     pub target_env: Vec<(String, String)>,
     pub upload_token: WorkerUploadId,
+    pub artifact_paths: Vec<WorkerArtifactPath>,
+    pub artifact_max_file_bytes: u64,
+    pub artifact_max_total_bytes: u64,
 }
 
 impl WorkerBuild {
@@ -457,6 +548,9 @@ impl WorkerBuild {
             guest_env,
             target_env,
             upload_token,
+            artifact_paths: Vec::new(),
+            artifact_max_file_bytes: MAX_WORKER_ARTIFACT_FILE_BYTES,
+            artifact_max_total_bytes: MAX_WORKER_ARTIFACT_TOTAL_BYTES,
         };
         build.validate()?;
         Ok(build)
@@ -469,6 +563,17 @@ impl WorkerBuild {
         validate_argv(&self.argv)?;
         validate_environment("worker guest environment", &self.guest_env)?;
         validate_environment("worker target environment", &self.target_env)?;
+        validate_count(self.artifact_paths.len(), MAX_WORKER_ARTIFACT_ENTRIES, "worker artifact paths")?;
+        for path in &self.artifact_paths {
+            validate_relative_path("worker artifact path", path.as_str(), false)?;
+        }
+        validate_artifact_limits(self.artifact_max_file_bytes, self.artifact_max_total_bytes)?;
+        let mut paths = BTreeSet::new();
+        for path in &self.artifact_paths {
+            if !paths.insert(path.as_str()) {
+                return Err(invalid(format!("duplicate worker artifact path: {}", path.as_str())));
+            }
+        }
         Ok(())
     }
 
@@ -502,6 +607,26 @@ impl WorkerBuild {
 
     pub fn upload_token(&self) -> WorkerUploadId {
         self.upload_token
+    }
+
+    pub fn artifact_paths(&self) -> &[WorkerArtifactPath] {
+        &self.artifact_paths
+    }
+
+    pub fn artifact_max_file_bytes(&self) -> u64 {
+        self.artifact_max_file_bytes
+    }
+
+    pub fn artifact_max_total_bytes(&self) -> u64 {
+        self.artifact_max_total_bytes
+    }
+
+    pub fn with_artifacts(mut self, paths: Vec<WorkerArtifactPath>, max_file_bytes: u64, max_total_bytes: u64) -> WorkerResult<Self> {
+        self.artifact_paths = paths;
+        self.artifact_max_file_bytes = max_file_bytes;
+        self.artifact_max_total_bytes = max_total_bytes;
+        self.validate()?;
+        Ok(self)
     }
 }
 
@@ -579,11 +704,42 @@ pub enum WorkerMessage {
         kind: WorkerErrorKind,
         message: String,
     },
+    ArtifactManifest {
+        request_id: WorkerRequestId,
+        session_id: WorkerSessionId,
+        artifact_set_id: WorkerArtifactSetId,
+        entries: Vec<WorkerArtifactEntry>,
+        total_bytes: u64,
+    },
+    FetchArtifact {
+        request_id: WorkerRequestId,
+        session_id: WorkerSessionId,
+        artifact_set_id: WorkerArtifactSetId,
+        entry_index: u32,
+    },
+    ArtifactChunk {
+        request_id: WorkerRequestId,
+        session_id: WorkerSessionId,
+        artifact_set_id: WorkerArtifactSetId,
+        entry_index: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    ArtifactComplete {
+        request_id: WorkerRequestId,
+        session_id: WorkerSessionId,
+        artifact_set_id: WorkerArtifactSetId,
+        entry_index: u32,
+    },
 }
 
 impl WorkerMessage {
     pub fn hello(request_id: WorkerRequestId, session_id: WorkerSessionId, response: bool) -> Self {
-        Self::Hello { request_id, session_id, version: WORKER_PROTOCOL_VERSION, response }
+        Self::hello_for_version(request_id, session_id, response, WORKER_PROTOCOL_VERSION)
+    }
+
+    pub fn hello_for_version(request_id: WorkerRequestId, session_id: WorkerSessionId, response: bool, version: u16) -> Self {
+        Self::Hello { request_id, session_id, version, response }
     }
 
     pub fn build(request_id: WorkerRequestId, session_id: WorkerSessionId, build: WorkerBuild) -> Self {
@@ -622,6 +778,10 @@ impl WorkerMessage {
             Self::Stderr { .. } => WorkerFrameKind::Stderr,
             Self::Completed { .. } => WorkerFrameKind::Completed,
             Self::Error { .. } => WorkerFrameKind::Error,
+            Self::ArtifactManifest { .. } => WorkerFrameKind::ArtifactManifest,
+            Self::FetchArtifact { .. } => WorkerFrameKind::FetchArtifact,
+            Self::ArtifactChunk { .. } => WorkerFrameKind::ArtifactChunk,
+            Self::ArtifactComplete { .. } => WorkerFrameKind::ArtifactComplete,
         }
     }
 
@@ -638,7 +798,11 @@ impl WorkerMessage {
             | Self::Stdout { request_id, .. }
             | Self::Stderr { request_id, .. }
             | Self::Completed { request_id, .. }
-            | Self::Error { request_id, .. } => *request_id,
+            | Self::Error { request_id, .. }
+            | Self::ArtifactManifest { request_id, .. }
+            | Self::FetchArtifact { request_id, .. }
+            | Self::ArtifactChunk { request_id, .. }
+            | Self::ArtifactComplete { request_id, .. } => *request_id,
         }
     }
 
@@ -655,7 +819,11 @@ impl WorkerMessage {
             | Self::Stdout { session_id, .. }
             | Self::Stderr { session_id, .. }
             | Self::Completed { session_id, .. }
-            | Self::Error { session_id, .. } => *session_id,
+            | Self::Error { session_id, .. }
+            | Self::ArtifactManifest { session_id, .. }
+            | Self::FetchArtifact { session_id, .. }
+            | Self::ArtifactChunk { session_id, .. }
+            | Self::ArtifactComplete { session_id, .. } => *session_id,
         }
     }
 
@@ -668,14 +836,22 @@ impl WorkerMessage {
             | Self::SyncProgress { upload_id, .. } => Some(*upload_id),
             Self::Build { build, .. } => Some(build.upload_token),
             Self::Cleanup { upload_token, .. } => Some(*upload_token),
-            Self::Hello { .. } | Self::Stdout { .. } | Self::Stderr { .. } | Self::Completed { .. } | Self::Error { .. } => None,
+            Self::Hello { .. }
+            | Self::Stdout { .. }
+            | Self::Stderr { .. }
+            | Self::Completed { .. }
+            | Self::Error { .. }
+            | Self::ArtifactManifest { .. }
+            | Self::FetchArtifact { .. }
+            | Self::ArtifactChunk { .. }
+            | Self::ArtifactComplete { .. } => None,
         }
     }
 
     pub fn validate(&self) -> WorkerResult<()> {
         match self {
             Self::Hello { version, .. } => {
-                if *version != WORKER_PROTOCOL_VERSION {
+                if !is_supported_version(*version) {
                     return Err(invalid(format!("unsupported worker hello version: {version}")));
                 }
             }
@@ -702,20 +878,53 @@ impl WorkerMessage {
                 }
             }
             Self::Error { message, .. } => validate_error_message(message)?,
+            Self::ArtifactManifest { artifact_set_id, entries, total_bytes, .. } => {
+                validate_nonzero_id(artifact_set_id.0, "worker artifact set")?;
+                validate_artifact_manifest(entries, *total_bytes)?;
+            }
+            Self::FetchArtifact { artifact_set_id, entry_index, .. } => {
+                validate_nonzero_id(artifact_set_id.0, "worker artifact set")?;
+                validate_artifact_index(*entry_index)?;
+            }
+            Self::ArtifactChunk { artifact_set_id, entry_index, offset, data, .. } => {
+                validate_nonzero_id(artifact_set_id.0, "worker artifact set")?;
+                validate_artifact_index(*entry_index)?;
+                validate_chunk_offset(*offset, data)?;
+            }
+            Self::ArtifactComplete { artifact_set_id, entry_index, .. } => {
+                validate_nonzero_id(artifact_set_id.0, "worker artifact set")?;
+                validate_artifact_index(*entry_index)?;
+            }
         }
         Ok(())
     }
 
+    fn requires_artifact_version(&self) -> bool {
+        match self {
+            Self::Build { build, .. } => !build.artifact_paths.is_empty(),
+            Self::ArtifactManifest { .. } | Self::FetchArtifact { .. } | Self::ArtifactChunk { .. } | Self::ArtifactComplete { .. } => true,
+            _ => false,
+        }
+    }
+
     pub fn encode(&self) -> WorkerResult<Vec<u8>> {
+        self.encode_version(WORKER_PROTOCOL_VERSION)
+    }
+
+    pub fn encode_version(&self, version: u16) -> WorkerResult<Vec<u8>> {
+        validate_version(version)?;
+        if version == WORKER_PROTOCOL_VERSION && self.requires_artifact_version() {
+            return Err(invalid("worker artifact message requires artifact-capable protocol version"));
+        }
         self.validate()?;
         let mut payload = WireWriter::new();
-        encode_payload(self, &mut payload)?;
+        encode_payload(self, &mut payload, version)?;
         let payload = payload.finish()?;
 
         let declared = u32::try_from(payload.len()).map_err(|_| invalid("worker payload length does not fit in u32"))?;
         let mut frame = Vec::with_capacity(WORKER_FRAME_HEADER_LEN + payload.len());
         frame.extend_from_slice(&WORKER_PROTOCOL_MAGIC);
-        frame.extend_from_slice(&WORKER_PROTOCOL_VERSION.to_le_bytes());
+        frame.extend_from_slice(&version.to_le_bytes());
         frame.push(self.kind().as_u8());
         frame.extend_from_slice(&declared.to_le_bytes());
         frame.extend_from_slice(&payload);
@@ -723,42 +932,74 @@ impl WorkerMessage {
     }
 
     pub fn decode(frame: &[u8]) -> WorkerResult<Self> {
-        let (kind, payload) = split_frame(frame)?;
-        decode_payload(kind, payload)
+        let (version, message) = Self::decode_versioned(frame)?;
+        if version != WORKER_PROTOCOL_VERSION {
+            return Err(invalid(format!("unsupported worker protocol version: {version}")));
+        }
+        Ok(message)
+    }
+
+    pub fn decode_versioned(frame: &[u8]) -> WorkerResult<(u16, Self)> {
+        let (version, kind, payload) = split_frame_versioned(frame)?;
+        let message = decode_payload(kind, payload, version)?;
+        Ok((version, message))
     }
 
     #[cfg(feature = "async")]
     pub async fn read_async<R: AsyncRead + Unpin>(reader: &mut R) -> WorkerResult<Self> {
+        let (version, message) = Self::read_async_versioned(reader).await?;
+        require_default_version(version)?;
+        Ok(message)
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn read_async_versioned<R: AsyncRead + Unpin>(reader: &mut R) -> WorkerResult<(u16, Self)> {
         let mut header = [0u8; WORKER_FRAME_HEADER_LEN];
         reader.read_exact(&mut header).await.map_err(|error| match error.kind() {
             io::ErrorKind::UnexpectedEof => invalid("truncated worker frame header"),
             _ => WorkerProtocolError::Io(error.to_string()),
         })?;
-        let (kind, payload_len) = decode_header(&header)?;
+        let (version, kind, payload_len) = decode_header(&header)?;
         let mut payload = vec![0u8; payload_len];
         reader.read_exact(&mut payload).await.map_err(|error| match error.kind() {
             io::ErrorKind::UnexpectedEof => invalid("truncated worker frame payload"),
             _ => WorkerProtocolError::Io(error.to_string()),
         })?;
-        decode_payload(kind, &payload)
+        Ok((version, decode_payload(kind, &payload, version)?))
     }
 
     pub fn read_blocking<R: Read>(reader: &mut R) -> WorkerResult<Self> {
+        let (version, message) = Self::read_blocking_versioned(reader)?;
+        require_default_version(version)?;
+        Ok(message)
+    }
+
+    pub fn read_blocking_versioned<R: Read>(reader: &mut R) -> WorkerResult<(u16, Self)> {
         let mut header = [0u8; WORKER_FRAME_HEADER_LEN];
         reader.read_exact(&mut header).map_err(|error| match error.kind() {
             io::ErrorKind::UnexpectedEof => invalid("truncated worker frame header"),
             _ => WorkerProtocolError::Io(error.to_string()),
         })?;
-        let (kind, payload_len) = decode_header(&header)?;
+        let (version, kind, payload_len) = decode_header(&header)?;
         let mut payload = vec![0u8; payload_len];
         reader.read_exact(&mut payload).map_err(|error| match error.kind() {
             io::ErrorKind::UnexpectedEof => invalid("truncated worker frame payload"),
             _ => WorkerProtocolError::Io(error.to_string()),
         })?;
-        decode_payload(kind, &payload)
+        Ok((version, decode_payload(kind, &payload, version)?))
     }
 
     pub fn read_blocking_optional<R: Read>(reader: &mut R) -> WorkerResult<Option<Self>> {
+        let message = Self::read_blocking_optional_versioned(reader)?;
+        message
+            .map(|(version, message)| {
+                require_default_version(version)?;
+                Ok(message)
+            })
+            .transpose()
+    }
+
+    pub fn read_blocking_optional_versioned<R: Read>(reader: &mut R) -> WorkerResult<Option<(u16, Self)>> {
         let mut first = [0u8; 1];
         match reader.read_exact(&mut first) {
             Ok(()) => {}
@@ -771,24 +1012,33 @@ impl WorkerMessage {
             io::ErrorKind::UnexpectedEof => invalid("truncated worker frame header"),
             _ => WorkerProtocolError::Io(error.to_string()),
         })?;
-        let (kind, payload_len) = decode_header(&header)?;
+        let (version, kind, payload_len) = decode_header(&header)?;
         let mut payload = vec![0u8; payload_len];
         reader.read_exact(&mut payload).map_err(|error| match error.kind() {
             io::ErrorKind::UnexpectedEof => invalid("truncated worker frame payload"),
             _ => WorkerProtocolError::Io(error.to_string()),
         })?;
-        decode_payload(kind, &payload).map(Some)
+        decode_payload(kind, &payload, version).map(|message| Some((version, message)))
     }
 
     #[cfg(feature = "async")]
     pub async fn write_async<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> WorkerResult<()> {
-        let frame = self.encode()?;
+        self.write_async_version(writer, WORKER_PROTOCOL_VERSION).await
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn write_async_version<W: AsyncWrite + Unpin>(&self, writer: &mut W, version: u16) -> WorkerResult<()> {
+        let frame = self.encode_version(version)?;
         writer.write_all(&frame).await.map_err(WorkerProtocolError::from)?;
         writer.flush().await.map_err(WorkerProtocolError::from)
     }
 
     pub fn write_blocking<W: Write>(&self, writer: &mut W) -> WorkerResult<()> {
-        let frame = self.encode()?;
+        self.write_blocking_version(writer, WORKER_PROTOCOL_VERSION)
+    }
+
+    pub fn write_blocking_version<W: Write>(&self, writer: &mut W, version: u16) -> WorkerResult<()> {
+        let frame = self.encode_version(version)?;
         writer.write_all(&frame).map_err(WorkerProtocolError::from)?;
         writer.flush().map_err(WorkerProtocolError::from)
     }
@@ -810,8 +1060,18 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> WorkerResult<
 }
 
 #[cfg(feature = "async")]
+pub async fn read_message_versioned<R: AsyncRead + Unpin>(reader: &mut R) -> WorkerResult<(u16, WorkerMessage)> {
+    WorkerMessage::read_async_versioned(reader).await
+}
+
+#[cfg(feature = "async")]
 pub async fn write_message<W: AsyncWrite + Unpin>(writer: &mut W, message: &WorkerMessage) -> WorkerResult<()> {
     write_worker_message(writer, message).await
+}
+
+#[cfg(feature = "async")]
+pub async fn write_message_versioned<W: AsyncWrite + Unpin>(writer: &mut W, message: &WorkerMessage, version: u16) -> WorkerResult<()> {
+    message.write_async_version(writer, version).await
 }
 
 pub fn encode_worker_message(message: &WorkerMessage) -> WorkerResult<Vec<u8>> {
@@ -864,7 +1124,7 @@ pub fn validate_upload_manifest(entries: &[WorkerUploadEntry]) -> WorkerResult<u
     Ok(total_bytes)
 }
 
-fn encode_payload(message: &WorkerMessage, writer: &mut WireWriter) -> WorkerResult<()> {
+fn encode_payload(message: &WorkerMessage, writer: &mut WireWriter, version: u16) -> WorkerResult<()> {
     match message {
         WorkerMessage::Hello { request_id, session_id, version, response } => {
             encode_correlation(writer, *request_id, *session_id)?;
@@ -898,7 +1158,7 @@ fn encode_payload(message: &WorkerMessage, writer: &mut WireWriter) -> WorkerRes
         }
         WorkerMessage::Build { request_id, session_id, build } => {
             encode_correlation(writer, *request_id, *session_id)?;
-            encode_build(writer, build)?;
+            encode_build(writer, build, version)?;
         }
         WorkerMessage::Cleanup { request_id, session_id, upload_token } => {
             encode_correlation(writer, *request_id, *session_id)?;
@@ -931,11 +1191,37 @@ fn encode_payload(message: &WorkerMessage, writer: &mut WireWriter) -> WorkerRes
             writer.u8(kind.as_u8())?;
             writer.string(message, MAX_WORKER_ERROR_BYTES, "worker error")?;
         }
+        WorkerMessage::ArtifactManifest { request_id, session_id, artifact_set_id, entries, total_bytes } => {
+            encode_correlation(writer, *request_id, *session_id)?;
+            writer.id(artifact_set_id.0)?;
+            writer.count(entries.len(), MAX_WORKER_ARTIFACT_ENTRIES, "worker artifact entries")?;
+            for entry in entries {
+                encode_artifact_entry(writer, entry)?;
+            }
+            writer.u64(*total_bytes)?;
+        }
+        WorkerMessage::FetchArtifact { request_id, session_id, artifact_set_id, entry_index } => {
+            encode_correlation(writer, *request_id, *session_id)?;
+            writer.id(artifact_set_id.0)?;
+            writer.u32(*entry_index)?;
+        }
+        WorkerMessage::ArtifactChunk { request_id, session_id, artifact_set_id, entry_index, offset, data } => {
+            encode_correlation(writer, *request_id, *session_id)?;
+            writer.id(artifact_set_id.0)?;
+            writer.u32(*entry_index)?;
+            writer.u64(*offset)?;
+            writer.blob(data, MAX_WORKER_CHUNK_BYTES, "worker artifact chunk")?;
+        }
+        WorkerMessage::ArtifactComplete { request_id, session_id, artifact_set_id, entry_index } => {
+            encode_correlation(writer, *request_id, *session_id)?;
+            writer.id(artifact_set_id.0)?;
+            writer.u32(*entry_index)?;
+        }
     }
     Ok(())
 }
 
-fn decode_payload(kind: WorkerFrameKind, payload: &[u8]) -> WorkerResult<WorkerMessage> {
+fn decode_payload(kind: WorkerFrameKind, payload: &[u8], version: u16) -> WorkerResult<WorkerMessage> {
     let mut reader = WireReader::new(payload);
     let message = match kind {
         WorkerFrameKind::Hello => {
@@ -976,7 +1262,7 @@ fn decode_payload(kind: WorkerFrameKind, payload: &[u8]) -> WorkerResult<WorkerM
         }
         WorkerFrameKind::Build => {
             let (request_id, session_id) = decode_correlation(&mut reader)?;
-            WorkerMessage::Build { request_id, session_id, build: decode_build(&mut reader)? }
+            WorkerMessage::Build { request_id, session_id, build: decode_build(&mut reader, version)? }
         }
         WorkerFrameKind::Cleanup => {
             let (request_id, session_id) = decode_correlation(&mut reader)?;
@@ -1011,13 +1297,65 @@ fn decode_payload(kind: WorkerFrameKind, payload: &[u8]) -> WorkerResult<WorkerM
             let message = reader.string(MAX_WORKER_ERROR_BYTES, "worker error")?;
             WorkerMessage::Error { request_id, session_id, operation, kind, message }
         }
+        WorkerFrameKind::ArtifactManifest => {
+            let (request_id, session_id) = decode_correlation(&mut reader)?;
+            let artifact_set_id = WorkerArtifactSetId(reader.array16()?);
+            let count = reader.count(MAX_WORKER_ARTIFACT_ENTRIES, "worker artifact entries")?;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                entries.push(decode_artifact_entry(&mut reader)?);
+            }
+            let total_bytes = reader.u64()?;
+            WorkerMessage::ArtifactManifest { request_id, session_id, artifact_set_id, entries, total_bytes }
+        }
+        WorkerFrameKind::FetchArtifact => {
+            let (request_id, session_id) = decode_correlation(&mut reader)?;
+            let artifact_set_id = WorkerArtifactSetId(reader.array16()?);
+            let entry_index = reader.u32()?;
+            WorkerMessage::FetchArtifact { request_id, session_id, artifact_set_id, entry_index }
+        }
+        WorkerFrameKind::ArtifactChunk => {
+            let (request_id, session_id) = decode_correlation(&mut reader)?;
+            let artifact_set_id = WorkerArtifactSetId(reader.array16()?);
+            let entry_index = reader.u32()?;
+            let offset = reader.u64()?;
+            let data = reader.blob(MAX_WORKER_CHUNK_BYTES, "worker artifact chunk")?;
+            WorkerMessage::ArtifactChunk { request_id, session_id, artifact_set_id, entry_index, offset, data }
+        }
+        WorkerFrameKind::ArtifactComplete => {
+            let (request_id, session_id) = decode_correlation(&mut reader)?;
+            let artifact_set_id = WorkerArtifactSetId(reader.array16()?);
+            let entry_index = reader.u32()?;
+            WorkerMessage::ArtifactComplete { request_id, session_id, artifact_set_id, entry_index }
+        }
     };
     reader.finish()?;
     message.validate()?;
+    if version == WORKER_PROTOCOL_VERSION && message.requires_artifact_version() {
+        return Err(invalid("worker artifact message requires artifact-capable protocol version"));
+    }
+    if let WorkerMessage::Hello { version: hello_version, .. } = &message {
+        if *hello_version != version {
+            return Err(invalid("worker Hello version does not match frame version"));
+        }
+    }
     Ok(message)
 }
 
-fn encode_build(writer: &mut WireWriter, build: &WorkerBuild) -> WorkerResult<()> {
+fn encode_artifact_entry(writer: &mut WireWriter, entry: &WorkerArtifactEntry) -> WorkerResult<()> {
+    entry.validate()?;
+    writer.string(entry.path.as_str(), MAX_WORKER_ARTIFACT_PATH_BYTES, "worker artifact path")?;
+    writer.u32(entry.mode)?;
+    writer.u64(entry.size)?;
+    writer.bytes(&entry.digest)?;
+    Ok(())
+}
+
+fn decode_artifact_entry(reader: &mut WireReader<'_>) -> WorkerResult<WorkerArtifactEntry> {
+    WorkerArtifactEntry::new(reader.string(MAX_WORKER_ARTIFACT_PATH_BYTES, "worker artifact path")?, reader.u32()?, reader.u64()?, reader.array32()?)
+}
+
+fn encode_build(writer: &mut WireWriter, build: &WorkerBuild, version: u16) -> WorkerResult<()> {
     build.validate()?;
     writer.string(build.tool.as_str(), MAX_WORKER_TOOL_BYTES, "worker tool")?;
     writer.string(build.trusted_executable.as_str(), MAX_WORKER_EXECUTABLE_PATH_BYTES, "worker executable path")?;
@@ -1029,10 +1367,18 @@ fn encode_build(writer: &mut WireWriter, build: &WorkerBuild) -> WorkerResult<()
     encode_environment(writer, &build.guest_env, "worker guest environment")?;
     encode_environment(writer, &build.target_env, "worker target environment")?;
     writer.id(build.upload_token.0)?;
+    if version >= WORKER_ARTIFACT_PROTOCOL_VERSION {
+        writer.count(build.artifact_paths.len(), MAX_WORKER_ARTIFACT_ENTRIES, "worker artifact paths")?;
+        for path in &build.artifact_paths {
+            writer.string(path.as_str(), MAX_WORKER_ARTIFACT_PATH_BYTES, "worker artifact path")?;
+        }
+        writer.u64(build.artifact_max_file_bytes)?;
+        writer.u64(build.artifact_max_total_bytes)?;
+    }
     Ok(())
 }
 
-fn decode_build(reader: &mut WireReader<'_>) -> WorkerResult<WorkerBuild> {
+fn decode_build(reader: &mut WireReader<'_>, version: u16) -> WorkerResult<WorkerBuild> {
     let tool = WorkerTool::new(reader.string(MAX_WORKER_TOOL_BYTES, "worker tool")?)?;
     let trusted_executable = WorkerExecutablePath::new(reader.string(MAX_WORKER_EXECUTABLE_PATH_BYTES, "worker executable path")?)?;
     let argument_count = reader.count(MAX_WORKER_ARG_COUNT, "worker argv")?;
@@ -1044,7 +1390,28 @@ fn decode_build(reader: &mut WireReader<'_>) -> WorkerResult<WorkerBuild> {
     let guest_env = decode_environment(reader, "worker guest environment")?;
     let target_env = decode_environment(reader, "worker target environment")?;
     let upload_token = WorkerUploadId(reader.array16()?);
-    let build = WorkerBuild { tool, trusted_executable, argv, cwd, guest_env, target_env, upload_token };
+    let (artifact_paths, artifact_max_file_bytes, artifact_max_total_bytes) = if version >= WORKER_ARTIFACT_PROTOCOL_VERSION {
+        let count = reader.count(MAX_WORKER_ARTIFACT_ENTRIES, "worker artifact paths")?;
+        let mut paths = Vec::with_capacity(count);
+        for _ in 0..count {
+            paths.push(WorkerArtifactPath::new(reader.string(MAX_WORKER_ARTIFACT_PATH_BYTES, "worker artifact path")?)?);
+        }
+        (paths, reader.u64()?, reader.u64()?)
+    } else {
+        (Vec::new(), MAX_WORKER_ARTIFACT_FILE_BYTES, MAX_WORKER_ARTIFACT_TOTAL_BYTES)
+    };
+    let build = WorkerBuild {
+        tool,
+        trusted_executable,
+        argv,
+        cwd,
+        guest_env,
+        target_env,
+        upload_token,
+        artifact_paths,
+        artifact_max_file_bytes,
+        artifact_max_total_bytes,
+    };
     build.validate()?;
     Ok(build)
 }
@@ -1292,11 +1659,96 @@ fn invalid(message: impl Into<String>) -> WorkerProtocolError {
     WorkerProtocolError::Invalid(message.into())
 }
 
-fn split_frame(frame: &[u8]) -> WorkerResult<(WorkerFrameKind, &[u8])> {
+fn is_supported_version(version: u16) -> bool {
+    matches!(version, WORKER_PROTOCOL_VERSION | WORKER_ARTIFACT_PROTOCOL_VERSION)
+}
+
+fn validate_version(version: u16) -> WorkerResult<()> {
+    if is_supported_version(version) {
+        Ok(())
+    } else {
+        Err(invalid(format!("unsupported worker protocol version: {version}")))
+    }
+}
+
+fn require_default_version(version: u16) -> WorkerResult<()> {
+    if version == WORKER_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(invalid(format!("unsupported worker protocol version: {version}")))
+    }
+}
+
+fn validate_nonzero_id(bytes: [u8; WORKER_ID_LEN], label: &str) -> WorkerResult<()> {
+    if bytes == [0; WORKER_ID_LEN] {
+        return Err(invalid(format!("{label} ID must be nonzero")));
+    }
+    Ok(())
+}
+
+fn validate_artifact_limits(max_file_bytes: u64, max_total_bytes: u64) -> WorkerResult<()> {
+    if max_file_bytes == 0 || max_file_bytes > MAX_WORKER_ARTIFACT_FILE_BYTES {
+        return Err(invalid("worker artifact per-file limit is invalid"));
+    }
+    if max_total_bytes == 0 || max_total_bytes > MAX_WORKER_ARTIFACT_TOTAL_BYTES {
+        return Err(invalid("worker artifact total limit is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_artifact_index(index: u32) -> WorkerResult<()> {
+    if usize::try_from(index).map_or(true, |index| index >= MAX_WORKER_ARTIFACT_ENTRIES) {
+        return Err(invalid(format!("worker artifact index exceeds maximum {MAX_WORKER_ARTIFACT_ENTRIES}")));
+    }
+    Ok(())
+}
+
+fn validate_chunk_offset(offset: u64, data: &[u8]) -> WorkerResult<()> {
+    if data.is_empty() {
+        return Err(invalid("worker artifact chunk must not be empty"));
+    }
+    if data.len() > MAX_WORKER_CHUNK_BYTES {
+        return Err(invalid(format!("worker artifact chunk exceeds maximum length {MAX_WORKER_CHUNK_BYTES}")));
+    }
+    let end = offset.checked_add(data.len() as u64).ok_or_else(|| invalid("worker artifact chunk offset overflow"))?;
+    if end > MAX_WORKER_ARTIFACT_FILE_BYTES {
+        return Err(invalid("worker artifact chunk exceeds maximum file size"));
+    }
+    Ok(())
+}
+
+fn validate_artifact_manifest(entries: &[WorkerArtifactEntry], total_bytes: u64) -> WorkerResult<()> {
+    validate_count(entries.len(), MAX_WORKER_ARTIFACT_ENTRIES, "worker artifact entries")?;
+    let mut paths = BTreeSet::new();
+    let mut total = 0u64;
+    let mut manifest_bytes = 4usize;
+    for entry in entries {
+        entry.validate()?;
+        if !paths.insert(entry.path.as_str()) {
+            return Err(invalid(format!("duplicate worker artifact path: {}", entry.path.as_str())));
+        }
+        total = total.checked_add(entry.size).ok_or_else(|| invalid("worker artifact total size overflow"))?;
+        if total > MAX_WORKER_ARTIFACT_TOTAL_BYTES || total > total_bytes {
+            return Err(invalid("worker artifact total exceeds its limit"));
+        }
+        manifest_bytes = manifest_bytes
+            .checked_add(4 + entry.path.as_str().len() + 4 + 8 + WORKER_DIGEST_LEN)
+            .ok_or_else(|| invalid("worker artifact manifest length overflow"))?;
+        if manifest_bytes > MAX_WORKER_MANIFEST_BYTES {
+            return Err(invalid("worker artifact manifest exceeds maximum length"));
+        }
+    }
+    if total != total_bytes {
+        return Err(invalid("worker artifact manifest total does not match entries"));
+    }
+    Ok(())
+}
+
+fn split_frame_versioned(frame: &[u8]) -> WorkerResult<(u16, WorkerFrameKind, &[u8])> {
     if frame.len() < WORKER_FRAME_HEADER_LEN {
         return Err(invalid("truncated worker frame header"));
     }
-    let (kind, payload_len) = decode_header(&frame[..WORKER_FRAME_HEADER_LEN])?;
+    let (version, kind, payload_len) = decode_header(&frame[..WORKER_FRAME_HEADER_LEN])?;
     let expected = WORKER_FRAME_HEADER_LEN.checked_add(payload_len).ok_or_else(|| invalid("worker frame length overflow"))?;
     if frame.len() < expected {
         return Err(invalid("truncated worker frame payload"));
@@ -1304,10 +1756,10 @@ fn split_frame(frame: &[u8]) -> WorkerResult<(WorkerFrameKind, &[u8])> {
     if frame.len() > expected {
         return Err(invalid("extra bytes after worker frame"));
     }
-    Ok((kind, &frame[WORKER_FRAME_HEADER_LEN..expected]))
+    Ok((version, kind, &frame[WORKER_FRAME_HEADER_LEN..expected]))
 }
 
-fn decode_header(header: &[u8]) -> WorkerResult<(WorkerFrameKind, usize)> {
+fn decode_header(header: &[u8]) -> WorkerResult<(u16, WorkerFrameKind, usize)> {
     if header.len() != WORKER_FRAME_HEADER_LEN {
         return Err(invalid("invalid worker frame header length"));
     }
@@ -1315,15 +1767,13 @@ fn decode_header(header: &[u8]) -> WorkerResult<(WorkerFrameKind, usize)> {
         return Err(invalid("invalid worker frame magic"));
     }
     let version = u16::from_le_bytes([header[4], header[5]]);
-    if version != WORKER_PROTOCOL_VERSION {
-        return Err(invalid(format!("unsupported worker protocol version: {version}")));
-    }
+    validate_version(version)?;
     let kind = WorkerFrameKind::try_from(header[6])?;
     let payload_len = u32::from_le_bytes([header[7], header[8], header[9], header[10]]) as usize;
     if payload_len > MAX_WORKER_FRAME_PAYLOAD {
         return Err(invalid(format!("worker payload exceeds maximum length {MAX_WORKER_FRAME_PAYLOAD}")));
     }
-    Ok((kind, payload_len))
+    Ok((version, kind, payload_len))
 }
 
 struct WireWriter {

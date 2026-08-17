@@ -191,6 +191,9 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     let repo_root = workspace::project_root()?;
     let env = ProjectConfig::load_or_create(&repo_root)?;
     let remote_backend = remote_target::RemoteTargetConfig::load_default()?.resolve_for_project(&repo_root)?;
+    let artifact_policy = remote_backend.artifacts().clone();
+    let artifact_limits = remote_backend.target().map(|target| target.resources().artifact_limits()).unwrap_or_default();
+    artifact_policy.validate_limits(artifact_limits)?;
     if let remote_target::BackendMode::Ssh = remote_backend.backend() {
         let target = remote_backend.target().ok_or_else(|| "SSH backend selection has no target".to_string())?;
         for tool in &env.project.remote.tools {
@@ -365,7 +368,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
                     profiles,
                     share_dir_owned,
                     merged_allow,
-                    remote_config.with_policy(remote_tool_policies, remote_environment),
+                    remote_config.with_artifacts(artifact_policy, artifact_limits).with_policy(remote_tool_policies, remote_environment),
                 )?;
                 if let Err(error) = write_run_handoff(&mut setup_parent, workspace.path(), remote_session) {
                     tokio::runtime::Handle::current().block_on(daemon.shutdown());

@@ -1,3 +1,4 @@
+use crate::artifact::{ArtifactLimits, ArtifactManifest, ArtifactPolicy, ArtifactPublication};
 use crate::loopback::{RunRemoteSession, SnapshotExportClaim};
 use crate::remote::{
     AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteFailureClass, RemoteFuture, RemoteOperation,
@@ -6,8 +7,9 @@ use crate::remote::{
 use crate::remote_target::{ResourceLimits, SshTarget};
 use crate::snapshot::SnapshotEntryKind;
 use crate::worker_protocol::{
-    self, WorkerBuild, WorkerErrorKind, WorkerMessage, WorkerOperation, WorkerRelativePath, WorkerRequestId, WorkerSessionId, WorkerUploadEntry,
-    WorkerUploadId, MAX_WORKER_CHUNK_BYTES, MAX_WORKER_FILE_BYTES,
+    self, WorkerArtifactEntry, WorkerArtifactPath, WorkerArtifactSetId, WorkerBuild, WorkerErrorKind, WorkerMessage, WorkerOperation,
+    WorkerRelativePath, WorkerRequestId, WorkerSessionId, WorkerUploadEntry, WorkerUploadId, MAX_WORKER_CHUNK_BYTES, MAX_WORKER_FILE_BYTES,
+    WORKER_ARTIFACT_PROTOCOL_VERSION, WORKER_PROTOCOL_VERSION,
 };
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -205,16 +207,31 @@ pub struct SshBackend {
     target: SshTarget,
     factory: Arc<dyn SshProcessFactory>,
     uploads: Arc<Mutex<BTreeMap<RemoteSnapshotId, WorkerUploadId>>>,
+    artifact_policy: ArtifactPolicy,
+    artifact_limits: ArtifactLimits,
 }
 
 impl SshBackend {
     pub fn new(session: Arc<RunRemoteSession>, target: SshTarget) -> Result<Self, String> {
         let _ = SshLaunchSpec::from_target(&target)?;
-        Ok(Self { session, target, factory: Arc::new(SystemSshProcessFactory), uploads: Arc::new(Mutex::new(BTreeMap::new())) })
+        Ok(Self {
+            artifact_limits: target.resources().artifact_limits(),
+            session,
+            target,
+            factory: Arc::new(SystemSshProcessFactory),
+            uploads: Arc::new(Mutex::new(BTreeMap::new())),
+            artifact_policy: ArtifactPolicy::default(),
+        })
     }
 
     pub fn with_process_factory(mut self, factory: Arc<dyn SshProcessFactory>) -> Self {
         self.factory = factory;
+        self
+    }
+
+    pub fn with_artifacts(mut self, policy: ArtifactPolicy, limits: ArtifactLimits) -> Self {
+        self.artifact_policy = policy;
+        self.artifact_limits = limits;
         self
     }
 
@@ -237,8 +254,10 @@ impl RemoteBackend for SshBackend {
         let target = self.target.clone();
         let factory = self.factory.clone();
         let uploads = self.uploads.clone();
+        let artifact_policy = self.artifact_policy.clone();
+        let artifact_limits = self.artifact_limits;
         Box::pin(async move {
-            let backend = SshExecution { session, target, factory, uploads };
+            let backend = SshExecution { session, target, factory, uploads, artifact_policy, artifact_limits };
             match operation {
                 RemoteOperation::Sync(sync) => backend.execute_sync(request_id.0, sync.retain_capability(), events).await,
                 RemoteOperation::Build(build) => backend.execute_build(request_id.0, &build, events).await,
@@ -252,6 +271,8 @@ struct SshExecution {
     target: SshTarget,
     factory: Arc<dyn SshProcessFactory>,
     uploads: Arc<Mutex<BTreeMap<RemoteSnapshotId, WorkerUploadId>>>,
+    artifact_policy: ArtifactPolicy,
+    artifact_limits: ArtifactLimits,
 }
 
 impl SshExecution {
@@ -363,11 +384,38 @@ impl SshExecution {
         let worker_build =
             WorkerBuild::new(build.tool().as_str(), executable, build.argv().to_vec(), build.cwd().as_str(), guest_env, target_env, upload_id)
                 .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::WorkerProtocol, message: error.to_string() })?;
+        let worker_build = if self.artifact_policy.is_enabled() {
+            let paths = self
+                .artifact_policy
+                .paths()
+                .iter()
+                .map(|path| WorkerArtifactPath::new(path.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, message: error.to_string() })?;
+            worker_build
+                .with_artifacts(paths, self.artifact_limits.max_file_bytes, self.artifact_limits.max_total_bytes)
+                .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, message: error.to_string() })?
+        } else {
+            worker_build
+        };
 
         let mut connection = WorkerConnection::spawn(&self.factory, &self.target)?;
         let session_id = WorkerSessionId(self.session.session_id().0);
-        let operation =
-            build_and_finish(&mut connection, WorkerRequestId(request_id), session_id, worker_build, &events, upload_id, self.target.resources());
+        let operation = build_and_finish(
+            &mut connection,
+            BuildPlan {
+                request_id: WorkerRequestId(request_id),
+                session_id,
+                build: worker_build,
+                events: &events,
+                upload_id,
+                resources: self.target.resources(),
+                artifact_policy: self.artifact_policy.clone(),
+                artifact_limits: self.artifact_limits,
+                workspace_root: self.session.workspace_root().to_path_buf(),
+                protocol_version: if self.artifact_policy.is_enabled() { WORKER_ARTIFACT_PROTOCOL_VERSION } else { WORKER_PROTOCOL_VERSION },
+            },
+        );
         let result = match timeout(self.target.resources().build_timeout(), operation).await {
             Ok(result) => result,
             Err(_) => {
@@ -396,6 +444,7 @@ struct WorkerConnection {
     writer: Option<WorkerWriter>,
     reader: WorkerReader,
     stderr_task: Option<JoinHandle<Vec<u8>>>,
+    version: u16,
 }
 
 impl WorkerConnection {
@@ -407,18 +456,25 @@ impl WorkerConnection {
         let reader = process.take_stdout().ok_or_else(|| unavailable("SSH transport has no stdout"))?;
         let stderr = process.take_stderr().ok_or_else(|| unavailable("SSH transport has no stderr"))?;
         let stderr_task = tokio::spawn(read_diagnostic(stderr));
-        Ok(Self { process, writer: Some(writer), reader, stderr_task: Some(stderr_task) })
+        Ok(Self { process, writer: Some(writer), reader, stderr_task: Some(stderr_task), version: WORKER_PROTOCOL_VERSION })
     }
 
-    async fn handshake(&mut self, request_id: WorkerRequestId, session_id: WorkerSessionId) -> Result<(), RemoteBackendError> {
-        self.write(&WorkerMessage::hello(request_id, session_id, false)).await?;
-        let message = self.read().await?;
+    async fn handshake(&mut self, request_id: WorkerRequestId, session_id: WorkerSessionId, version: u16) -> Result<(), RemoteBackendError> {
+        self.version = version;
+        self.write(&WorkerMessage::hello_for_version(request_id, session_id, false, version)).await?;
+        let (received_version, message) = self.read_versioned().await?;
+        if received_version != version {
+            return Err(RemoteBackendError::Transport {
+                class: RemoteFailureClass::WorkerVersion,
+                message: format!("worker selected protocol version {received_version}, requested {version}"),
+            });
+        }
         match message {
             WorkerMessage::Hello { request_id: received_request, session_id: received_session, version, response } => {
                 if received_request != request_id || received_session != session_id {
                     return Err(worker_protocol("worker hello correlation mismatch"));
                 }
-                if version != worker_protocol::WORKER_PROTOCOL_VERSION {
+                if version != self.version {
                     return Err(RemoteBackendError::Transport {
                         class: RemoteFailureClass::WorkerVersion,
                         message: format!("unsupported worker version: {version}"),
@@ -436,11 +492,22 @@ impl WorkerConnection {
 
     async fn write(&mut self, message: &WorkerMessage) -> Result<(), RemoteBackendError> {
         let writer = self.writer.as_mut().ok_or_else(|| disconnected("SSH worker stdin is closed"))?;
-        worker_protocol::write_message(writer, message).await.map_err(worker_io_error)
+        worker_protocol::write_message_versioned(writer, message, self.version).await.map_err(worker_io_error)
     }
 
     async fn read(&mut self) -> Result<WorkerMessage, RemoteBackendError> {
-        worker_protocol::read_message(&mut self.reader).await.map_err(worker_io_error)
+        let (version, message) = self.read_versioned().await?;
+        if version != self.version {
+            return Err(RemoteBackendError::Transport {
+                class: RemoteFailureClass::WorkerVersion,
+                message: format!("worker frame version changed from {} to {version}", self.version),
+            });
+        }
+        Ok(message)
+    }
+
+    async fn read_versioned(&mut self) -> Result<(u16, WorkerMessage), RemoteBackendError> {
+        worker_protocol::read_message_versioned(&mut self.reader).await.map_err(worker_io_error)
     }
 
     async fn cleanup(
@@ -512,9 +579,22 @@ struct UploadPlan<'a> {
     cleanup: bool,
 }
 
+struct BuildPlan<'a> {
+    request_id: WorkerRequestId,
+    session_id: WorkerSessionId,
+    build: WorkerBuild,
+    events: &'a tokio::sync::mpsc::Sender<RemoteBackendEvent>,
+    upload_id: WorkerUploadId,
+    resources: ResourceLimits,
+    artifact_policy: ArtifactPolicy,
+    artifact_limits: ArtifactLimits,
+    workspace_root: PathBuf,
+    protocol_version: u16,
+}
+
 async fn upload_and_finish(connection: &mut WorkerConnection, plan: UploadPlan<'_>) -> Result<(), RemoteBackendError> {
     let UploadPlan { request_id, session_id, upload_id, entries, export, events, cleanup } = plan;
-    connection.handshake(request_id, session_id).await?;
+    connection.handshake(request_id, session_id, WORKER_PROTOCOL_VERSION).await?;
     let total_bytes = export.total_file_bytes();
     connection.write(&WorkerMessage::UploadBegin { request_id, session_id, upload_id, entries: entries.to_vec() }).await?;
     let mut completed_bytes = 0u64;
@@ -572,11 +652,10 @@ async fn upload_and_finish(connection: &mut WorkerConnection, plan: UploadPlan<'
     connection.finish().await
 }
 
-async fn build_and_finish(
-    connection: &mut WorkerConnection, request_id: WorkerRequestId, session_id: WorkerSessionId, build: WorkerBuild,
-    events: &tokio::sync::mpsc::Sender<RemoteBackendEvent>, upload_id: WorkerUploadId, resources: ResourceLimits,
-) -> Result<(), RemoteBackendError> {
-    connection.handshake(request_id, session_id).await?;
+async fn build_and_finish(connection: &mut WorkerConnection, plan: BuildPlan<'_>) -> Result<(), RemoteBackendError> {
+    let BuildPlan { request_id, session_id, build, events, upload_id, resources, artifact_policy, artifact_limits, workspace_root, protocol_version } =
+        plan;
+    connection.handshake(request_id, session_id, protocol_version).await?;
     connection.write(&WorkerMessage::build(request_id, session_id, build)).await?;
     let mut output_bytes = 0u64;
     let exit_code = loop {
@@ -605,9 +684,122 @@ async fn build_and_finish(
             _ => return Err(worker_protocol("unexpected worker build response")),
         }
     };
+    if exit_code == 0 && artifact_policy.is_enabled() {
+        let (artifact_set_id, manifest) = match connection.read().await? {
+            WorkerMessage::ArtifactManifest { request_id: received_request, session_id: received_session, artifact_set_id, entries, total_bytes } => {
+                check_correlation(received_request, received_session, request_id, session_id, "worker artifact manifest")?;
+                (artifact_set_id, artifact_manifest_from_worker(entries, total_bytes, &artifact_policy, artifact_limits)?)
+            }
+            WorkerMessage::Error { kind, message, .. } => return Err(worker_error(WorkerOperation::Artifact, kind, message)),
+            _ => return Err(worker_protocol("unexpected worker artifact manifest response")),
+        };
+        let retrieval = timeout(
+            artifact_limits.timeout,
+            fetch_and_publish_artifacts(connection, request_id, session_id, artifact_set_id, &manifest, workspace_root),
+        )
+        .await;
+        match retrieval {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(RemoteBackendError::Transport {
+                    class: RemoteFailureClass::ArtifactTransfer,
+                    message: "artifact retrieval timed out".to_string(),
+                })
+            }
+        }
+    }
     connection.cleanup(request_id, session_id, upload_id).await?;
     connection.finish().await?;
     send_event(events, RemoteBackendEvent::Completed { exit_code }).await
+}
+
+async fn fetch_and_publish_artifacts(
+    connection: &mut WorkerConnection, request_id: WorkerRequestId, session_id: WorkerSessionId, artifact_set_id: WorkerArtifactSetId,
+    manifest: &ArtifactManifest, workspace_root: PathBuf,
+) -> Result<(), RemoteBackendError> {
+    let mut publication = ArtifactPublication::new(&workspace_root, request_id.0, manifest.clone())
+        .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })?;
+    for index in 0..manifest.entries().len() {
+        connection
+            .write(&WorkerMessage::FetchArtifact {
+                request_id,
+                session_id,
+                artifact_set_id,
+                entry_index: u32::try_from(index).map_err(|_| RemoteBackendError::Transport {
+                    class: RemoteFailureClass::ArtifactTransfer,
+                    message: "artifact index does not fit worker protocol".to_string(),
+                })?,
+            })
+            .await?;
+        let mut writer = publication
+            .begin(index)
+            .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })?;
+        loop {
+            match connection.read().await? {
+                WorkerMessage::ArtifactChunk {
+                    request_id: received_request,
+                    session_id: received_session,
+                    artifact_set_id: received_set,
+                    entry_index,
+                    offset,
+                    data,
+                } => {
+                    check_correlation(received_request, received_session, request_id, session_id, "worker artifact chunk")?;
+                    if received_set != artifact_set_id || entry_index != index as u32 {
+                        return Err(RemoteBackendError::Transport {
+                            class: RemoteFailureClass::ArtifactTransfer,
+                            message: "worker artifact chunk identity mismatch".to_string(),
+                        });
+                    }
+                    let expected = writer
+                        .expected_offset()
+                        .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })?;
+                    if offset != expected {
+                        return Err(RemoteBackendError::Transport {
+                            class: RemoteFailureClass::ArtifactTransfer,
+                            message: "worker artifact chunk offset is out of order".to_string(),
+                        });
+                    }
+                    writer
+                        .write_chunk(&data)
+                        .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })?;
+                }
+                WorkerMessage::ArtifactComplete {
+                    request_id: received_request,
+                    session_id: received_session,
+                    artifact_set_id: received_set,
+                    entry_index,
+                } => {
+                    check_correlation(received_request, received_session, request_id, session_id, "worker artifact completion")?;
+                    if received_set != artifact_set_id || entry_index != index as u32 {
+                        return Err(RemoteBackendError::Transport {
+                            class: RemoteFailureClass::ArtifactTransfer,
+                            message: "worker artifact completion identity mismatch".to_string(),
+                        });
+                    }
+                    publication
+                        .complete(writer)
+                        .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })?;
+                    break;
+                }
+                WorkerMessage::Error { kind, message, .. } => return Err(worker_error(WorkerOperation::Artifact, kind, message)),
+                _ => return Err(worker_protocol("unexpected worker artifact transfer response")),
+            }
+        }
+    }
+    publication.publish().map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })
+}
+
+fn artifact_manifest_from_worker(
+    entries: Vec<WorkerArtifactEntry>, total_bytes: u64, policy: &ArtifactPolicy, limits: ArtifactLimits,
+) -> Result<ArtifactManifest, RemoteBackendError> {
+    let entries = entries
+        .into_iter()
+        .map(|entry| crate::artifact::ArtifactEntry::new(entry.path().as_str().to_string(), entry.mode(), entry.size(), *entry.digest()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, message: error })?;
+    ArtifactManifest::new(entries, total_bytes, policy, limits)
+        .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, message: error })
 }
 
 fn worker_entry(entry: &crate::snapshot::SnapshotEntry) -> Result<WorkerUploadEntry, RemoteBackendError> {
@@ -694,6 +886,7 @@ fn worker_error(operation: WorkerOperation, kind: WorkerErrorKind, message: Stri
     let class = match kind {
         WorkerErrorKind::WorkerProtocol => RemoteFailureClass::WorkerProtocol,
         WorkerErrorKind::Upload | WorkerErrorKind::Sync => RemoteFailureClass::SnapshotTransfer,
+        WorkerErrorKind::Artifact => RemoteFailureClass::ArtifactTransfer,
         WorkerErrorKind::Cleanup => RemoteFailureClass::Cleanup,
         WorkerErrorKind::Build => return RemoteBackendError::Failed(format!("remote worker build failure ({operation:?}): {message}")),
     };

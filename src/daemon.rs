@@ -1,3 +1,4 @@
+use crate::artifact::{ArtifactLimits, ArtifactPolicy};
 use crate::cfg::EnvMode;
 use crate::logging;
 use crate::loopback::{LoopbackBackend, RunRemoteSession};
@@ -102,6 +103,8 @@ pub struct RemoteDaemonConfig {
     environment: Option<RemoteEnvironmentPolicy>,
     backend: RemoteBackendSelection,
     resources: RemoteResourcePolicy,
+    artifact_policy: ArtifactPolicy,
+    artifact_limits: ArtifactLimits,
 }
 
 enum RemoteBackendSelection {
@@ -118,6 +121,8 @@ impl RemoteDaemonConfig {
             environment: None,
             backend: RemoteBackendSelection::Loopback { tools, target_environment: std::collections::BTreeMap::new() },
             resources: RemoteResourcePolicy::default(),
+            artifact_policy: ArtifactPolicy::default(),
+            artifact_limits: ArtifactLimits::default(),
         }
     }
 
@@ -130,6 +135,8 @@ impl RemoteDaemonConfig {
             environment: None,
             backend: RemoteBackendSelection::Ssh { target: Box::new(target) },
             resources: RemoteResourcePolicy::default(),
+            artifact_policy: ArtifactPolicy::default(),
+            artifact_limits: ArtifactLimits::default(),
         })
     }
 
@@ -150,6 +157,12 @@ impl RemoteDaemonConfig {
         self.resources = resources;
         self
     }
+
+    pub fn with_artifacts(mut self, policy: ArtifactPolicy, limits: ArtifactLimits) -> Self {
+        self.artifact_policy = policy;
+        self.artifact_limits = limits;
+        self
+    }
 }
 
 struct RemoteComponents {
@@ -163,7 +176,7 @@ impl VsockDaemon {
         passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, profiles: Vec<String>, share_dir: PathBuf, allow: Vec<String>,
         remote: RemoteDaemonConfig,
     ) -> Result<Self, String> {
-        let RemoteDaemonConfig { session, allowed_tools, tool_policies, environment, backend, resources } = remote;
+        let RemoteDaemonConfig { session, allowed_tools, tool_policies, environment, backend, resources, artifact_policy, artifact_limits } = remote;
         let remote_policy = match (tool_policies, environment) {
             (Some(tool_policies), Some(environment)) => {
                 RemoteAuthorizationPolicy::from_policies(session.target(), session.session_id(), tool_policies, environment)?
@@ -178,9 +191,12 @@ impl VsockDaemon {
                 LoopbackBackend::new(session, tools)
                     .with_target_environment(target_environment)
                     .with_timeout(resources.build_timeout)
-                    .with_output_limit(resources.max_output_bytes),
+                    .with_output_limit(resources.max_output_bytes)
+                    .with_artifacts(artifact_policy.clone(), artifact_limits),
             ),
-            RemoteBackendSelection::Ssh { target } => Arc::new(SshBackend::new(session, *target)?),
+            RemoteBackendSelection::Ssh { target } => {
+                Arc::new(SshBackend::new(session, *target)?.with_artifacts(artifact_policy.clone(), artifact_limits))
+            }
         };
         let remote_components = RemoteComponents { context: remote_context, policy: remote_policy, backend };
         Self::start_inner(passthrough, env_mode, workspace, profiles, share_dir, allow, remote_components)

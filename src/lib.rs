@@ -1,3 +1,4 @@
+pub mod artifact;
 pub mod cfg;
 pub mod cfgsetup;
 pub mod clidef;

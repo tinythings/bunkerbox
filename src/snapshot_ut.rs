@@ -1,5 +1,5 @@
 use super::*;
-use crate::cfg::{ProjectConfig, ProjectSection};
+use crate::cfg::{ProjectConfig, ProjectSection, RemoteSection};
 use crate::remote::WorkspaceSessionId;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -22,6 +22,24 @@ fn builder(store: &TempDir, limits: SnapshotLimits, patterns: &[&str]) -> Snapsh
 
 fn build_at(source: &TempDir, store: &TempDir, limits: SnapshotLimits, patterns: &[&str]) -> Result<WorkspaceSnapshot, String> {
     builder(store, limits, patterns).build_root(source.path(), session(1))
+}
+
+fn remote_config(patterns: &[&str]) -> ProjectConfig {
+    ProjectConfig {
+        project: ProjectSection {
+            remote: RemoteSection { exclude: patterns.iter().map(|pattern| (*pattern).to_string()).collect(), ..Default::default() },
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn remote_builder(store: &TempDir, limits: SnapshotLimits, config: &ProjectConfig) -> SnapshotBuilder {
+    SnapshotBuilder::new(SnapshotStore::new(store.path()), limits, SnapshotExclusionPolicy::from_remote_config(config, None).unwrap())
+}
+
+fn build_remote_at(source: &TempDir, store: &TempDir, limits: SnapshotLimits, config: &ProjectConfig) -> Result<WorkspaceSnapshot, String> {
+    remote_builder(store, limits, config).build_root(source.path(), session(1))
 }
 
 fn write_file(root: &Path, path: &str, contents: &[u8]) {
@@ -105,6 +123,28 @@ fn config_and_runtime_exclusions_use_explicit_snapshot_semantics() {
 }
 
 #[test]
+fn remote_exclusions_use_basename_and_root_anchored_semantics() {
+    let config = remote_config(&[".tmp", "docs/generated"]);
+    let policy = SnapshotExclusionPolicy::from_remote_config(&config, None).unwrap();
+
+    assert!(policy.excludes(".tmp/electron"));
+    assert!(policy.excludes("nested/.tmp/electron"));
+    assert!(policy.excludes("docs/generated/file"));
+    assert!(!policy.excludes("nested/docs/generated/file"));
+    assert!(!policy.excludes("docs/generated-other/file"));
+}
+
+#[test]
+fn mandatory_snapshot_exclusions_remain_enforced_for_remote_config() {
+    let config = remote_config(&[".git", ".bunker", ".bunkerbox", ".ssh", ".env", ".envrc"]);
+    let policy = SnapshotExclusionPolicy::from_remote_config(&config, None).unwrap();
+
+    for path in [".git/config", "nested/.bunker/state", ".bunkerbox/control", ".ssh/key", ".env", "nested/.envrc"] {
+        assert!(policy.excludes(path), "{path}");
+    }
+}
+
+#[test]
 fn malformed_exclusions_are_rejected() {
     for pattern in ["/absolute", "foo/../bar", "foo//bar", "foo/./bar", ""] {
         assert!(SnapshotExclusionPolicy::from_patterns([pattern.to_string()]).is_err(), "{pattern}");
@@ -134,6 +174,37 @@ fn every_symlink_is_rejected_without_following_it() {
         }
         assert!(build_at(&source, &store, SnapshotLimits::default(), &[]).is_err(), "{case}");
     }
+}
+
+#[test]
+fn remote_exclusions_skip_oversized_files_and_symlinks_before_validation() {
+    let source = TempDir::new().unwrap();
+    let store = TempDir::new().unwrap();
+    write_file(source.path(), ".tmp/electron", b"oversized");
+    let symlink_path = source.path().join(".venv-docs/bin/python");
+    fs::create_dir_all(symlink_path.parent().unwrap()).unwrap();
+    symlink("missing-python", &symlink_path).unwrap();
+
+    let config = remote_config(&[".tmp", ".venv-docs"]);
+    let snapshot = build_remote_at(&source, &store, SnapshotLimits { max_file_bytes: 4, ..SnapshotLimits::default() }, &config).unwrap();
+
+    assert!(snapshot.entries().is_empty());
+}
+
+#[test]
+fn remote_exclusions_do_not_bypass_snapshot_validation_outside_excluded_trees() {
+    let source = TempDir::new().unwrap();
+    let store = TempDir::new().unwrap();
+    write_file(source.path(), "other/electron", b"oversized");
+    let config = remote_config(&[".tmp", ".venv-docs"]);
+    assert!(build_remote_at(&source, &store, SnapshotLimits { max_file_bytes: 4, ..SnapshotLimits::default() }, &config).is_err());
+
+    let source = TempDir::new().unwrap();
+    let store = TempDir::new().unwrap();
+    let symlink_path = source.path().join("other/python");
+    fs::create_dir_all(symlink_path.parent().unwrap()).unwrap();
+    symlink("missing-python", &symlink_path).unwrap();
+    assert!(build_remote_at(&source, &store, SnapshotLimits::default(), &config).is_err());
 }
 
 #[test]

@@ -45,6 +45,48 @@ fn load_or_create_loads_existing_config() {
     assert_eq!(cfg.project.exclude, vec!["build/", "logs/"]);
 }
 
+#[test]
+fn load_or_create_parses_remote_exclusions() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(root.path(), "project:\n  remote:\n    exclude:\n      - .tmp\n      - docs/generated\n");
+
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+
+    assert_eq!(cfg.project.remote.exclude, vec![".tmp", "docs/generated"]);
+}
+
+#[test]
+fn remote_exclusions_default_to_empty() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(root.path(), "project:\n  remote:\n    exclude: []\n");
+
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+
+    assert!(cfg.project.remote.exclude.is_empty());
+    assert!(ProjectConfig::default().project.remote.exclude.is_empty());
+}
+
+#[test]
+fn load_or_create_rejects_invalid_remote_exclusions() {
+    for exclusion in ["/absolute", "foo/../bar"] {
+        let root = TempDir::new().unwrap();
+        write_project_conf(root.path(), &format!("project:\n  remote:\n    exclude:\n      - \"{exclusion}\"\n"));
+
+        assert!(ProjectConfig::load_or_create(root.path()).is_err(), "{exclusion}");
+    }
+}
+
+#[test]
+fn remote_exclusions_do_not_change_general_workspace_exclusions() {
+    let cfg = ProjectConfig {
+        project: ProjectSection { remote: RemoteSection { exclude: vec![".tmp".into()], ..Default::default() }, ..Default::default() },
+        ..Default::default()
+    };
+
+    assert!(cfg.project.exclude.is_empty());
+    assert!(!cfg.effective_exclude(None).iter().any(|pattern| pattern.trim_end_matches('/') == ".tmp"));
+}
+
 /// Invalid YAML in project.conf produces an error.
 #[test]
 fn load_or_create_invalid_yaml_is_error() {

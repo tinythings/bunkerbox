@@ -1,5 +1,5 @@
 use crate::cfg::ProjectConfig;
-use crate::remote::WorkspaceSessionId;
+use crate::remote::{RemoteExecutionControl, WorkspaceSessionId};
 use crate::workspace::WorkspaceHandle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -266,7 +266,16 @@ impl SnapshotStore {
     }
 
     pub fn materialize(&self, handle: &SnapshotHandle, destination: &Path) -> Result<MaterializedWorkspace, String> {
+        self.materialize_with_control(handle, destination, RemoteExecutionControl::new())
+    }
+
+    pub fn materialize_with_control(
+        &self, handle: &SnapshotHandle, destination: &Path, control: RemoteExecutionControl,
+    ) -> Result<MaterializedWorkspace, String> {
         let snapshot = self.resolve(handle)?;
+        if control.is_cancelled() {
+            return Err("snapshot materialization cancelled".to_string());
+        }
         if fs::symlink_metadata(destination).is_ok() {
             return Err("materialization destination already exists".to_string());
         }
@@ -280,6 +289,9 @@ impl SnapshotStore {
         let destination_root = open_directory(destination)?;
 
         for entry in snapshot.entries() {
+            if control.is_cancelled() {
+                return Err("snapshot materialization cancelled".to_string());
+            }
             match entry.kind {
                 SnapshotEntryKind::Directory => ensure_destination_directory(&destination_root, entry.path.as_str(), entry.mode)?,
                 SnapshotEntryKind::RegularFile => {
@@ -291,9 +303,13 @@ impl SnapshotStore {
                         entry.size,
                         entry.content_digest.ok_or_else(|| "regular file has no digest".to_string())?,
                         entry.path.as_str(),
+                        &control,
                     )?;
                 }
             }
+        }
+        if control.is_cancelled() {
+            return Err("snapshot materialization cancelled".to_string());
         }
 
         cleanup.committed = true;
@@ -302,6 +318,12 @@ impl SnapshotStore {
 
     #[allow(dead_code)]
     fn read_staged_file(&self, handle: &SnapshotHandle, entry: &SnapshotEntry, max_bytes: u64) -> Result<Vec<u8>, String> {
+        self.read_staged_file_with_control(handle, entry, max_bytes, &RemoteExecutionControl::new())
+    }
+
+    fn read_staged_file_with_control(
+        &self, handle: &SnapshotHandle, entry: &SnapshotEntry, max_bytes: u64, control: &RemoteExecutionControl,
+    ) -> Result<Vec<u8>, String> {
         if entry.kind != SnapshotEntryKind::RegularFile {
             return Err(format!("snapshot export entry is not a regular file: {}", entry.path.as_str()));
         }
@@ -333,6 +355,9 @@ impl SnapshotStore {
         let mut hasher = Sha256::new();
         let mut read_bytes = 0u64;
         loop {
+            if control.is_cancelled() {
+                return Err("snapshot export cancelled".to_string());
+            }
             let count = (&source).read(&mut buffer).map_err(|error| format!("read snapshot export file {}: {error}", entry.path.as_str()))?;
             if count == 0 {
                 break;
@@ -396,6 +421,12 @@ impl SnapshotExport {
     }
 
     pub(crate) fn read_file_bounded(&self, entry: &SnapshotEntry, max_bytes: u64) -> Result<Vec<u8>, String> {
+        self.read_file_bounded_with_control(entry, max_bytes, &RemoteExecutionControl::new())
+    }
+
+    pub(crate) fn read_file_bounded_with_control(
+        &self, entry: &SnapshotEntry, max_bytes: u64, control: &RemoteExecutionControl,
+    ) -> Result<Vec<u8>, String> {
         let manifest_entry = self
             .snapshot
             .entries
@@ -405,7 +436,7 @@ impl SnapshotExport {
         if manifest_entry != entry {
             return Err(format!("snapshot export entry does not match the manifest: {}", entry.path.as_str()));
         }
-        self.store.read_staged_file(self.snapshot.handle(), manifest_entry, max_bytes)
+        self.store.read_staged_file_with_control(self.snapshot.handle(), manifest_entry, max_bytes, control)
     }
 }
 
@@ -449,6 +480,12 @@ impl SnapshotBuilder {
     }
 
     pub(crate) fn build_root(&self, workspace_root: &Path, session_id: WorkspaceSessionId) -> Result<WorkspaceSnapshot, String> {
+        self.build_root_with_control(workspace_root, session_id, RemoteExecutionControl::new())
+    }
+
+    pub(crate) fn build_root_with_control(
+        &self, workspace_root: &Path, session_id: WorkspaceSessionId, control: RemoteExecutionControl,
+    ) -> Result<WorkspaceSnapshot, String> {
         validate_limits(&self.limits)?;
         if session_id.0 == [0; 16] {
             return Err("snapshot requires an authoritative nonzero workspace session".to_string());
@@ -476,6 +513,7 @@ impl SnapshotBuilder {
             root_device,
             stage_files: files_root,
             next_buffer: vec![0; SNAPSHOT_COPY_BUFFER_BYTES],
+            control,
         };
         walk_directory(root.as_raw_fd(), "", 0, &self.limits, &self.exclusions, &mut state)?;
         state.entries.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
@@ -485,12 +523,18 @@ impl SnapshotBuilder {
         if manifest.len() > self.limits.max_manifest_bytes {
             return Err(format!("snapshot manifest exceeds maximum size {}", self.limits.max_manifest_bytes));
         }
+        if state.control.is_cancelled() {
+            return Err("snapshot creation cancelled".to_string());
+        }
         fs::write(stage.join("manifest.json"), manifest).map_err(|error| format!("write snapshot manifest: {error}"))?;
 
         let final_session = store_root.join(hex(&session_id.0));
         fs::create_dir_all(&final_session).map_err(|error| format!("create snapshot session directory: {error}"))?;
         set_mode(&final_session, 0o700)?;
         let final_path = final_session.join(hex(&id.0));
+        if state.control.is_cancelled() {
+            return Err("snapshot creation cancelled".to_string());
+        }
         if !final_path.exists() {
             fs::rename(&stage, &final_path).map_err(|error| format!("publish snapshot: {error}"))?;
         } else {
@@ -528,16 +572,23 @@ struct WalkState {
     root_device: libc::dev_t,
     stage_files: PathBuf,
     next_buffer: Vec<u8>,
+    control: RemoteExecutionControl,
 }
 
 fn walk_directory(
     directory_fd: RawFd, parent: &str, depth: usize, limits: &SnapshotLimits, exclusions: &SnapshotExclusionPolicy, state: &mut WalkState,
 ) -> Result<(), String> {
+    if state.control.is_cancelled() {
+        return Err("snapshot creation cancelled".to_string());
+    }
     check_deadline(state.started, limits)?;
     if depth > limits.max_depth {
         return Err(format!("snapshot exceeds maximum depth {}", limits.max_depth));
     }
     for name in read_directory_names(directory_fd)? {
+        if state.control.is_cancelled() {
+            return Err("snapshot creation cancelled".to_string());
+        }
         check_deadline(state.started, limits)?;
         let component = name.to_str().ok_or_else(|| "snapshot contains a non-UTF-8 path component".to_string())?;
         validate_component(component, limits.max_component_bytes)?;
@@ -607,6 +658,9 @@ fn copy_and_hash_file(
     let mut hasher = Sha256::new();
     let mut read_bytes = 0u64;
     loop {
+        if state.control.is_cancelled() {
+            return Err("snapshot creation cancelled".to_string());
+        }
         check_deadline(state.started, limits)?;
         let count = (&file).read(&mut state.next_buffer).map_err(|error| format!("read snapshot file {relative}: {error}"))?;
         if count == 0 {
@@ -833,13 +887,18 @@ fn open_relative_file(root: &File, relative: &str, flags: i32) -> Result<File, S
         .map_err(|error| format!("open snapshot content {relative}: {error}"))
 }
 
-fn copy_materialized_file(source: &File, destination: &File, expected_size: u64, expected_digest: [u8; 32], path: &str) -> Result<(), String> {
+fn copy_materialized_file(
+    source: &File, destination: &File, expected_size: u64, expected_digest: [u8; 32], path: &str, control: &RemoteExecutionControl,
+) -> Result<(), String> {
     let mut source = source.try_clone().map_err(|error| format!("clone snapshot content {path}: {error}"))?;
     let mut destination = destination.try_clone().map_err(|error| format!("clone materialized file {path}: {error}"))?;
     let mut buffer = vec![0u8; SNAPSHOT_COPY_BUFFER_BYTES];
     let mut hasher = Sha256::new();
     let mut copied = 0u64;
     loop {
+        if control.is_cancelled() {
+            return Err(format!("snapshot materialization cancelled: {path}"));
+        }
         let count = source.read(&mut buffer).map_err(|error| format!("read snapshot content {path}: {error}"))?;
         if count == 0 {
             break;

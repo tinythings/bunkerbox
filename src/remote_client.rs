@@ -51,6 +51,14 @@ pub fn selected_remote_environment(names: impl IntoIterator<Item = String>) -> V
         .collect()
 }
 
+pub fn selected_remote_environment_for_tool(tool: &str, names: impl IntoIterator<Item = String>) -> Vec<(String, String)> {
+    if tool == "cargo" {
+        Vec::new()
+    } else {
+        selected_remote_environment(names)
+    }
+}
+
 fn never_forward_environment(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(upper.as_str(), "PATH" | "HOME" | "SSH_AUTH_SOCK" | "SSH_AGENT_PID" | "GITHUB_TOKEN" | "GITLAB_TOKEN" | "NPM_TOKEN" | "KUBECONFIG")
@@ -81,6 +89,10 @@ pub fn remote_build_request(
     let snapshot_id = crate::vscomm::RemoteSnapshotId(*snapshot_id.as_bytes());
     let build = RemoteBuild::new(WorkspaceRelativePath::new(cwd)?, RemoteTool::new(tool)?, argv, env, snapshot_id)?;
     Ok(RemoteRequest::build(request_id, session_id, build))
+}
+
+pub fn remote_cancel_request(request_id: RequestId, session_id: WorkspaceSessionId, target_request_id: RequestId) -> RemoteRequest {
+    RemoteRequest::cancel(request_id, session_id, target_request_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

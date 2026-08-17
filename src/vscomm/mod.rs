@@ -185,6 +185,7 @@ impl RemoteBuild {
 pub enum RemoteOperation {
     Sync(RemoteSync),
     Build(RemoteBuild),
+    Cancel { target_request_id: RequestId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,12 +212,23 @@ impl RemoteRequest {
         Self { request_id, workspace_session_id, operation: RemoteOperation::Build(build) }
     }
 
+    pub fn cancel(request_id: RequestId, workspace_session_id: WorkspaceSessionId, target_request_id: RequestId) -> Self {
+        Self { request_id, workspace_session_id, operation: RemoteOperation::Cancel { target_request_id } }
+    }
+
     pub fn to_frame(&self) -> Result<Frame, String> {
+        if self.request_id.0 == [0; 16] {
+            return Err("remote request ID must be nonzero".to_string());
+        }
+        if self.workspace_session_id.0 == [0; 16] {
+            return Err("remote workspace session ID must be nonzero".to_string());
+        }
         let mut writer = WireWriter::new(*b"BBR1");
         writer.u16(REMOTE_PROTOCOL_VERSION);
         writer.u8(match &self.operation {
             RemoteOperation::Sync(_) => 1,
             RemoteOperation::Build(_) => 2,
+            RemoteOperation::Cancel { .. } => 3,
         });
         writer.u8(0);
         writer.bytes(&self.request_id.0);
@@ -226,6 +238,11 @@ impl RemoteRequest {
             encode_remote_build(&mut writer, build)?;
         } else if let RemoteOperation::Sync(sync) = &self.operation {
             writer.u8(u8::from(sync.retain_capability));
+        } else if let RemoteOperation::Cancel { target_request_id } = &self.operation {
+            if target_request_id.0 == [0; 16] {
+                return Err("remote cancel target request ID must be nonzero".to_string());
+            }
+            writer.bytes(&target_request_id.0);
         }
 
         writer.into_frame(FrameType::RemoteRequest)
@@ -242,7 +259,13 @@ impl RemoteRequest {
         let operation_kind = reader.u8()?;
         reader.zero_reserved()?;
         let request_id = RequestId(reader.array16()?);
+        if request_id.0 == [0; 16] {
+            return Err("remote request ID must be nonzero".to_string());
+        }
         let workspace_session_id = WorkspaceSessionId(reader.array16()?);
+        if workspace_session_id.0 == [0; 16] {
+            return Err("remote workspace session ID must be nonzero".to_string());
+        }
         let operation = match operation_kind {
             1 => {
                 let retain_capability = match reader.u8()? {
@@ -253,6 +276,13 @@ impl RemoteRequest {
                 RemoteOperation::Sync(RemoteSync { retain_capability })
             }
             2 => RemoteOperation::Build(decode_remote_build(&mut reader)?),
+            3 => {
+                let target_request_id = RequestId(reader.array16()?);
+                if target_request_id.0 == [0; 16] {
+                    return Err("remote cancel target request ID must be nonzero".to_string());
+                }
+                RemoteOperation::Cancel { target_request_id }
+            }
             value => return Err(format!("unknown remote operation: {value}")),
         };
         let request = Self { request_id, workspace_session_id, operation };
@@ -277,6 +307,9 @@ impl RemoteRequest {
                 let snapshot_id = remote_domain::RemoteSnapshotId::from_bytes(build.snapshot_id.0);
                 let build = remote_domain::RemoteBuild::new(cwd, tool, build.argv, build.env, snapshot_id)?;
                 Ok(remote_domain::RemoteRequest::build(request_id, session_id, build))
+            }
+            RemoteOperation::Cancel { target_request_id } => {
+                Ok(remote_domain::RemoteRequest::cancel(request_id, session_id, remote_domain::RequestId(target_request_id.0)))
             }
         }
     }
@@ -564,6 +597,9 @@ impl RemoteEvent {
     }
 
     pub fn to_frame(&self) -> Result<Frame, String> {
+        if self.request_id.0 == [0; 16] {
+            return Err("remote event request ID must be nonzero".to_string());
+        }
         let mut writer = WireWriter::new(*b"BBE1");
         writer.u16(REMOTE_PROTOCOL_VERSION);
         writer.u8(match &self.kind {
@@ -615,6 +651,9 @@ impl RemoteEvent {
         let event_kind = reader.u8()?;
         reader.zero_reserved()?;
         let request_id = RequestId(reader.array16()?);
+        if request_id.0 == [0; 16] {
+            return Err("remote event request ID must be nonzero".to_string());
+        }
         let kind = match event_kind {
             1 => {
                 let completed_bytes = reader.u64()?;

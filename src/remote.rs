@@ -3,9 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 pub const MAX_REMOTE_STRING_BYTES: usize = 4 * 1024;
 pub const MAX_REMOTE_TOOL_BYTES: usize = 256;
@@ -18,8 +20,14 @@ pub const DEFAULT_REMOTE_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_REMOTE_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_REMOTE_ENVIRONMENT: &[&str] = &["CC", "CXX", "AR", "RUSTFLAGS", "CFLAGS", "CXXFLAGS", "MAKEFLAGS"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestId(pub [u8; 16]);
+
+impl RequestId {
+    pub fn is_zero(self) -> bool {
+        self.0 == [0; 16]
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RemoteSnapshotId([u8; 16]);
@@ -38,10 +46,10 @@ impl RemoteSnapshotId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkspaceSessionId(pub [u8; 16]);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RemoteTargetId(pub [u8; 16]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,13 +146,22 @@ impl RemoteBuild {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteResourcePolicy {
+    pub sync_timeout: Duration,
     pub build_timeout: Duration,
+    pub idle_output_timeout: Duration,
+    pub cleanup_timeout: Duration,
     pub max_output_bytes: u64,
 }
 
 impl Default for RemoteResourcePolicy {
     fn default() -> Self {
-        Self { build_timeout: DEFAULT_REMOTE_BUILD_TIMEOUT, max_output_bytes: DEFAULT_REMOTE_OUTPUT_BYTES }
+        Self {
+            sync_timeout: Duration::from_secs(60),
+            build_timeout: DEFAULT_REMOTE_BUILD_TIMEOUT,
+            idle_output_timeout: Duration::from_secs(5 * 60),
+            cleanup_timeout: Duration::from_secs(5),
+            max_output_bytes: DEFAULT_REMOTE_OUTPUT_BYTES,
+        }
     }
 }
 
@@ -231,10 +248,168 @@ impl RemoteSync {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteAdmissionLimits {
+    pub global_active: usize,
+    pub target_active: usize,
+}
+
+impl Default for RemoteAdmissionLimits {
+    fn default() -> Self {
+        Self { global_active: 2, target_active: 1 }
+    }
+}
+
+impl RemoteAdmissionLimits {
+    pub const MAX: usize = 64;
+
+    pub fn new(global_active: usize, target_active: usize) -> Result<Self, String> {
+        if global_active == 0 || target_active == 0 {
+            return Err("remote active-build limits must be positive".to_string());
+        }
+        if global_active > Self::MAX || target_active > Self::MAX {
+            return Err(format!("remote active-build limits must not exceed {}", Self::MAX));
+        }
+        Ok(Self { global_active, target_active })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteLifecyclePhase {
+    Admitting,
+    Syncing,
+    Connecting,
+    Transferring,
+    Building,
+    ArtifactHandling,
+    Cancelling,
+    Cleanup,
+    Finalizing,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTimeoutCause {
+    Connection,
+    Sync,
+    Build,
+    IdleOutput,
+    Artifact,
+    Cleanup,
+}
+
+impl RemoteTimeoutCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::Sync => "sync",
+            Self::Build => "build",
+            Self::IdleOutput => "idle output",
+            Self::Artifact => "artifact",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteCancellation {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl Default for RemoteCancellation {
+    fn default() -> Self {
+        Self { cancelled: Arc::new(AtomicBool::new(false)), notify: Arc::new(Notify::new()) }
+    }
+}
+
+impl RemoteCancellation {
+    pub fn cancel(&self) -> bool {
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            false
+        } else {
+            self.notify.notify_waiters();
+            true
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            self.notify.notified().await;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteExecutionControl {
+    cancellation: RemoteCancellation,
+    phase: Arc<AtomicU8>,
+}
+
+impl Default for RemoteExecutionControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RemoteExecutionControl {
+    pub fn new() -> Self {
+        Self { cancellation: RemoteCancellation::default(), phase: Arc::new(AtomicU8::new(0)) }
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.cancellation.cancel()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    pub fn phase(&self) -> RemoteLifecyclePhase {
+        match self.phase.load(Ordering::Acquire) {
+            1 => RemoteLifecyclePhase::Syncing,
+            2 => RemoteLifecyclePhase::Connecting,
+            3 => RemoteLifecyclePhase::Transferring,
+            4 => RemoteLifecyclePhase::Building,
+            5 => RemoteLifecyclePhase::ArtifactHandling,
+            6 => RemoteLifecyclePhase::Cancelling,
+            7 => RemoteLifecyclePhase::Cleanup,
+            8 => RemoteLifecyclePhase::Finalizing,
+            9 => RemoteLifecyclePhase::Terminal,
+            _ => RemoteLifecyclePhase::Admitting,
+        }
+    }
+
+    pub fn set_phase(&self, phase: RemoteLifecyclePhase) {
+        let value = match phase {
+            RemoteLifecyclePhase::Admitting => 0,
+            RemoteLifecyclePhase::Syncing => 1,
+            RemoteLifecyclePhase::Connecting => 2,
+            RemoteLifecyclePhase::Transferring => 3,
+            RemoteLifecyclePhase::Building => 4,
+            RemoteLifecyclePhase::ArtifactHandling => 5,
+            RemoteLifecyclePhase::Cancelling => 6,
+            RemoteLifecyclePhase::Cleanup => 7,
+            RemoteLifecyclePhase::Finalizing => 8,
+            RemoteLifecyclePhase::Terminal => 9,
+        };
+        self.phase.fetch_max(value, Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteOperation {
     Sync(RemoteSync),
     Build(RemoteBuild),
+    Cancel { target_request_id: RequestId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +434,10 @@ impl RemoteRequest {
 
     pub fn build(request_id: RequestId, workspace_session_id: WorkspaceSessionId, build: RemoteBuild) -> Self {
         Self { request_id, workspace_session_id, operation: RemoteOperation::Build(build) }
+    }
+
+    pub fn cancel(request_id: RequestId, workspace_session_id: WorkspaceSessionId, target_request_id: RequestId) -> Self {
+        Self { request_id, workspace_session_id, operation: RemoteOperation::Cancel { target_request_id } }
     }
 
     pub fn request_id(&self) -> RequestId {
@@ -302,6 +481,10 @@ impl AuthorizedRemoteRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteAuthorizationError {
+    InvalidRequestId,
+    InvalidCancelTarget,
+    CancelTargetUnavailable,
+    CancelTargetFinalizing,
     SessionMismatch,
     TargetNotAllowed,
     ToolNotAllowed(String),
@@ -362,6 +545,9 @@ impl RemoteAuthorizationPolicy {
     }
 
     pub fn authorize(&self, context: &RemoteExecutionContext, request: RemoteRequest) -> Result<AuthorizedRemoteRequest, RemoteAuthorizationError> {
+        if request.request_id.is_zero() {
+            return Err(RemoteAuthorizationError::InvalidRequestId);
+        }
         if context.workspace_session_id != self.allowed_session || request.workspace_session_id != context.workspace_session_id {
             return Err(RemoteAuthorizationError::SessionMismatch);
         }
@@ -371,6 +557,12 @@ impl RemoteAuthorizationPolicy {
 
         let request = match request.operation() {
             RemoteOperation::Sync(_) => request,
+            RemoteOperation::Cancel { target_request_id } => {
+                if target_request_id.is_zero() {
+                    return Err(RemoteAuthorizationError::InvalidCancelTarget);
+                }
+                request
+            }
             RemoteOperation::Build(build) => {
                 if self.snapshot_authority.as_ref().is_none_or(|authority| !authority.snapshot_available(self.allowed_session, build.snapshot_id())) {
                     return Err(RemoteAuthorizationError::SnapshotNotAllowed);
@@ -381,7 +573,14 @@ impl RemoteAuthorizationPolicy {
                 if !tool_policy.allows_arbitrary_argv() && !build.argv().is_empty() {
                     return Err(RemoteAuthorizationError::ToolArgumentsNotAllowed(build.tool().as_str().to_string()));
                 }
-                let environment = self.environment.filter(build.env())?;
+                let environment = if build.tool().as_str() == "cargo" {
+                    if let Some((name, _)) = build.env().first() {
+                        return Err(RemoteAuthorizationError::ForbiddenEnvironment(name.clone()));
+                    }
+                    Vec::new()
+                } else {
+                    self.environment.filter(build.env())?
+                };
                 let filtered = RemoteBuild::new(build.cwd.clone(), build.tool.clone(), build.argv.clone(), environment, build.snapshot_id())
                     .map_err(RemoteAuthorizationError::InvalidEnvironment)?;
                 RemoteRequest::build(request.request_id, request.workspace_session_id, filtered)
@@ -408,6 +607,7 @@ pub enum RemoteBackendError {
     Failed(String),
     Spawn(String),
     Transport { class: RemoteFailureClass, message: String },
+    Deadline { cause: RemoteTimeoutCause },
     Timeout,
     OutputLimit { limit: u64 },
     Cancelled,
@@ -425,6 +625,7 @@ pub enum RemoteFailureClass {
     SnapshotTransfer,
     ArtifactManifest,
     ArtifactTransfer,
+    Busy,
     Disconnect,
     Cleanup,
 }
@@ -442,6 +643,7 @@ impl RemoteFailureClass {
             Self::SnapshotTransfer => "snapshot transfer",
             Self::ArtifactManifest => "artifact manifest",
             Self::ArtifactTransfer => "artifact transfer",
+            Self::Busy => "busy",
             Self::Disconnect => "disconnect",
             Self::Cleanup => "cleanup",
         }
@@ -453,6 +655,7 @@ impl RemoteBackendError {
         match self {
             Self::Failed(message) | Self::Spawn(message) => RemoteBackendEvent::Error { message: message.clone() },
             Self::Transport { class, message } => RemoteBackendEvent::Error { message: format!("remote {} failure: {message}", class.as_str()) },
+            Self::Deadline { cause } => RemoteBackendEvent::Error { message: format!("remote {} deadline exceeded", cause.as_str()) },
             Self::Timeout => RemoteBackendEvent::Error { message: "remote backend timed out".to_string() },
             Self::OutputLimit { limit } => RemoteBackendEvent::Error { message: format!("remote output exceeded limit of {limit} bytes") },
             Self::Cancelled => RemoteBackendEvent::Cancelled,
@@ -464,7 +667,7 @@ pub type RemoteFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait RemoteBackend: Send + Sync {
     fn execute<'a>(
-        &'a self, request: AuthorizedRemoteRequest, events: mpsc::Sender<RemoteBackendEvent>,
+        &'a self, request: AuthorizedRemoteRequest, control: RemoteExecutionControl, events: mpsc::Sender<RemoteBackendEvent>,
     ) -> RemoteFuture<'a, Result<(), RemoteBackendError>>;
 }
 

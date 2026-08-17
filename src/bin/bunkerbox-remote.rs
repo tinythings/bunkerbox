@@ -1,9 +1,9 @@
-use bunkerbox::guest_install::install_remote_make_link;
+use bunkerbox::guest_install::{install_remote_cargo_link, install_remote_make_link};
 #[cfg(test)]
 use bunkerbox::remote::RemoteSnapshotId;
 use bunkerbox::remote_client::{
     execute_remote_request_to, logical_workspace_cwd, new_request_id, remote_build_request, remote_diagnostic_sync_request, remote_environment_names,
-    remote_session_from_env, remote_sync_request, remote_tool_enabled, selected_remote_environment, RemoteCompletion,
+    remote_session_from_env, remote_sync_request, remote_tool_enabled, selected_remote_environment_for_tool, RemoteCompletion,
 };
 #[cfg(test)]
 use bunkerbox::vscomm::RequestId;
@@ -37,11 +37,11 @@ fn run() -> Result<i32, String> {
         env::args_os().next().and_then(|value| Path::new(&value).file_name().and_then(|name| name.to_str()).map(str::to_owned)).unwrap_or_default();
     let args = env::args().skip(1).collect::<Vec<_>>();
 
-    if invoked_as == "make" {
-        return run_transparent_make(&args);
+    if matches!(invoked_as.as_str(), "make" | "cargo") {
+        return run_transparent_tool(&invoked_as, &args);
     }
     if invoked_as != "bunkerbox-remote" {
-        return Err("bunkerbox-remote must be invoked directly or through the managed make symlink".to_string());
+        return Err("bunkerbox-remote must be invoked directly or through a managed make or cargo symlink".to_string());
     }
     if args.len() == 1 && args[0] == "install" {
         install_remote_links()?;
@@ -69,14 +69,14 @@ fn run_explicit(args: &[String]) -> Result<i32, String> {
     }
 }
 
-fn run_transparent_make(args: &[String]) -> Result<i32, String> {
+fn run_transparent_tool(tool: &str, args: &[String]) -> Result<i32, String> {
     let cwd = logical_workspace_cwd(&env::current_dir().map_err(|error| format!("current directory: {error}"))?)?;
     let session = remote_session_from_env()?;
-    run_build_with_sync(cwd, "make".to_string(), args.to_vec(), session)
+    run_build_with_sync(cwd, tool.to_string(), args.to_vec(), session)
 }
 
 fn run_build_with_sync(cwd: String, tool: String, args: Vec<String>, session: WorkspaceSessionId) -> Result<i32, String> {
-    let environment = selected_remote_environment(remote_environment_names());
+    let environment = selected_remote_environment_for_tool(&tool, remote_environment_names());
     run_build_with_sync_using(cwd, tool, args, environment, session, execute_request_over_vsock)
 }
 
@@ -140,7 +140,9 @@ fn build_request(
 fn install_remote_links() -> Result<(), String> {
     fs::create_dir_all(VSCOMM_BIN_DIR).map_err(|error| format!("mkdir {VSCOMM_BIN_DIR}: {error}"))?;
     let executable = env::current_exe().map_err(|error| format!("failed to locate remote binary: {error}"))?;
-    install_remote_make_link(Path::new(VSCOMM_BIN_DIR), &executable, remote_tool_enabled("make"))
+    let bin_dir = Path::new(VSCOMM_BIN_DIR);
+    install_remote_make_link(bin_dir, &executable, remote_tool_enabled("make"))?;
+    install_remote_cargo_link(bin_dir, &executable, remote_tool_enabled("cargo"))
 }
 
 fn connect_toolchain() -> Result<VsockStream, String> {

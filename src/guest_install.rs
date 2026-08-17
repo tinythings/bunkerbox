@@ -3,11 +3,22 @@ use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const REMOTE_MAKE_OWNER: &str = "bunkerbox-remote";
+const REMOTE_WRAPPER_OWNER: &str = "bunkerbox-remote";
 
 pub fn install_remote_make_link(bin_dir: &Path, executable: &Path, enabled: bool) -> Result<(), String> {
-    let target = bin_dir.join("make");
-    let managed = is_managed_remote_make_link(&target);
+    install_remote_link("make", bin_dir, executable, enabled)
+}
+
+pub fn install_remote_cargo_link(bin_dir: &Path, executable: &Path, enabled: bool) -> Result<(), String> {
+    install_remote_link("cargo", bin_dir, executable, enabled)
+}
+
+fn install_remote_link(command: &str, bin_dir: &Path, executable: &Path, enabled: bool) -> Result<(), String> {
+    if !is_supported_remote_command(command) {
+        return Err(format!("unsupported remote wrapper command: {command}"));
+    }
+    let target = bin_dir.join(command);
+    let managed = is_managed_remote_link(&target);
 
     if enabled {
         if let Ok(link) = fs::read_link(&target) {
@@ -17,13 +28,13 @@ pub fn install_remote_make_link(bin_dir: &Path, executable: &Path, enabled: bool
         }
         if fs::symlink_metadata(&target).is_ok() {
             if !managed {
-                return Err(format!("cannot install remote make wrapper over existing {}", target.display()));
+                return Err(format!("cannot install remote {command} wrapper over existing {}", target.display()));
             }
-            fs::remove_file(&target).map_err(|error| format!("remove existing remote make wrapper: {error}"))?;
+            fs::remove_file(&target).map_err(|error| format!("remove existing remote {command} wrapper: {error}"))?;
         }
-        symlink(executable, &target).map_err(|error| format!("symlink remote make wrapper: {error}"))?;
+        symlink(executable, &target).map_err(|error| format!("symlink remote {command} wrapper: {error}"))?;
     } else if managed {
-        fs::remove_file(&target).map_err(|error| format!("remove disabled remote make wrapper: {error}"))?;
+        fs::remove_file(&target).map_err(|error| format!("remove disabled remote {command} wrapper: {error}"))?;
     }
     Ok(())
 }
@@ -36,7 +47,7 @@ pub fn install_vscomm_links(commands: impl IntoIterator<Item = String>, bin_dir:
             continue;
         }
         let target = bin_dir.join(&command);
-        if command == "make" && is_managed_remote_make_link(&target) {
+        if is_supported_remote_command(&command) && is_managed_remote_link(&target) {
             continue;
         }
         if command_exists_in_path_except(&command, vscomm_path, path) {
@@ -56,12 +67,16 @@ pub fn install_vscomm_links(commands: impl IntoIterator<Item = String>, bin_dir:
     Ok(())
 }
 
-fn is_managed_remote_make_link(target: &Path) -> bool {
+fn is_managed_remote_link(target: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(target) else { return false };
     if !metadata.file_type().is_symlink() {
         return false;
     }
-    fs::read_link(target).ok().and_then(|link| link.file_name().map(OsStr::to_owned)).is_some_and(|name| name == REMOTE_MAKE_OWNER)
+    fs::read_link(target).ok().and_then(|link| link.file_name().map(OsStr::to_owned)).is_some_and(|name| name == REMOTE_WRAPPER_OWNER)
+}
+
+fn is_supported_remote_command(command: &str) -> bool {
+    matches!(command, "make" | "cargo")
 }
 
 fn command_exists_in_path_except(command: &str, except: &Path, path: &str) -> bool {

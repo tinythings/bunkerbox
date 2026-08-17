@@ -1,3 +1,4 @@
+use crate::remote::RemoteExecutionControl;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -190,6 +191,12 @@ pub struct LocalArtifactSpool {
 
 impl LocalArtifactSpool {
     pub fn capture(job_root: &Path, parent: &Path, policy: &ArtifactPolicy, limits: ArtifactLimits) -> Result<Self, String> {
+        Self::capture_with_control(job_root, parent, policy, limits, &RemoteExecutionControl::new())
+    }
+
+    pub fn capture_with_control(
+        job_root: &Path, parent: &Path, policy: &ArtifactPolicy, limits: ArtifactLimits, control: &RemoteExecutionControl,
+    ) -> Result<Self, String> {
         policy.validate_limits(limits)?;
         let path = create_unique_directory(parent, "artifact-spool")?;
         let root = match open_directory(&path) {
@@ -204,6 +211,9 @@ impl LocalArtifactSpool {
             let mut entries = Vec::with_capacity(policy.paths.len());
             let mut total = 0u64;
             for relative in policy.paths() {
+                if control.is_cancelled() {
+                    return Err("artifact capture cancelled".to_string());
+                }
                 let source = open_regular_file(job_root, relative)?;
                 let metadata = source.metadata().map_err(|error| format!("stat artifact {relative}: {error}"))?;
                 if metadata.nlink() != 1 {
@@ -219,7 +229,7 @@ impl LocalArtifactSpool {
                 }
                 let mode = metadata.mode() & 0o777;
                 let destination = create_relative_file(&root, relative, mode)?;
-                let digest = copy_and_hash(&source, &destination, size, relative)?;
+                let digest = copy_and_hash(&source, &destination, size, relative, control)?;
                 let after = source.metadata().map_err(|error| format!("restat artifact {relative}: {error}"))?;
                 if after.dev() != metadata.dev()
                     || after.ino() != metadata.ino()
@@ -309,9 +319,16 @@ impl ArtifactPublication {
     }
 
     pub fn copy_from_reader<R: Read>(&mut self, index: usize, reader: &mut R) -> Result<(), String> {
+        self.copy_from_reader_with_control(index, reader, &RemoteExecutionControl::new())
+    }
+
+    pub fn copy_from_reader_with_control<R: Read>(&mut self, index: usize, reader: &mut R, control: &RemoteExecutionControl) -> Result<(), String> {
         let mut writer = self.begin(index)?;
         let mut buffer = [0u8; COPY_BUFFER_BYTES];
         loop {
+            if control.is_cancelled() {
+                return Err("artifact publication copy cancelled".to_string());
+            }
             let count = reader.read(&mut buffer).map_err(|error| format!("read artifact spool: {error}"))?;
             if count == 0 {
                 break;
@@ -631,13 +648,16 @@ fn create_relative_file(root: &File, relative: &str, mode: u32) -> Result<File, 
     Ok(file)
 }
 
-fn copy_and_hash(source: &File, destination: &File, expected_size: u64, path: &str) -> Result<[u8; 32], String> {
+fn copy_and_hash(source: &File, destination: &File, expected_size: u64, path: &str, control: &RemoteExecutionControl) -> Result<[u8; 32], String> {
     let mut source = source.try_clone().map_err(|error| format!("clone artifact source {path}: {error}"))?;
     let mut destination = destination.try_clone().map_err(|error| format!("clone artifact spool file {path}: {error}"))?;
     let mut hasher = Sha256::new();
     let mut copied = 0u64;
     let mut buffer = [0u8; COPY_BUFFER_BYTES];
     loop {
+        if control.is_cancelled() {
+            return Err(format!("artifact capture cancelled: {path}"));
+        }
         let count = source.read(&mut buffer).map_err(|error| format!("read artifact {path}: {error}"))?;
         if count == 0 {
             break;

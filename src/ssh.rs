@@ -1,8 +1,8 @@
 use crate::artifact::{ArtifactLimits, ArtifactManifest, ArtifactPolicy, ArtifactPublication};
 use crate::loopback::{RunRemoteSession, SnapshotExportClaim};
 use crate::remote::{
-    AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteFailureClass, RemoteFuture, RemoteOperation,
-    RemoteSnapshotId,
+    AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteExecutionControl, RemoteFailureClass, RemoteFuture,
+    RemoteOperation, RemoteSnapshotId,
 };
 use crate::remote_target::{ResourceLimits, SshTarget};
 use crate::snapshot::SnapshotEntryKind;
@@ -13,10 +13,11 @@ use crate::worker_protocol::{
 };
 use rand::RngCore;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -24,7 +25,6 @@ use tokio::time::timeout;
 
 const SSH_PROGRAM: &str = "/usr/bin/ssh";
 const MAX_SSH_DIAGNOSTIC_BYTES: usize = 16 * 1024;
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 type WorkerReader = Box<dyn AsyncRead + Send + Unpin>;
@@ -43,7 +43,21 @@ impl SshLaunchSpec {
             return Err("SSH target is not fully validated".to_string());
         }
 
-        let remote_command = format!("exec {} --stdio --workspace-root {}", shell_quote(target.worker_path()), shell_quote(target.workspace_root()));
+        let worker = target.resources().worker_state_limits();
+        let build_timeout_ms = target.resources().build_timeout().as_millis().max(1);
+        let remote_command = format!(
+            "exec {} --stdio --workspace-root {} --build-timeout-ms {} --max-worker-uploads {} --max-worker-upload-bytes {} --max-worker-jobs {} --max-worker-job-bytes {} --max-worker-artifact-spools {} --max-worker-artifact-spool-bytes {} --max-worker-state-entries {}",
+            shell_quote(target.worker_path()),
+            shell_quote(target.workspace_root()),
+            build_timeout_ms,
+            worker.max_uploads,
+            worker.max_upload_bytes,
+            worker.max_jobs,
+            worker.max_job_bytes,
+            worker.max_artifact_spools,
+            worker.max_artifact_spool_bytes,
+            worker.max_state_entries,
+        );
         let connect_timeout = target.resources().connect_timeout().as_secs().max(1).to_string();
         let args = vec![
             "-F".to_string(),
@@ -246,7 +260,7 @@ impl SshBackend {
 
 impl RemoteBackend for SshBackend {
     fn execute<'a>(
-        &'a self, request: AuthorizedRemoteRequest, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>,
+        &'a self, request: AuthorizedRemoteRequest, control: RemoteExecutionControl, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>,
     ) -> RemoteFuture<'a, Result<(), RemoteBackendError>> {
         let operation = request.request().operation().clone();
         let request_id = request.request_id();
@@ -257,12 +271,21 @@ impl RemoteBackend for SshBackend {
         let artifact_policy = self.artifact_policy.clone();
         let artifact_limits = self.artifact_limits;
         Box::pin(async move {
-            let backend = SshExecution { session, target, factory, uploads, artifact_policy, artifact_limits };
+            let backend = SshExecution { session, target, factory, uploads, artifact_policy, artifact_limits, control: control.clone() };
             match operation {
                 RemoteOperation::Sync(sync) => backend.execute_sync(request_id.0, sync.retain_capability(), events).await,
                 RemoteOperation::Build(build) => backend.execute_build(request_id.0, &build, events).await,
+                RemoteOperation::Cancel { .. } => Err(RemoteBackendError::Failed("cancel is handled by the remote broker".to_string())),
             }
         })
+    }
+}
+
+impl SshBackend {
+    pub async fn execute(
+        &self, request: AuthorizedRemoteRequest, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>,
+    ) -> Result<(), RemoteBackendError> {
+        <Self as RemoteBackend>::execute(self, request, RemoteExecutionControl::new(), events).await
     }
 }
 
@@ -273,14 +296,38 @@ struct SshExecution {
     uploads: Arc<Mutex<BTreeMap<RemoteSnapshotId, WorkerUploadId>>>,
     artifact_policy: ArtifactPolicy,
     artifact_limits: ArtifactLimits,
+    control: RemoteExecutionControl,
 }
 
 impl SshExecution {
     async fn execute_sync(
         &self, request_id: [u8; 16], retain_capability: bool, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>,
     ) -> Result<(), RemoteBackendError> {
+        self.control.set_phase(crate::remote::RemoteLifecyclePhase::Syncing);
         send_event(&events, RemoteBackendEvent::SyncProgress { completed_bytes: 0, total_bytes: None }).await?;
-        let snapshot_id = self.session.sync_snapshot().map_err(RemoteBackendError::Failed)?;
+        let sync_deadline = Instant::now() + self.target.resources().sync_timeout();
+        let session = self.session.clone();
+        let snapshot_control = self.control.clone();
+        let mut snapshot_task = tokio::task::spawn_blocking(move || session.sync_snapshot_for_request_with_control(true, snapshot_control));
+        let snapshot_id = tokio::select! {
+            result = tokio::time::timeout(remaining(sync_deadline), &mut snapshot_task) => {
+                match result {
+                    Ok(result) => result
+                        .map_err(|error| RemoteBackendError::Failed(format!("snapshot worker failed: {error}")))?
+                        .map_err(RemoteBackendError::Failed)?
+                        .ok_or_else(|| RemoteBackendError::Failed("remote snapshot capability was not retained".to_string()))?,
+                    Err(_) => {
+                        self.control.cancel();
+                        let _ = tokio::time::timeout(self.target.resources().cleanup_timeout(), &mut snapshot_task).await;
+                        return Err(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::Sync });
+                    }
+                }
+            }
+            _ = self.control.cancelled() => {
+                let _ = tokio::time::timeout(self.target.resources().cleanup_timeout(), &mut snapshot_task).await;
+                return Err(RemoteBackendError::Cancelled);
+            }
+        };
         let export = match self.session.claim_snapshot_for_export(snapshot_id) {
             Ok(export) => export,
             Err(error) => {
@@ -302,7 +349,19 @@ impl SshExecution {
             let _ = self.session.abort_snapshot_capability(snapshot_id);
             return Err(error);
         }
-        let mut connection = match WorkerConnection::spawn(&self.factory, &self.target) {
+        self.control.set_phase(crate::remote::RemoteLifecyclePhase::Connecting);
+        let mut connection = match phase(
+            async {
+                let mut connection = WorkerConnection::spawn(&self.factory, &self.target)?;
+                connection.handshake(WorkerRequestId(request_id), session_id_for(&self.session), WORKER_PROTOCOL_VERSION).await?;
+                Ok(connection)
+            },
+            remaining(sync_deadline).min(self.target.resources().connect_timeout()),
+            &self.control,
+            crate::remote::RemoteTimeoutCause::Connection,
+        )
+        .await
+        {
             Ok(connection) => connection,
             Err(error) => {
                 drop(export);
@@ -310,6 +369,7 @@ impl SshExecution {
                 return Err(error);
             }
         };
+        self.control.set_phase(crate::remote::RemoteLifecyclePhase::Transferring);
         let session_id = session_id_for(&self.session);
         let operation = upload_and_finish(
             &mut connection,
@@ -321,21 +381,25 @@ impl SshExecution {
                 export: &export,
                 events: &events,
                 cleanup: !retain_capability,
+                control: &self.control,
+                handshake: false,
             },
         );
-        let result = match timeout(self.target.resources().sync_timeout(), operation).await {
-            Ok(result) => result,
-            Err(_) => {
-                connection.kill_and_reap().await;
-                Err(RemoteBackendError::Timeout)
-            }
-        };
+        let result = phase(operation, remaining(sync_deadline), &self.control, crate::remote::RemoteTimeoutCause::Sync).await;
         drop(export);
 
         if let Err(error) = result {
-            connection.kill_and_reap().await;
+            connection.kill_and_reap(self.target.resources().cleanup_timeout()).await;
+            self.cleanup_upload(request_id, upload_id).await;
             let _ = self.session.abort_snapshot_capability(snapshot_id);
             return Err(error);
+        }
+
+        if self.control.is_cancelled() {
+            connection.kill_and_reap(self.target.resources().cleanup_timeout()).await;
+            self.cleanup_upload(request_id, upload_id).await;
+            let _ = self.session.abort_snapshot_capability(snapshot_id);
+            return Err(RemoteBackendError::Cancelled);
         }
 
         if retain_capability {
@@ -345,6 +409,7 @@ impl SshExecution {
                 .insert(snapshot_id, upload_id);
             if let Err(error) = send_event(&events, RemoteBackendEvent::SyncCompleted { snapshot_id }).await {
                 self.remove_upload(snapshot_id);
+                self.cleanup_upload(request_id, upload_id).await;
                 let _ = self.session.abort_snapshot_capability(snapshot_id);
                 return Err(error);
             }
@@ -358,6 +423,14 @@ impl SshExecution {
     async fn execute_build(
         &self, request_id: [u8; 16], build: &crate::remote::RemoteBuild, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>,
     ) -> Result<(), RemoteBackendError> {
+        if self.control.is_cancelled() {
+            let upload_id = self.uploads.lock().ok().and_then(|mut uploads| uploads.remove(&build.snapshot_id()));
+            if let Some(upload_id) = upload_id {
+                self.cleanup_upload(request_id, upload_id).await;
+            }
+            let _ = self.session.abort_snapshot_capability(build.snapshot_id());
+            return Err(RemoteBackendError::Cancelled);
+        }
         let snapshot_id = build.snapshot_id();
         let upload_id = self
             .uploads
@@ -368,11 +441,18 @@ impl SshExecution {
                 class: RemoteFailureClass::SnapshotTransfer,
                 message: "remote snapshot upload is unavailable".to_string(),
             })?;
-        let claim = self.session.claim_snapshot(snapshot_id).map_err(RemoteBackendError::Failed)?;
+        let claim = match self.session.claim_snapshot(snapshot_id) {
+            Ok(claim) => claim,
+            Err(error) => {
+                self.cleanup_upload(request_id, upload_id).await;
+                return Err(RemoteBackendError::Failed(error));
+            }
+        };
         let executable = match self.target.tools().get(build.tool().as_str()) {
             Some(executable) => executable.clone(),
             None => {
                 drop(claim);
+                self.cleanup_upload(request_id, upload_id).await;
                 return Err(RemoteBackendError::Transport {
                     class: RemoteFailureClass::WorkerUnavailable,
                     message: format!("remote tool is not configured: {}", build.tool().as_str()),
@@ -381,25 +461,69 @@ impl SshExecution {
         };
         let guest_env = build.env().to_vec();
         let target_env = self.target.environment().iter().map(|(key, value)| (key.clone(), value.clone())).collect::<Vec<_>>();
-        let worker_build =
-            WorkerBuild::new(build.tool().as_str(), executable, build.argv().to_vec(), build.cwd().as_str(), guest_env, target_env, upload_id)
-                .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::WorkerProtocol, message: error.to_string() })?;
+        let worker_build = match WorkerBuild::new(
+            build.tool().as_str(),
+            executable,
+            build.argv().to_vec(),
+            build.cwd().as_str(),
+            guest_env,
+            target_env,
+            upload_id,
+        ) {
+            Ok(worker_build) => worker_build,
+            Err(error) => {
+                drop(claim);
+                self.cleanup_upload(request_id, upload_id).await;
+                return Err(RemoteBackendError::Transport { class: RemoteFailureClass::WorkerProtocol, message: error.to_string() });
+            }
+        };
         let worker_build = if self.artifact_policy.is_enabled() {
-            let paths = self
-                .artifact_policy
-                .paths()
-                .iter()
-                .map(|path| WorkerArtifactPath::new(path.clone()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, message: error.to_string() })?;
-            worker_build
-                .with_artifacts(paths, self.artifact_limits.max_file_bytes, self.artifact_limits.max_total_bytes)
-                .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, message: error.to_string() })?
+            let paths = match self.artifact_policy.paths().iter().map(|path| WorkerArtifactPath::new(path.clone())).collect::<Result<Vec<_>, _>>() {
+                Ok(paths) => paths,
+                Err(error) => {
+                    drop(claim);
+                    self.cleanup_upload(request_id, upload_id).await;
+                    return Err(RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, message: error.to_string() });
+                }
+            };
+            match worker_build.with_artifacts(paths, self.artifact_limits.max_file_bytes, self.artifact_limits.max_total_bytes) {
+                Ok(worker_build) => worker_build,
+                Err(error) => {
+                    drop(claim);
+                    self.cleanup_upload(request_id, upload_id).await;
+                    return Err(RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, message: error.to_string() });
+                }
+            }
         } else {
             worker_build
         };
 
-        let mut connection = WorkerConnection::spawn(&self.factory, &self.target)?;
+        self.control.set_phase(crate::remote::RemoteLifecyclePhase::Connecting);
+        let mut connection = match phase(
+            async {
+                let mut connection = WorkerConnection::spawn(&self.factory, &self.target)?;
+                connection
+                    .handshake(
+                        WorkerRequestId(request_id),
+                        WorkerSessionId(self.session.session_id().0),
+                        if self.artifact_policy.is_enabled() { WORKER_ARTIFACT_PROTOCOL_VERSION } else { WORKER_PROTOCOL_VERSION },
+                    )
+                    .await?;
+                Ok(connection)
+            },
+            self.target.resources().connect_timeout(),
+            &self.control,
+            crate::remote::RemoteTimeoutCause::Connection,
+        )
+        .await
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.cleanup_upload(request_id, upload_id).await;
+                drop(claim);
+                return Err(error);
+            }
+        };
         let session_id = WorkerSessionId(self.session.session_id().0);
         let operation = build_and_finish(
             &mut connection,
@@ -414,18 +538,28 @@ impl SshExecution {
                 artifact_limits: self.artifact_limits,
                 workspace_root: self.session.workspace_root().to_path_buf(),
                 protocol_version: if self.artifact_policy.is_enabled() { WORKER_ARTIFACT_PROTOCOL_VERSION } else { WORKER_PROTOCOL_VERSION },
+                control: &self.control,
+                handshake: false,
             },
         );
-        let result = match timeout(self.target.resources().build_timeout(), operation).await {
-            Ok(result) => result,
-            Err(_) => {
-                connection.kill_and_reap().await;
-                Err(RemoteBackendError::Timeout)
-            }
-        };
+        let result = operation.await;
         if let Err(error) = result {
-            let _ = timeout(CLEANUP_TIMEOUT, connection.cleanup(WorkerRequestId(request_id), session_id, upload_id)).await;
-            connection.kill_and_reap().await;
+            let cleanup_succeeded = if !matches!(error, RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::Cleanup }) {
+                phase(
+                    connection.cleanup(WorkerRequestId(request_id), session_id, upload_id),
+                    self.target.resources().cleanup_timeout(),
+                    &self.control,
+                    crate::remote::RemoteTimeoutCause::Cleanup,
+                )
+                .await
+                .is_ok()
+            } else {
+                false
+            };
+            connection.kill_and_reap(self.target.resources().cleanup_timeout()).await;
+            if !cleanup_succeeded {
+                self.cleanup_upload(request_id, upload_id).await;
+            }
             return Err(error);
         }
         drop(claim);
@@ -435,6 +569,41 @@ impl SshExecution {
     fn remove_upload(&self, snapshot_id: RemoteSnapshotId) {
         if let Ok(mut uploads) = self.uploads.lock() {
             uploads.remove(&snapshot_id);
+        }
+    }
+
+    async fn cleanup_upload(&self, request_id: [u8; 16], upload_id: WorkerUploadId) {
+        let cleanup_control = RemoteExecutionControl::new();
+        let cleanup_timeout = self.target.resources().cleanup_timeout();
+        let session_id = session_id_for(&self.session);
+        let mut connection = match phase(
+            async {
+                let mut connection = WorkerConnection::spawn(&self.factory, &self.target)?;
+                connection.handshake(WorkerRequestId(request_id), session_id, WORKER_PROTOCOL_VERSION).await?;
+                Ok(connection)
+            },
+            cleanup_timeout,
+            &cleanup_control,
+            crate::remote::RemoteTimeoutCause::Cleanup,
+        )
+        .await
+        {
+            Ok(connection) => connection,
+            Err(_) => return,
+        };
+
+        let cleaned = phase(
+            connection.cleanup(WorkerRequestId(request_id), session_id, upload_id),
+            cleanup_timeout,
+            &cleanup_control,
+            crate::remote::RemoteTimeoutCause::Cleanup,
+        )
+        .await
+        .is_ok();
+        if cleaned {
+            let _ = phase(connection.finish(), cleanup_timeout, &cleanup_control, crate::remote::RemoteTimeoutCause::Cleanup).await;
+        } else {
+            connection.kill_and_reap(cleanup_timeout).await;
         }
     }
 }
@@ -551,9 +720,9 @@ impl WorkerConnection {
         Ok(())
     }
 
-    async fn kill_and_reap(&mut self) {
+    async fn kill_and_reap(&mut self, cleanup_timeout: Duration) {
         self.process.kill_group();
-        let _ = timeout(PROCESS_REAP_TIMEOUT, self.process.wait()).await;
+        let _ = timeout(cleanup_timeout.min(PROCESS_REAP_TIMEOUT), self.process.wait()).await;
         if let Some(task) = self.stderr_task.take() {
             task.abort();
         }
@@ -577,6 +746,8 @@ struct UploadPlan<'a> {
     export: &'a SnapshotExportClaim,
     events: &'a tokio::sync::mpsc::Sender<RemoteBackendEvent>,
     cleanup: bool,
+    control: &'a RemoteExecutionControl,
+    handshake: bool,
 }
 
 struct BuildPlan<'a> {
@@ -590,22 +761,33 @@ struct BuildPlan<'a> {
     artifact_limits: ArtifactLimits,
     workspace_root: PathBuf,
     protocol_version: u16,
+    control: &'a RemoteExecutionControl,
+    handshake: bool,
 }
 
 async fn upload_and_finish(connection: &mut WorkerConnection, plan: UploadPlan<'_>) -> Result<(), RemoteBackendError> {
-    let UploadPlan { request_id, session_id, upload_id, entries, export, events, cleanup } = plan;
-    connection.handshake(request_id, session_id, WORKER_PROTOCOL_VERSION).await?;
+    let UploadPlan { request_id, session_id, upload_id, entries, export, events, cleanup, control, handshake } = plan;
+    if handshake {
+        connection.handshake(request_id, session_id, WORKER_PROTOCOL_VERSION).await?;
+    }
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Transferring);
     let total_bytes = export.total_file_bytes();
     connection.write(&WorkerMessage::UploadBegin { request_id, session_id, upload_id, entries: entries.to_vec() }).await?;
     let mut completed_bytes = 0u64;
     for entry in export.entries() {
+        if control.is_cancelled() {
+            return Err(RemoteBackendError::Cancelled);
+        }
         if entry.kind() != SnapshotEntryKind::RegularFile {
             continue;
         }
         let contents = export
-            .read_file_bounded(entry, MAX_WORKER_FILE_BYTES)
+            .read_file_bounded_with_control(entry, MAX_WORKER_FILE_BYTES, control)
             .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::SnapshotTransfer, message: error })?;
         for (index, chunk) in contents.chunks(MAX_WORKER_CHUNK_BYTES).enumerate() {
+            if control.is_cancelled() {
+                return Err(RemoteBackendError::Cancelled);
+            }
             let offset = u64::try_from(index).unwrap_or(u64::MAX).saturating_mul(MAX_WORKER_CHUNK_BYTES as u64);
             connection
                 .write(&WorkerMessage::UploadFileChunk {
@@ -653,73 +835,130 @@ async fn upload_and_finish(connection: &mut WorkerConnection, plan: UploadPlan<'
 }
 
 async fn build_and_finish(connection: &mut WorkerConnection, plan: BuildPlan<'_>) -> Result<(), RemoteBackendError> {
-    let BuildPlan { request_id, session_id, build, events, upload_id, resources, artifact_policy, artifact_limits, workspace_root, protocol_version } =
-        plan;
-    connection.handshake(request_id, session_id, protocol_version).await?;
+    let BuildPlan {
+        request_id,
+        session_id,
+        build,
+        events,
+        upload_id,
+        resources,
+        artifact_policy,
+        artifact_limits,
+        workspace_root,
+        protocol_version,
+        control,
+        handshake,
+    } = plan;
+    if handshake {
+        connection.handshake(request_id, session_id, protocol_version).await?;
+    }
+    if control.is_cancelled() {
+        return Err(RemoteBackendError::Cancelled);
+    }
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Building);
+    let exit_code = phase(
+        execute_native_build(connection, request_id, session_id, build, events, resources, control),
+        resources.build_timeout(),
+        control,
+        crate::remote::RemoteTimeoutCause::Build,
+    )
+    .await?;
+    if exit_code == 0 && artifact_policy.is_enabled() {
+        control.set_phase(crate::remote::RemoteLifecyclePhase::ArtifactHandling);
+        let artifact_deadline = Instant::now() + artifact_limits.timeout;
+        let (artifact_set_id, manifest) = phase(
+            async {
+                match connection.read().await? {
+                    WorkerMessage::ArtifactManifest {
+                        request_id: received_request,
+                        session_id: received_session,
+                        artifact_set_id,
+                        entries,
+                        total_bytes,
+                    } => {
+                        check_correlation(received_request, received_session, request_id, session_id, "worker artifact manifest")?;
+                        Ok((artifact_set_id, artifact_manifest_from_worker(entries, total_bytes, &artifact_policy, artifact_limits)?))
+                    }
+                    WorkerMessage::Error { kind, message, .. } => Err(worker_artifact_manifest_error(kind, message)),
+                    _ => Err(worker_protocol("unexpected worker artifact manifest response")),
+                }
+            },
+            remaining(artifact_deadline),
+            control,
+            crate::remote::RemoteTimeoutCause::Artifact,
+        )
+        .await?;
+        phase(
+            fetch_and_publish_artifacts(connection, request_id, session_id, artifact_set_id, &manifest, workspace_root, control),
+            remaining(artifact_deadline),
+            control,
+            crate::remote::RemoteTimeoutCause::Artifact,
+        )
+        .await?;
+    }
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Cleanup);
+    phase(connection.cleanup(request_id, session_id, upload_id), resources.cleanup_timeout(), control, crate::remote::RemoteTimeoutCause::Cleanup)
+        .await?;
+    phase(connection.finish(), resources.cleanup_timeout(), control, crate::remote::RemoteTimeoutCause::Cleanup).await?;
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Finalizing);
+    send_event(events, RemoteBackendEvent::Completed { exit_code }).await
+}
+
+async fn execute_native_build(
+    connection: &mut WorkerConnection, request_id: WorkerRequestId, session_id: WorkerSessionId, build: WorkerBuild,
+    events: &tokio::sync::mpsc::Sender<RemoteBackendEvent>, resources: ResourceLimits, control: &RemoteExecutionControl,
+) -> Result<i32, RemoteBackendError> {
     connection.write(&WorkerMessage::build(request_id, session_id, build)).await?;
     let mut output_bytes = 0u64;
-    let exit_code = loop {
-        match connection.read().await? {
-            WorkerMessage::Stdout { request_id: received_request, session_id: received_session, data } => {
-                check_correlation(received_request, received_session, request_id, session_id, "worker stdout")?;
-                output_bytes = output_bytes.saturating_add(data.len() as u64);
-                if output_bytes > resources.max_output_bytes() {
-                    return Err(RemoteBackendError::OutputLimit { limit: resources.max_output_bytes() });
+    let mut idle = Box::pin(tokio::time::sleep(resources.idle_output_timeout()));
+    loop {
+        tokio::select! {
+            result = connection.read() => match result? {
+                WorkerMessage::Stdout { request_id: received_request, session_id: received_session, data } => {
+                    check_correlation(received_request, received_session, request_id, session_id, "worker stdout")?;
+                    if !data.is_empty() {
+                        idle.as_mut().reset(tokio::time::Instant::now() + resources.idle_output_timeout());
+                    }
+                    output_bytes = output_bytes.saturating_add(data.len() as u64);
+                    if output_bytes > resources.max_output_bytes() {
+                        return Err(RemoteBackendError::OutputLimit { limit: resources.max_output_bytes() });
+                    }
+                    send_event_control(events, RemoteBackendEvent::Stdout(data), control).await?;
                 }
-                send_event(events, RemoteBackendEvent::Stdout(data)).await?;
-            }
-            WorkerMessage::Stderr { request_id: received_request, session_id: received_session, data } => {
-                check_correlation(received_request, received_session, request_id, session_id, "worker stderr")?;
-                output_bytes = output_bytes.saturating_add(data.len() as u64);
-                if output_bytes > resources.max_output_bytes() {
-                    return Err(RemoteBackendError::OutputLimit { limit: resources.max_output_bytes() });
+                WorkerMessage::Stderr { request_id: received_request, session_id: received_session, data } => {
+                    check_correlation(received_request, received_session, request_id, session_id, "worker stderr")?;
+                    if !data.is_empty() {
+                        idle.as_mut().reset(tokio::time::Instant::now() + resources.idle_output_timeout());
+                    }
+                    output_bytes = output_bytes.saturating_add(data.len() as u64);
+                    if output_bytes > resources.max_output_bytes() {
+                        return Err(RemoteBackendError::OutputLimit { limit: resources.max_output_bytes() });
+                    }
+                    send_event_control(events, RemoteBackendEvent::Stderr(data), control).await?;
                 }
-                send_event(events, RemoteBackendEvent::Stderr(data)).await?;
-            }
-            WorkerMessage::Completed { request_id: received_request, session_id: received_session, operation: WorkerOperation::Build, exit_code } => {
-                check_correlation(received_request, received_session, request_id, session_id, "worker completion")?;
-                break exit_code;
-            }
-            WorkerMessage::Error { kind, message, .. } => return Err(worker_error(WorkerOperation::Build, kind, message)),
-            _ => return Err(worker_protocol("unexpected worker build response")),
-        }
-    };
-    if exit_code == 0 && artifact_policy.is_enabled() {
-        let (artifact_set_id, manifest) = match connection.read().await? {
-            WorkerMessage::ArtifactManifest { request_id: received_request, session_id: received_session, artifact_set_id, entries, total_bytes } => {
-                check_correlation(received_request, received_session, request_id, session_id, "worker artifact manifest")?;
-                (artifact_set_id, artifact_manifest_from_worker(entries, total_bytes, &artifact_policy, artifact_limits)?)
-            }
-            WorkerMessage::Error { kind, message, .. } => return Err(worker_artifact_manifest_error(kind, message)),
-            _ => return Err(worker_protocol("unexpected worker artifact manifest response")),
-        };
-        let retrieval = timeout(
-            artifact_limits.timeout,
-            fetch_and_publish_artifacts(connection, request_id, session_id, artifact_set_id, &manifest, workspace_root),
-        )
-        .await;
-        match retrieval {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(RemoteBackendError::Transport {
-                    class: RemoteFailureClass::ArtifactTransfer,
-                    message: "artifact retrieval timed out".to_string(),
-                })
-            }
+                WorkerMessage::Completed { request_id: received_request, session_id: received_session, operation: WorkerOperation::Build, exit_code } => {
+                    check_correlation(received_request, received_session, request_id, session_id, "worker completion")?;
+                    return Ok(exit_code);
+                }
+                WorkerMessage::Error { kind, message, .. } => return Err(worker_error(WorkerOperation::Build, kind, message)),
+                _ => return Err(worker_protocol("unexpected worker build response")),
+            },
+            _ = &mut idle => return Err(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::IdleOutput }),
+            _ = control.cancelled() => return Err(RemoteBackendError::Cancelled),
         }
     }
-    connection.cleanup(request_id, session_id, upload_id).await?;
-    connection.finish().await?;
-    send_event(events, RemoteBackendEvent::Completed { exit_code }).await
 }
 
 async fn fetch_and_publish_artifacts(
     connection: &mut WorkerConnection, request_id: WorkerRequestId, session_id: WorkerSessionId, artifact_set_id: WorkerArtifactSetId,
-    manifest: &ArtifactManifest, workspace_root: PathBuf,
+    manifest: &ArtifactManifest, workspace_root: PathBuf, control: &RemoteExecutionControl,
 ) -> Result<(), RemoteBackendError> {
     let mut publication = ArtifactPublication::new(&workspace_root, request_id.0, manifest.clone())
         .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })?;
     for index in 0..manifest.entries().len() {
+        if control.is_cancelled() {
+            return Err(RemoteBackendError::Cancelled);
+        }
         connection
             .write(&WorkerMessage::FetchArtifact {
                 request_id,
@@ -745,6 +984,9 @@ async fn fetch_and_publish_artifacts(
                     offset,
                     data,
                 } => {
+                    if control.is_cancelled() {
+                        return Err(RemoteBackendError::Cancelled);
+                    }
                     check_correlation(received_request, received_session, request_id, session_id, "worker artifact chunk")
                         .map_err(artifact_transfer_error)?;
                     if received_set != artifact_set_id || entry_index != index as u32 {
@@ -792,6 +1034,10 @@ async fn fetch_and_publish_artifacts(
             }
         }
     }
+    if control.is_cancelled() {
+        return Err(RemoteBackendError::Cancelled);
+    }
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Finalizing);
     publication.publish().map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })
 }
 
@@ -856,6 +1102,15 @@ fn send_event<'a>(
     Box::pin(async move { events.send(event).await.map_err(|_| RemoteBackendError::Cancelled) })
 }
 
+async fn send_event_control(
+    events: &tokio::sync::mpsc::Sender<RemoteBackendEvent>, event: RemoteBackendEvent, control: &RemoteExecutionControl,
+) -> Result<(), RemoteBackendError> {
+    tokio::select! {
+        result = events.send(event) => result.map_err(|_| RemoteBackendError::Cancelled),
+        _ = control.cancelled() => Err(RemoteBackendError::Cancelled),
+    }
+}
+
 fn classify_spawn_error(message: String) -> RemoteBackendError {
     RemoteBackendError::Transport { class: RemoteFailureClass::Connect, message }
 }
@@ -885,6 +1140,25 @@ fn worker_io_error(error: worker_protocol::WorkerProtocolError) -> RemoteBackend
     } else {
         disconnected(error.to_string())
     }
+}
+
+async fn phase<T, F>(
+    future: F, duration: Duration, control: &RemoteExecutionControl, cause: crate::remote::RemoteTimeoutCause,
+) -> Result<T, RemoteBackendError>
+where
+    F: Future<Output = Result<T, RemoteBackendError>>,
+{
+    if duration.is_zero() {
+        return Err(RemoteBackendError::Deadline { cause });
+    }
+    tokio::select! {
+        result = timeout(duration, future) => result.unwrap_or_else(|_| Err(RemoteBackendError::Deadline { cause })),
+        _ = control.cancelled() => Err(RemoteBackendError::Cancelled),
+    }
+}
+
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 fn worker_error(operation: WorkerOperation, kind: WorkerErrorKind, message: String) -> RemoteBackendError {

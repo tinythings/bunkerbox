@@ -1,5 +1,5 @@
 use bunkerbox::cfg::{ProjectConfig, RemoteToolSpec, WorkspaceMode};
-use bunkerbox::remote::{RemoteEnvironmentPolicy, RemoteToolPolicy};
+use bunkerbox::remote::{RemoteAdmissionLimits, RemoteEnvironmentPolicy, RemoteToolPolicy};
 use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, logging, loopback, overlay, remote_target, snapshot, tui, vscomm, workspace};
 use rand::RngCore;
 use std::ffi::OsString;
@@ -354,6 +354,8 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
                 )?);
                 let tools = loopback::resolve_fixed_tools(configured_remote_tool_names.clone());
                 logging::log("Starting remote daemon...");
+                let global_active = config.remote_max_active_builds()?;
+                let target_active = remote_backend.target().map(|target| target.resources().max_active_builds()).unwrap_or(1);
                 let remote_config = match remote_backend.backend() {
                     remote_target::BackendMode::Loopback => daemon::RemoteDaemonConfig::loopback(session.clone(), Vec::new(), tools),
                     remote_target::BackendMode::Ssh => {
@@ -368,7 +370,10 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
                     profiles,
                     share_dir_owned,
                     merged_allow,
-                    remote_config.with_artifacts(artifact_policy, artifact_limits).with_policy(remote_tool_policies, remote_environment),
+                    remote_config
+                        .with_artifacts(artifact_policy, artifact_limits)
+                        .with_policy(remote_tool_policies, remote_environment)
+                        .with_admission_limits(RemoteAdmissionLimits::new(global_active, target_active)?),
                 )?;
                 if let Err(error) = write_run_handoff(&mut setup_parent, workspace.path(), remote_session) {
                     tokio::runtime::Handle::current().block_on(daemon.shutdown());
@@ -446,7 +451,7 @@ fn new_target_id() -> bunkerbox::remote::RemoteTargetId {
 }
 
 fn remote_tool_names(entries: &[RemoteToolSpec]) -> Vec<String> {
-    entries.iter().filter(|tool| tool.name == "make").map(|tool| tool.name.clone()).collect()
+    entries.iter().filter(|tool| matches!(tool.name.as_str(), "make" | "cargo")).map(|tool| tool.name.clone()).collect()
 }
 
 fn write_run_handoff(file: &mut File, path: &Path, session_id: vscomm::WorkspaceSessionId) -> Result<(), String> {

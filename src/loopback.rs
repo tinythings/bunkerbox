@@ -1,7 +1,7 @@
 use crate::artifact::{ArtifactLimits, ArtifactPolicy, ArtifactPublication, LocalArtifactSpool};
 use crate::remote::{
-    AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteFuture, RemoteOperation, RemoteResourcePolicy,
-    RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTargetId, WorkspaceSessionId,
+    AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteExecutionControl, RemoteFuture, RemoteOperation,
+    RemoteResourcePolicy, RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTargetId, WorkspaceSessionId,
 };
 use crate::snapshot::{SnapshotBuilder, SnapshotEntry, SnapshotExport, SnapshotHandle, SnapshotStore};
 use rand::RngCore;
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::sleep;
 
 pub const LOOPBACK_BUILD_TIMEOUT: Duration = crate::remote::DEFAULT_REMOTE_BUILD_TIMEOUT;
@@ -95,16 +95,32 @@ impl RunRemoteSession {
     }
 
     fn sync_snapshot_for_request(&self, retain_capability: bool) -> Result<Option<RemoteSnapshotId>, String> {
+        self.sync_snapshot_for_request_with_control(retain_capability, RemoteExecutionControl::new())
+    }
+
+    pub(crate) fn sync_snapshot_for_request_with_control(
+        &self, retain_capability: bool, control: RemoteExecutionControl,
+    ) -> Result<Option<RemoteSnapshotId>, String> {
         let _operation = self.snapshot_operation.lock().map_err(|_| "remote session operation lock poisoned".to_string())?;
-        let snapshot = self.snapshot_builder.build_root(&self.workspace_root, self.session_id)?;
+        let snapshot = self.snapshot_builder.build_root_with_control(&self.workspace_root, self.session_id, control.clone())?;
         let handle = snapshot.handle().clone();
         if !retain_capability {
             self.discard_unclaimed_snapshot(&handle)?;
             return Ok(None);
         }
 
+        if control.is_cancelled() {
+            self.discard_unclaimed_snapshot(&handle)?;
+            return Err("snapshot synchronization cancelled".to_string());
+        }
         match self.register_snapshot(handle.clone()) {
-            Ok(snapshot_id) => Ok(Some(snapshot_id)),
+            Ok(snapshot_id) => {
+                if control.is_cancelled() {
+                    self.abort_snapshot_capability(snapshot_id)?;
+                    return Err("snapshot synchronization cancelled".to_string());
+                }
+                Ok(Some(snapshot_id))
+            }
             Err(error) => {
                 let cleanup = self.discard_unclaimed_snapshot(&handle);
                 if let Err(cleanup_error) = cleanup {
@@ -204,9 +220,9 @@ impl RunRemoteSession {
         }
     }
 
-    fn materialize_snapshot(&self, handle: &SnapshotHandle, destination: &Path) -> Result<(), String> {
+    fn materialize_snapshot_with_control(&self, handle: &SnapshotHandle, destination: &Path, control: RemoteExecutionControl) -> Result<(), String> {
         let _operation = self.snapshot_operation.lock().map_err(|_| "remote session operation lock poisoned".to_string())?;
-        self.snapshot_store.materialize(handle, destination).map(|_| ())
+        self.snapshot_store.materialize_with_control(handle, destination, control).map(|_| ())
     }
 
     fn new_job_path(&self) -> Result<PathBuf, String> {
@@ -277,6 +293,12 @@ impl SnapshotExportClaim {
     pub(crate) fn read_file_bounded(&self, entry: &SnapshotEntry, max_bytes: u64) -> Result<Vec<u8>, String> {
         self.snapshot.read_file_bounded(entry, max_bytes)
     }
+
+    pub(crate) fn read_file_bounded_with_control(
+        &self, entry: &SnapshotEntry, max_bytes: u64, control: &RemoteExecutionControl,
+    ) -> Result<Vec<u8>, String> {
+        self.snapshot.read_file_bounded_with_control(entry, max_bytes, control)
+    }
 }
 
 impl Drop for SnapshotExportClaim {
@@ -340,6 +362,11 @@ impl LoopbackBackend {
         self
     }
 
+    pub fn with_resources(mut self, resources: RemoteResourcePolicy) -> Self {
+        self.resources = resources;
+        self
+    }
+
     pub fn with_target_environment(mut self, environment: BTreeMap<String, String>) -> Self {
         let mut trusted = trusted_target_environment();
         trusted.extend(environment);
@@ -356,7 +383,7 @@ impl LoopbackBackend {
 
 impl RemoteBackend for LoopbackBackend {
     fn execute<'a>(
-        &'a self, request: AuthorizedRemoteRequest, events: mpsc::Sender<RemoteBackendEvent>,
+        &'a self, request: AuthorizedRemoteRequest, control: RemoteExecutionControl, events: mpsc::Sender<RemoteBackendEvent>,
     ) -> RemoteFuture<'a, Result<(), RemoteBackendError>> {
         let session = self.session.clone();
         let tools = self.tools.clone();
@@ -368,10 +395,17 @@ impl RemoteBackend for LoopbackBackend {
         let options = LoopbackBuildOptions { resources, artifact_policy, artifact_limits, request_id };
         Box::pin(async move {
             match request.request().operation() {
-                RemoteOperation::Sync(sync) => execute_sync(session, sync.retain_capability(), events).await,
-                RemoteOperation::Build(build) => execute_build(session, tools, target_environment, options, build, events).await,
+                RemoteOperation::Sync(sync) => execute_sync(session, sync.retain_capability(), resources, control, events).await,
+                RemoteOperation::Build(build) => execute_build(session, tools, target_environment, options, build, control, events).await,
+                RemoteOperation::Cancel { .. } => Err(RemoteBackendError::Failed("cancel is handled by the remote broker".to_string())),
             }
         })
+    }
+}
+
+impl LoopbackBackend {
+    pub async fn execute(&self, request: AuthorizedRemoteRequest, events: mpsc::Sender<RemoteBackendEvent>) -> Result<(), RemoteBackendError> {
+        <Self as RemoteBackend>::execute(self, request, RemoteExecutionControl::new(), events).await
     }
 }
 
@@ -384,12 +418,27 @@ struct LoopbackBuildOptions {
 }
 
 async fn execute_sync(
-    session: Arc<RunRemoteSession>, retain_capability: bool, events: mpsc::Sender<RemoteBackendEvent>,
+    session: Arc<RunRemoteSession>, retain_capability: bool, resources: RemoteResourcePolicy, control: RemoteExecutionControl,
+    events: mpsc::Sender<RemoteBackendEvent>,
 ) -> Result<(), RemoteBackendError> {
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Syncing);
     send_event(&events, RemoteBackendEvent::SyncProgress { completed_bytes: 0, total_bytes: None }).await?;
-    let sync = tokio::task::spawn_blocking(move || session.sync_snapshot_for_request(retain_capability))
-        .await
-        .map_err(|error| RemoteBackendError::Failed(format!("snapshot worker failed: {error}")))?;
+    let snapshot_control = control.clone();
+    let mut sync_task = tokio::task::spawn_blocking(move || session.sync_snapshot_for_request_with_control(retain_capability, snapshot_control));
+    let sync = tokio::select! {
+        result = tokio::time::timeout(resources.sync_timeout, &mut sync_task) => match result {
+            Ok(result) => result.map_err(|error| RemoteBackendError::Failed(format!("snapshot worker failed: {error}")))?,
+            Err(_) => {
+                control.cancel();
+                let _ = tokio::time::timeout(resources.cleanup_timeout, &mut sync_task).await;
+                return Err(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::Sync });
+            }
+        },
+        _ = control.cancelled() => {
+            let _ = tokio::time::timeout(resources.cleanup_timeout, &mut sync_task).await;
+            return Err(RemoteBackendError::Cancelled);
+        },
+    };
     match sync.map_err(RemoteBackendError::Failed)? {
         Some(snapshot_id) => send_event(&events, RemoteBackendEvent::SyncCompleted { snapshot_id }).await,
         None => send_event(&events, RemoteBackendEvent::Completed { exit_code: 0 }).await,
@@ -398,29 +447,47 @@ async fn execute_sync(
 
 async fn execute_build(
     session: Arc<RunRemoteSession>, tools: Arc<BTreeMap<String, PathBuf>>, target_environment: Arc<BTreeMap<String, String>>,
-    options: LoopbackBuildOptions, build: &crate::remote::RemoteBuild, events: mpsc::Sender<RemoteBackendEvent>,
+    options: LoopbackBuildOptions, build: &crate::remote::RemoteBuild, control: RemoteExecutionControl, events: mpsc::Sender<RemoteBackendEvent>,
 ) -> Result<(), RemoteBackendError> {
     let LoopbackBuildOptions { resources, artifact_policy, artifact_limits, request_id } = options;
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Transferring);
+    if control.is_cancelled() {
+        return Err(RemoteBackendError::Cancelled);
+    }
     let snapshot = session.claim_snapshot(build.snapshot_id()).map_err(RemoteBackendError::Failed)?;
     let executable = tools
         .get(build.tool().as_str())
         .ok_or_else(|| RemoteBackendError::Spawn(format!("loopback tool is not configured: {}", build.tool().as_str())))?;
     let job_path = session.new_job_path().map_err(RemoteBackendError::Failed)?;
-    let _job = JobGuard { path: job_path.clone() };
+    let mut job = JobGuard { path: Some(job_path.clone()) };
     let materialization_claim = snapshot.clone_for_worker().map_err(RemoteBackendError::Failed)?;
     let destination = job_path.clone();
     let snapshot_handle = snapshot.handle().clone();
-    tokio::task::spawn_blocking({
+    let materialize_control = control.clone();
+    let mut materialize = tokio::task::spawn_blocking({
         let session = session.clone();
         move || {
-            let result = session.materialize_snapshot(&snapshot_handle, &destination);
+            let result = session.materialize_snapshot_with_control(&snapshot_handle, &destination, materialize_control);
             drop(materialization_claim);
             result
         }
-    })
-    .await
-    .map_err(|error| RemoteBackendError::Failed(format!("materialization worker failed: {error}")))?
-    .map_err(RemoteBackendError::Failed)?;
+    });
+    tokio::select! {
+        result = tokio::time::timeout(resources.sync_timeout, &mut materialize) => match result {
+            Ok(result) => result
+                .map_err(|error| RemoteBackendError::Failed(format!("materialization worker failed: {error}")))?
+                .map_err(RemoteBackendError::Failed)?,
+            Err(_) => {
+                control.cancel();
+                let _ = tokio::time::timeout(resources.cleanup_timeout, &mut materialize).await;
+                return Err(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::Sync });
+            }
+        },
+        _ = control.cancelled() => {
+            let _ = tokio::time::timeout(resources.cleanup_timeout, &mut materialize).await;
+            return Err(RemoteBackendError::Cancelled);
+        },
+    }
 
     let cwd = job_path.join(build.cwd().as_str());
     let cwd_metadata = fs::symlink_metadata(&cwd).map_err(|error| RemoteBackendError::Failed(format!("remote cwd is unavailable: {error}")))?;
@@ -452,14 +519,33 @@ async fn execute_build(
     }
     command.kill_on_drop(true);
     let mut child = command.spawn().map_err(|error| RemoteBackendError::Spawn(format!("spawn loopback tool: {error}")))?;
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Building);
     let process_group = child.id().map(|pid| ProcessGroupGuard { pgid: pid as i32, active: true });
     let stdout = child.stdout.take().ok_or_else(|| RemoteBackendError::Failed("loopback child has no stdout".to_string()))?;
     let stderr = child.stderr.take().ok_or_else(|| RemoteBackendError::Failed("loopback child has no stderr".to_string()))?;
     let output_bytes = Arc::new(AtomicU64::new(0));
-    let mut stdout_task = tokio::spawn(pump(stdout, RemoteStream::Stdout, events.clone(), output_bytes.clone(), resources.max_output_bytes));
-    let mut stderr_task = tokio::spawn(pump(stderr, RemoteStream::Stderr, events.clone(), output_bytes, resources.max_output_bytes));
+    let output_activity = Arc::new(Notify::new());
+    let mut stdout_task = tokio::spawn(pump(
+        stdout,
+        RemoteStream::Stdout,
+        events.clone(),
+        output_bytes.clone(),
+        output_activity.clone(),
+        control.clone(),
+        resources.max_output_bytes,
+    ));
+    let mut stderr_task = tokio::spawn(pump(
+        stderr,
+        RemoteStream::Stderr,
+        events.clone(),
+        output_bytes,
+        output_activity.clone(),
+        control.clone(),
+        resources.max_output_bytes,
+    ));
     let mut child_wait = Box::pin(child.wait());
     let mut timeout_sleep = Box::pin(sleep(resources.build_timeout));
+    let mut idle_output_sleep = Box::pin(sleep(resources.idle_output_timeout));
     let mut post_exit_drain_sleep = Box::pin(sleep(POST_CHILD_EXIT_DRAIN_TIMEOUT));
     let mut final_drain_sleep = Box::pin(sleep(POST_CHILD_EXIT_FINAL_DRAIN_TIMEOUT));
     let mut child_status = None;
@@ -516,7 +602,20 @@ async fn execute_build(
                 }
             }
             _ = &mut timeout_sleep, if child_status.is_none() => {
-                failure.get_or_insert(RemoteBackendError::Timeout);
+                failure.get_or_insert(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::Build });
+                kill_process_group(process_group.as_ref());
+                group_killed = true;
+            }
+            _ = &mut idle_output_sleep, if child_status.is_none() => {
+                failure.get_or_insert(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::IdleOutput });
+                kill_process_group(process_group.as_ref());
+                group_killed = true;
+            }
+            _ = output_activity.notified(), if child_status.is_none() => {
+                idle_output_sleep.as_mut().reset(tokio::time::Instant::now() + resources.idle_output_timeout);
+            }
+            _ = control.cancelled(), if child_status.is_none() || !stdout_done || !stderr_done => {
+                failure.get_or_insert(RemoteBackendError::Cancelled);
                 kill_process_group(process_group.as_ref());
                 group_killed = true;
             }
@@ -548,51 +647,79 @@ async fn execute_build(
         process_group.active = false;
     }
     if let Some(error) = failure {
-        return Err(error);
+        control.set_phase(crate::remote::RemoteLifecyclePhase::Cleanup);
+        let cleanup_error = job.cleanup(resources.cleanup_timeout).await.err();
+        return Err(cleanup_error.unwrap_or(error));
     }
-    let status = child_status.unwrap()?;
+    let status = match child_status.unwrap() {
+        Ok(status) => status,
+        Err(error) => {
+            control.set_phase(crate::remote::RemoteLifecyclePhase::Cleanup);
+            let cleanup_error = job.cleanup(resources.cleanup_timeout).await.err();
+            return Err(cleanup_error.unwrap_or(error));
+        }
+    };
     let exit_code = status.code().unwrap_or(-1);
     if exit_code == 0 && artifact_policy.is_enabled() {
+        control.set_phase(crate::remote::RemoteLifecyclePhase::ArtifactHandling);
         let job_root = job_path.clone();
         let workspace_root = session.workspace_root().to_path_buf();
         let spool_parent = session.jobs_root().to_path_buf();
-        let policy = artifact_policy;
+        let policy = artifact_policy.clone();
         let limits = artifact_limits;
-        let retrieval = tokio::time::timeout(
-            limits.timeout,
-            tokio::task::spawn_blocking(move || {
-                let spool = LocalArtifactSpool::capture(&job_root, &spool_parent, &policy, limits)
+        let artifact_control = control.clone();
+        let artifact_result = tokio::select! {
+            result = tokio::time::timeout(
+                limits.timeout,
+                tokio::task::spawn_blocking(move || {
+                    let control = artifact_control;
+                    if control.is_cancelled() {
+                        return Err(RemoteBackendError::Cancelled);
+                    }
+                let spool = LocalArtifactSpool::capture_with_control(&job_root, &spool_parent, &policy, limits, &control)
                     .map_err(|error| RemoteBackendError::Transport { class: crate::remote::RemoteFailureClass::ArtifactManifest, message: error })?;
                 let manifest = spool.manifest().clone();
                 let mut publication = ArtifactPublication::new(&workspace_root, request_id, manifest)
                     .map_err(|error| RemoteBackendError::Transport { class: crate::remote::RemoteFailureClass::ArtifactTransfer, message: error })?;
                 for index in 0..spool.manifest().entries().len() {
+                    if control.is_cancelled() {
+                        return Err(RemoteBackendError::Cancelled);
+                    }
                     let mut source = spool.open_entry(index).map_err(|error| RemoteBackendError::Transport {
                         class: crate::remote::RemoteFailureClass::ArtifactTransfer,
                         message: error,
                     })?;
-                    publication.copy_from_reader(index, &mut source).map_err(|error| RemoteBackendError::Transport {
+                    publication.copy_from_reader_with_control(index, &mut source, &control).map_err(|error| RemoteBackendError::Transport {
                         class: crate::remote::RemoteFailureClass::ArtifactTransfer,
                         message: error,
                     })?;
                 }
+                if control.is_cancelled() {
+                    return Err(RemoteBackendError::Cancelled);
+                }
                 publication
                     .publish()
                     .map_err(|error| RemoteBackendError::Transport { class: crate::remote::RemoteFailureClass::ArtifactTransfer, message: error })
-            }),
-        )
-        .await;
-        match retrieval {
-            Ok(Ok(result)) => result?,
-            Ok(Err(error)) => return Err(RemoteBackendError::Failed(format!("artifact worker failed: {error}"))),
-            Err(_) => {
-                return Err(RemoteBackendError::Transport {
-                    class: crate::remote::RemoteFailureClass::ArtifactTransfer,
-                    message: "artifact retrieval timed out".to_string(),
-                })
-            }
+                }),
+            ) => match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(RemoteBackendError::Failed(format!("artifact worker failed: {error}"))),
+                Err(_) => {
+                    control.cancel();
+                    Err(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::Artifact })
+                }
+            },
+            _ = control.cancelled() => Err(RemoteBackendError::Cancelled),
+        };
+        if let Err(error) = artifact_result {
+            control.set_phase(crate::remote::RemoteLifecyclePhase::Cleanup);
+            let cleanup_error = job.cleanup(resources.cleanup_timeout).await.err();
+            return Err(if matches!(error, RemoteBackendError::Cancelled) { error } else { cleanup_error.unwrap_or(error) });
         }
     }
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Cleanup);
+    job.cleanup(resources.cleanup_timeout).await?;
+    control.set_phase(crate::remote::RemoteLifecyclePhase::Finalizing);
     send_event(&events, RemoteBackendEvent::Completed { exit_code }).await
 }
 
@@ -603,11 +730,15 @@ enum RemoteStream {
 }
 
 async fn pump<R: tokio::io::AsyncRead + Unpin>(
-    mut reader: R, stream: RemoteStream, events: mpsc::Sender<RemoteBackendEvent>, output_bytes: Arc<AtomicU64>, max_output_bytes: u64,
+    mut reader: R, stream: RemoteStream, events: mpsc::Sender<RemoteBackendEvent>, output_bytes: Arc<AtomicU64>, output_activity: Arc<Notify>,
+    control: RemoteExecutionControl, max_output_bytes: u64,
 ) -> Result<(), RemoteBackendError> {
     let mut buffer = [0u8; 8192];
     loop {
-        let count = reader.read(&mut buffer).await.map_err(|error| RemoteBackendError::Failed(format!("read loopback output: {error}")))?;
+        let count = tokio::select! {
+            result = reader.read(&mut buffer) => result.map_err(|error| RemoteBackendError::Failed(format!("read loopback output: {error}")))?,
+            _ = control.cancelled() => return Err(RemoteBackendError::Cancelled),
+        };
         if count == 0 {
             return Ok(());
         }
@@ -615,6 +746,7 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
         if total > max_output_bytes {
             return Err(RemoteBackendError::OutputLimit { limit: max_output_bytes });
         }
+        output_activity.notify_waiters();
         let event = match stream {
             RemoteStream::Stdout => RemoteBackendEvent::Stdout(buffer[..count].to_vec()),
             RemoteStream::Stderr => RemoteBackendEvent::Stderr(buffer[..count].to_vec()),
@@ -648,12 +780,31 @@ async fn send_event(events: &mpsc::Sender<RemoteBackendEvent>, event: RemoteBack
 }
 
 struct JobGuard {
-    path: PathBuf,
+    path: Option<PathBuf>,
+}
+
+impl JobGuard {
+    async fn cleanup(&mut self, cleanup_timeout: Duration) -> Result<(), RemoteBackendError> {
+        let Some(path) = self.path.take() else { return Ok(()) };
+        let result = tokio::time::timeout(cleanup_timeout, tokio::task::spawn_blocking(move || fs::remove_dir_all(path))).await;
+        match result {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(Ok(Err(error))) => Err(RemoteBackendError::Transport {
+                class: crate::remote::RemoteFailureClass::Cleanup,
+                message: format!("remove loopback job: {error}"),
+            }),
+            Ok(Err(error)) => Err(RemoteBackendError::Failed(format!("loopback cleanup worker failed: {error}"))),
+            Err(_) => Err(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::Cleanup }),
+        }
+    }
 }
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_dir_all(path);
+        }
     }
 }
 

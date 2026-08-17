@@ -40,8 +40,68 @@ pub struct ResourceLimits {
     pub connect_timeout: Duration,
     pub sync_timeout: Duration,
     pub build_timeout: Duration,
+    pub idle_output_timeout: Duration,
+    pub cleanup_timeout: Duration,
     pub max_output_bytes: u64,
+    pub max_active_builds: usize,
     pub artifact: ArtifactLimits,
+    pub worker: WorkerStateLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerStateLimits {
+    pub max_uploads: usize,
+    pub max_upload_bytes: u64,
+    pub max_jobs: usize,
+    pub max_job_bytes: u64,
+    pub max_artifact_spools: usize,
+    pub max_artifact_spool_bytes: u64,
+    pub max_state_entries: usize,
+}
+
+impl Default for WorkerStateLimits {
+    fn default() -> Self {
+        Self {
+            max_uploads: 2,
+            max_upload_bytes: 1024 * 1024 * 1024,
+            max_jobs: 1,
+            max_job_bytes: 512 * 1024 * 1024,
+            max_artifact_spools: 1,
+            max_artifact_spool_bytes: 512 * 1024 * 1024,
+            max_state_entries: 20_000,
+        }
+    }
+}
+
+impl WorkerStateLimits {
+    pub const MAX_COUNT: usize = 1_000;
+    pub const MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+    pub const MAX_ENTRIES: usize = 1_000_000;
+
+    pub fn new(
+        max_uploads: usize, max_upload_bytes: u64, max_jobs: usize, max_job_bytes: u64, max_artifact_spools: usize, max_artifact_spool_bytes: u64,
+        max_state_entries: usize,
+    ) -> Result<Self, String> {
+        if max_uploads == 0 || max_jobs == 0 || max_artifact_spools == 0 {
+            return Err("worker state counts must be positive".to_string());
+        }
+        if max_uploads > Self::MAX_COUNT || max_jobs > Self::MAX_COUNT || max_artifact_spools > Self::MAX_COUNT {
+            return Err(format!("worker state counts must not exceed {}", Self::MAX_COUNT));
+        }
+        if max_upload_bytes == 0
+            || max_job_bytes == 0
+            || max_artifact_spool_bytes == 0
+            || max_upload_bytes > Self::MAX_BYTES
+            || max_job_bytes > Self::MAX_BYTES
+            || max_artifact_spool_bytes > Self::MAX_BYTES
+        {
+            return Err(format!("worker state byte limits must be between 1 and {}", Self::MAX_BYTES));
+        }
+        if max_state_entries == 0 || max_state_entries > Self::MAX_ENTRIES {
+            return Err(format!("worker state entry limit must be between 1 and {}", Self::MAX_ENTRIES));
+        }
+        Ok(Self { max_uploads, max_upload_bytes, max_jobs, max_job_bytes, max_artifact_spools, max_artifact_spool_bytes, max_state_entries })
+    }
 }
 
 impl ResourceLimits {
@@ -57,6 +117,14 @@ impl ResourceLimits {
         self.build_timeout
     }
 
+    pub fn idle_output_timeout(&self) -> Duration {
+        self.idle_output_timeout
+    }
+
+    pub fn cleanup_timeout(&self) -> Duration {
+        self.cleanup_timeout
+    }
+
     pub fn max_output(&self) -> u64 {
         self.max_output_bytes
     }
@@ -65,8 +133,16 @@ impl ResourceLimits {
         self.max_output_bytes
     }
 
+    pub fn max_active_builds(&self) -> usize {
+        self.max_active_builds
+    }
+
     pub fn artifact_limits(&self) -> ArtifactLimits {
         self.artifact
+    }
+
+    pub fn worker_state_limits(&self) -> WorkerStateLimits {
+        self.worker
     }
 }
 
@@ -526,6 +602,10 @@ struct RawResources {
     build_timeout: RawQuantity,
     #[serde(rename = "max-output-bytes", alias = "max-output", alias = "max_output_bytes", alias = "max_output")]
     max_output: RawQuantity,
+    #[serde(default, rename = "idle-output-timeout-seconds", alias = "idle-output-timeout", alias = "idle_output_timeout")]
+    idle_output_timeout: Option<RawQuantity>,
+    #[serde(default, rename = "cleanup-timeout-seconds", alias = "cleanup-timeout", alias = "cleanup_timeout")]
+    cleanup_timeout: Option<RawQuantity>,
     #[serde(default, rename = "artifact-timeout-seconds", alias = "artifact-timeout", alias = "artifact_timeout")]
     artifact_timeout: Option<RawQuantity>,
     #[serde(default, rename = "max-artifact-bytes", alias = "max-artifact-bytes-per-file", alias = "max_artifact_bytes")]
@@ -534,6 +614,22 @@ struct RawResources {
     max_artifact_total_bytes: Option<RawQuantity>,
     #[serde(default, rename = "max-artifact-entries", alias = "max_artifact_entries")]
     max_artifact_entries: Option<u64>,
+    #[serde(default, rename = "max-worker-uploads", alias = "max_worker_uploads")]
+    max_worker_uploads: Option<u64>,
+    #[serde(default, rename = "max-worker-upload-bytes", alias = "max_worker_upload_bytes")]
+    max_worker_upload_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-worker-jobs", alias = "max_worker_jobs")]
+    max_worker_jobs: Option<u64>,
+    #[serde(default, rename = "max-worker-job-bytes", alias = "max_worker_job_bytes")]
+    max_worker_job_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-worker-artifact-spools", alias = "max_worker_artifact_spools")]
+    max_worker_artifact_spools: Option<u64>,
+    #[serde(default, rename = "max-worker-artifact-spool-bytes", alias = "max_worker_artifact_spool_bytes")]
+    max_worker_artifact_spool_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-worker-state-entries", alias = "max_worker_state_entries")]
+    max_worker_state_entries: Option<u64>,
+    #[serde(default, rename = "max-active-builds", alias = "max_active_builds")]
+    max_active_builds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -612,8 +708,20 @@ fn validate_resources(raw: RawResources) -> Result<ResourceLimits, String> {
     let connect_timeout = parse_duration("connect-timeout", raw.connect_timeout)?;
     let sync_timeout = parse_duration("sync-timeout", raw.sync_timeout)?;
     let build_timeout = parse_duration("build-timeout", raw.build_timeout)?;
+    validate_lifecycle_duration("connect-timeout", connect_timeout)?;
+    validate_lifecycle_duration("sync-timeout", sync_timeout)?;
+    validate_lifecycle_duration("build-timeout", build_timeout)?;
     let max_output_bytes = parse_size("max-output", raw.max_output)?;
+    let max_active_builds = parse_count("max-active-builds", raw.max_active_builds, 1)?;
+    if max_active_builds == 0 || max_active_builds > 64 {
+        return Err("max-active-builds must be between 1 and 64".to_string());
+    }
     let defaults = ArtifactLimits::default();
+    let idle_output_timeout =
+        raw.idle_output_timeout.map_or(Ok(Duration::from_secs(5 * 60)), |value| parse_duration("idle-output-timeout", value))?;
+    let cleanup_timeout = raw.cleanup_timeout.map_or(Ok(Duration::from_secs(5)), |value| parse_duration("cleanup-timeout", value))?;
+    validate_lifecycle_duration("idle-output-timeout", idle_output_timeout)?;
+    validate_lifecycle_duration("cleanup-timeout", cleanup_timeout)?;
     let artifact_timeout = raw.artifact_timeout.map_or(Ok(defaults.timeout), |value| parse_duration("artifact-timeout", value))?;
     let max_artifact_bytes = raw.max_artifact_bytes.map_or(Ok(defaults.max_file_bytes), |value| parse_size("max-artifact-bytes", value))?;
     let max_artifact_total_bytes =
@@ -622,7 +730,42 @@ fn validate_resources(raw: RawResources) -> Result<ResourceLimits, String> {
         .max_artifact_entries
         .map_or(Ok(defaults.max_entries), |value| usize::try_from(value).map_err(|_| "max-artifact-entries is too large".to_string()))?;
     let artifact = ArtifactLimits::new(artifact_timeout, max_artifact_entries, max_artifact_bytes, max_artifact_total_bytes)?;
-    Ok(ResourceLimits { connect_timeout, sync_timeout, build_timeout, max_output_bytes, artifact })
+    let worker_defaults = WorkerStateLimits::default();
+    let worker = WorkerStateLimits::new(
+        parse_count("max-worker-uploads", raw.max_worker_uploads, worker_defaults.max_uploads)?,
+        raw.max_worker_upload_bytes.map_or(Ok(worker_defaults.max_upload_bytes), |value| parse_size("max-worker-upload-bytes", value))?,
+        parse_count("max-worker-jobs", raw.max_worker_jobs, worker_defaults.max_jobs)?,
+        raw.max_worker_job_bytes.map_or(Ok(worker_defaults.max_job_bytes), |value| parse_size("max-worker-job-bytes", value))?,
+        parse_count("max-worker-artifact-spools", raw.max_worker_artifact_spools, worker_defaults.max_artifact_spools)?,
+        raw.max_worker_artifact_spool_bytes
+            .map_or(Ok(worker_defaults.max_artifact_spool_bytes), |value| parse_size("max-worker-artifact-spool-bytes", value))?,
+        parse_count("max-worker-state-entries", raw.max_worker_state_entries, worker_defaults.max_state_entries)?,
+    )?;
+    Ok(ResourceLimits {
+        connect_timeout,
+        sync_timeout,
+        build_timeout,
+        idle_output_timeout,
+        cleanup_timeout,
+        max_output_bytes,
+        max_active_builds,
+        artifact,
+        worker,
+    })
+}
+
+fn parse_count(field: &str, value: Option<u64>, default: usize) -> Result<usize, String> {
+    match value {
+        Some(value) => usize::try_from(value).map_err(|_| format!("{field} is too large")),
+        None => Ok(default),
+    }
+}
+
+fn validate_lifecycle_duration(field: &str, value: Duration) -> Result<(), String> {
+    if value.is_zero() || value > Duration::from_secs(24 * 60 * 60) {
+        return Err(format!("{field} must be between 1 second and 24 hours"));
+    }
+    Ok(())
 }
 
 fn parse_duration(field: &str, quantity: RawQuantity) -> Result<Duration, String> {

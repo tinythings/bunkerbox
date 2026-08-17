@@ -101,6 +101,8 @@ pub struct RuntimeConfig {
     pub session_cleanup: Option<Vec<String>>,
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub remote_max_active_builds: Option<u64>,
 }
 
 impl RuntimeConfig {
@@ -141,6 +143,15 @@ impl RuntimeConfig {
 
     pub fn session_mb(&self) -> u32 {
         self.session_mb.unwrap_or(50)
+    }
+
+    pub fn remote_max_active_builds(&self) -> Result<usize, String> {
+        let value = self.remote_max_active_builds.unwrap_or(2);
+        let value = usize::try_from(value).map_err(|_| "remote_max_active_builds is too large".to_string())?;
+        if value == 0 || value > crate::remote::RemoteAdmissionLimits::MAX {
+            return Err(format!("remote_max_active_builds must be between 1 and {}", crate::remote::RemoteAdmissionLimits::MAX));
+        }
+        Ok(value)
     }
 
     pub fn effective_session_cleanup(&self) -> Vec<String> {

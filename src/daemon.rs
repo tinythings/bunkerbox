@@ -4,8 +4,8 @@ use crate::logging;
 use crate::loopback::{LoopbackBackend, RunRemoteSession};
 use crate::proxy::{FilterProxy, UnixProxyHandle};
 use crate::remote::{
-    RemoteAuthorizationError, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteEnvironmentPolicy,
-    RemoteExecutionContext, RemoteRequest, RemoteResourcePolicy, RemoteToolPolicy,
+    RemoteAdmissionLimits, RemoteAuthorizationError, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent,
+    RemoteEnvironmentPolicy, RemoteExecutionContext, RemoteRequest, RemoteResourcePolicy, RemoteTargetId, RemoteToolPolicy,
 };
 use crate::remote_target::SshTarget;
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
@@ -13,6 +13,7 @@ use crate::ssh::SshBackend;
 use crate::vscomm::{validate_exec_request, validate_process_path, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
 use crate::workspace::WorkspaceCwd;
 use rand::Rng;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -22,6 +23,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 const BWRAP_STATUS_FD: RawFd = 3;
 
@@ -51,15 +53,240 @@ pub enum RemoteDispatchError {
     EventSinkClosed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ExecutionKey {
+    session_id: crate::remote::WorkspaceSessionId,
+    request_id: crate::remote::RequestId,
+}
+
+struct AdmissionPermit {
+    _global: OwnedSemaphorePermit,
+    _target: OwnedSemaphorePermit,
+}
+
+struct RemoteAdmission {
+    global: Arc<Semaphore>,
+    targets: Mutex<BTreeMap<RemoteTargetId, Arc<Semaphore>>>,
+    target_limit: usize,
+}
+
+impl RemoteAdmission {
+    fn new(limits: RemoteAdmissionLimits) -> Self {
+        Self { global: Arc::new(Semaphore::new(limits.global_active)), targets: Mutex::new(BTreeMap::new()), target_limit: limits.target_active }
+    }
+
+    fn acquire(&self, target_id: RemoteTargetId) -> Result<AdmissionPermit, RemoteBackendError> {
+        let global = self.global.clone().try_acquire_owned().map_err(|_| RemoteBackendError::Transport {
+            class: crate::remote::RemoteFailureClass::Busy,
+            message: "remote global active-execution limit reached".to_string(),
+        })?;
+        let target_semaphore = self
+            .targets
+            .lock()
+            .map_err(|_| RemoteBackendError::Failed("remote target admission lock poisoned".to_string()))?
+            .entry(target_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.target_limit)))
+            .clone();
+        let target = match target_semaphore.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                drop(global);
+                return Err(RemoteBackendError::Transport {
+                    class: crate::remote::RemoteFailureClass::Busy,
+                    message: "remote target active-execution limit reached".to_string(),
+                });
+            }
+        };
+        Ok(AdmissionPermit { _global: global, _target: target })
+    }
+}
+
+struct ExecutionState {
+    cancellation_selected: bool,
+    terminal: bool,
+}
+
+struct ExecutionEntry {
+    control: crate::remote::RemoteExecutionControl,
+    state: Mutex<ExecutionState>,
+    _admission: AdmissionPermit,
+}
+
+impl ExecutionEntry {
+    fn new(control: crate::remote::RemoteExecutionControl, admission: AdmissionPermit) -> Self {
+        Self { control, state: Mutex::new(ExecutionState { cancellation_selected: false, terminal: false }), _admission: admission }
+    }
+
+    fn request_cancel(&self) -> CancelSelection {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return CancelSelection::Rejected,
+        };
+        if state.terminal
+            || matches!(self.control.phase(), crate::remote::RemoteLifecyclePhase::Finalizing | crate::remote::RemoteLifecyclePhase::Terminal)
+        {
+            return CancelSelection::Rejected;
+        }
+        if state.cancellation_selected {
+            return CancelSelection::AlreadySelected;
+        }
+        state.cancellation_selected = true;
+        self.control.set_phase(crate::remote::RemoteLifecyclePhase::Cancelling);
+        self.control.cancel();
+        CancelSelection::Selected
+    }
+
+    fn cancellation_selected(&self) -> bool {
+        self.state.lock().map(|state| state.cancellation_selected).unwrap_or(true)
+    }
+
+    fn accept_event(&self, event: &RemoteBackendEvent) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        if state.terminal || (state.cancellation_selected && !matches!(event, RemoteBackendEvent::Cancelled)) {
+            return false;
+        }
+        if is_terminal_event(event) {
+            state.terminal = true;
+            self.control.set_phase(crate::remote::RemoteLifecyclePhase::Terminal);
+        }
+        true
+    }
+
+    fn accept_cancelled(&self) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        if state.terminal || !state.cancellation_selected {
+            return false;
+        }
+        state.terminal = true;
+        self.control.set_phase(crate::remote::RemoteLifecyclePhase::Terminal);
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CancelSelection {
+    Selected,
+    AlreadySelected,
+    Rejected,
+}
+
+struct RemoteExecutionRegistry {
+    entries: Mutex<BTreeMap<ExecutionKey, Arc<ExecutionEntry>>>,
+}
+
+impl RemoteExecutionRegistry {
+    fn new() -> Self {
+        Self { entries: Mutex::new(BTreeMap::new()) }
+    }
+
+    fn insert(&self, key: ExecutionKey, entry: Arc<ExecutionEntry>) -> Result<(), RemoteBackendError> {
+        let mut entries = self.entries.lock().map_err(|_| RemoteBackendError::Failed("remote execution registry lock poisoned".to_string()))?;
+        if entries.contains_key(&key) {
+            return Err(RemoteBackendError::Transport {
+                class: crate::remote::RemoteFailureClass::Busy,
+                message: "remote request ID is already active for this session".to_string(),
+            });
+        }
+        entries.insert(key, entry);
+        Ok(())
+    }
+
+    fn get(&self, key: &ExecutionKey) -> Option<Arc<ExecutionEntry>> {
+        self.entries.lock().ok().and_then(|entries| entries.get(key).cloned())
+    }
+
+    fn remove(&self, key: &ExecutionKey) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(key);
+        }
+    }
+
+    fn cancel_all(&self) {
+        if let Ok(entries) = self.entries.lock() {
+            for entry in entries.values() {
+                let _ = entry.request_cancel();
+            }
+        }
+    }
+}
+
+struct ExecutionGuard {
+    registry: Arc<RemoteExecutionRegistry>,
+    key: ExecutionKey,
+    entry: Arc<ExecutionEntry>,
+    finished: bool,
+}
+
+impl ExecutionGuard {
+    fn finish(mut self) {
+        self.finished = true;
+        self.registry.remove(&self.key);
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.entry.request_cancel();
+            self.registry.remove(&self.key);
+        }
+    }
+}
+
+fn is_terminal_event(event: &RemoteBackendEvent) -> bool {
+    matches!(
+        event,
+        RemoteBackendEvent::SyncCompleted { .. }
+            | RemoteBackendEvent::Completed { .. }
+            | RemoteBackendEvent::Error { .. }
+            | RemoteBackendEvent::Cancelled
+    )
+}
+
 pub struct RemoteBroker {
     policy: RemoteAuthorizationPolicy,
     context: RemoteExecutionContext,
     backend: Arc<dyn RemoteBackend>,
+    registry: Arc<RemoteExecutionRegistry>,
+    admission: Arc<RemoteAdmission>,
+    cleanup_timeout: std::time::Duration,
 }
 
 impl RemoteBroker {
     pub fn new(policy: RemoteAuthorizationPolicy, context: RemoteExecutionContext, backend: Arc<dyn RemoteBackend>) -> Self {
-        Self { policy, context, backend }
+        Self {
+            policy,
+            context,
+            backend,
+            registry: Arc::new(RemoteExecutionRegistry::new()),
+            admission: Arc::new(RemoteAdmission::new(RemoteAdmissionLimits::default())),
+            cleanup_timeout: RemoteResourcePolicy::default().cleanup_timeout,
+        }
+    }
+
+    pub fn with_admission_limits(mut self, limits: RemoteAdmissionLimits) -> Self {
+        self.admission = Arc::new(RemoteAdmission::new(limits));
+        self
+    }
+
+    pub fn with_cleanup_timeout(mut self, cleanup_timeout: std::time::Duration) -> Self {
+        self.cleanup_timeout = cleanup_timeout;
+        self
+    }
+
+    pub fn cancel_request(&self, request_id: crate::remote::RequestId) -> bool {
+        let key = ExecutionKey { session_id: self.context.workspace_session_id, request_id };
+        self.registry.get(&key).is_some_and(|entry| !matches!(entry.request_cancel(), CancelSelection::Rejected))
+    }
+
+    pub fn cleanup_timeout(&self) -> std::time::Duration {
+        self.cleanup_timeout
     }
 
     pub async fn dispatch(&self, request: RemoteRequest, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>) -> Result<(), RemoteDispatchError> {
@@ -70,13 +297,138 @@ impl RemoteBroker {
                 return Err(RemoteDispatchError::Unauthorized(error));
             }
         };
-        match self.backend.execute(authorized, events.clone()).await {
-            Ok(()) => Ok(()),
+
+        if let crate::remote::RemoteOperation::Cancel { target_request_id } = authorized.request().operation() {
+            return self.dispatch_cancel(authorized.request_id(), *target_request_id, events).await;
+        }
+
+        let request_id = authorized.request_id();
+        let key = ExecutionKey { session_id: self.context.workspace_session_id, request_id };
+        let admission = match self.admission.acquire(self.context.target) {
+            Ok(admission) => admission,
             Err(error) => {
                 events.send(error.event()).await.map_err(|_| RemoteDispatchError::EventSinkClosed)?;
-                Err(RemoteDispatchError::Backend(error))
+                return Err(RemoteDispatchError::Backend(error));
+            }
+        };
+        let control = crate::remote::RemoteExecutionControl::new();
+        let entry = Arc::new(ExecutionEntry::new(control.clone(), admission));
+        self.registry.insert(key, entry.clone()).map_err(RemoteDispatchError::Backend)?;
+        let guard = ExecutionGuard { registry: self.registry.clone(), key, entry: entry.clone(), finished: false };
+        let (backend_events, mut backend_rx) = mpsc::channel(64);
+        let mut backend = Box::pin(self.backend.execute(authorized, control.clone(), backend_events));
+        let mut backend_result = None;
+        let mut terminal_sent = false;
+        let mut sink_closed = false;
+        let mut terminal_deadline = Box::pin(tokio::time::sleep(self.cleanup_timeout));
+
+        loop {
+            if backend_result.is_some() && backend_rx.is_empty() {
+                break;
+            }
+            tokio::select! {
+                result = &mut backend, if backend_result.is_none() => {
+                    backend_result = Some(result);
+                }
+                event = backend_rx.recv() => {
+                    let Some(event) = event else { continue };
+                    if !entry.accept_event(&event) {
+                        continue;
+                    }
+                    let terminal = is_terminal_event(&event);
+                    if !sink_closed {
+                        tokio::select! {
+                            result = events.send(event) => {
+                                if result.is_err() {
+                                    sink_closed = true;
+                                    let _ = entry.request_cancel();
+                                }
+                            }
+                            _ = control.cancelled(), if !terminal => {
+                                sink_closed = true;
+                                let _ = entry.request_cancel();
+                            }
+                        }
+                    }
+                    if terminal {
+                        terminal_sent = true;
+                        terminal_deadline.as_mut().reset(tokio::time::Instant::now() + self.cleanup_timeout);
+                    }
+                }
+                _ = control.cancelled(), if !terminal_sent => {
+                    if entry.accept_cancelled() {
+                        terminal_sent = true;
+                        terminal_deadline.as_mut().reset(tokio::time::Instant::now() + self.cleanup_timeout);
+                        if !sink_closed && events.send(RemoteBackendEvent::Cancelled).await.is_err() {
+                            sink_closed = true;
+                        }
+                    }
+                }
+                _ = &mut terminal_deadline, if terminal_sent && backend_result.is_none() => {
+                    backend_result = Some(Err(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::Cleanup }));
+                }
             }
         }
+
+        let result = backend_result.unwrap_or(Ok(()));
+        if !terminal_sent {
+            if entry.cancellation_selected() {
+                if entry.accept_cancelled() && !sink_closed && events.send(RemoteBackendEvent::Cancelled).await.is_err() {
+                    sink_closed = true;
+                }
+            } else {
+                let error = match &result {
+                    Ok(()) => RemoteBackendError::Failed("remote backend completed without a terminal event".to_string()),
+                    Err(error) => error.clone(),
+                };
+                let event = error.event();
+                if entry.accept_event(&event) && !sink_closed && events.send(event).await.is_err() {
+                    sink_closed = true;
+                }
+            }
+        }
+
+        drop(backend);
+        guard.finish();
+        if sink_closed {
+            return Err(RemoteDispatchError::EventSinkClosed);
+        }
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(RemoteDispatchError::Backend(error)),
+        }
+    }
+
+    async fn dispatch_cancel(
+        &self, _cancel_request_id: crate::remote::RequestId, target_request_id: crate::remote::RequestId,
+        events: tokio::sync::mpsc::Sender<RemoteBackendEvent>,
+    ) -> Result<(), RemoteDispatchError> {
+        let key = ExecutionKey { session_id: self.context.workspace_session_id, request_id: target_request_id };
+        let Some(entry) = self.registry.get(&key) else {
+            let error = RemoteAuthorizationError::CancelTargetUnavailable;
+            events.send(error.event()).await.map_err(|_| RemoteDispatchError::EventSinkClosed)?;
+            return Err(RemoteDispatchError::Unauthorized(error));
+        };
+        if matches!(entry.control.phase(), crate::remote::RemoteLifecyclePhase::Finalizing | crate::remote::RemoteLifecyclePhase::Terminal) {
+            let error = RemoteAuthorizationError::CancelTargetFinalizing;
+            events.send(error.event()).await.map_err(|_| RemoteDispatchError::EventSinkClosed)?;
+            return Err(RemoteDispatchError::Unauthorized(error));
+        }
+        match entry.request_cancel() {
+            CancelSelection::Selected | CancelSelection::AlreadySelected => {
+                events.send(RemoteBackendEvent::Completed { exit_code: 0 }).await.map_err(|_| RemoteDispatchError::EventSinkClosed)?;
+                Ok(())
+            }
+            CancelSelection::Rejected => {
+                let error = RemoteAuthorizationError::CancelTargetFinalizing;
+                events.send(error.event()).await.map_err(|_| RemoteDispatchError::EventSinkClosed)?;
+                Err(RemoteDispatchError::Unauthorized(error))
+            }
+        }
+    }
+
+    pub fn cancel_all(&self) {
+        self.registry.cancel_all();
     }
 }
 
@@ -105,6 +457,7 @@ pub struct RemoteDaemonConfig {
     resources: RemoteResourcePolicy,
     artifact_policy: ArtifactPolicy,
     artifact_limits: ArtifactLimits,
+    admission_limits: RemoteAdmissionLimits,
 }
 
 enum RemoteBackendSelection {
@@ -123,20 +476,29 @@ impl RemoteDaemonConfig {
             resources: RemoteResourcePolicy::default(),
             artifact_policy: ArtifactPolicy::default(),
             artifact_limits: ArtifactLimits::default(),
+            admission_limits: RemoteAdmissionLimits::default(),
         }
     }
 
     pub fn ssh(session: Arc<RunRemoteSession>, target: SshTarget) -> Result<Self, String> {
         crate::ssh::SshLaunchSpec::from_target(&target)?;
+        let target_resources = target.resources();
         Ok(Self {
             session,
             allowed_tools: Vec::new(),
             tool_policies: None,
             environment: None,
             backend: RemoteBackendSelection::Ssh { target: Box::new(target) },
-            resources: RemoteResourcePolicy::default(),
+            resources: RemoteResourcePolicy {
+                sync_timeout: target_resources.sync_timeout(),
+                build_timeout: target_resources.build_timeout(),
+                idle_output_timeout: target_resources.idle_output_timeout(),
+                cleanup_timeout: target_resources.cleanup_timeout(),
+                max_output_bytes: target_resources.max_output_bytes(),
+            },
             artifact_policy: ArtifactPolicy::default(),
             artifact_limits: ArtifactLimits::default(),
+            admission_limits: RemoteAdmissionLimits::default(),
         })
     }
 
@@ -163,12 +525,19 @@ impl RemoteDaemonConfig {
         self.artifact_limits = limits;
         self
     }
+
+    pub fn with_admission_limits(mut self, limits: RemoteAdmissionLimits) -> Self {
+        self.admission_limits = limits;
+        self
+    }
 }
 
 struct RemoteComponents {
     context: RemoteExecutionContext,
     policy: RemoteAuthorizationPolicy,
     backend: Arc<dyn RemoteBackend>,
+    admission_limits: RemoteAdmissionLimits,
+    cleanup_timeout: std::time::Duration,
 }
 
 impl VsockDaemon {
@@ -176,7 +545,17 @@ impl VsockDaemon {
         passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, profiles: Vec<String>, share_dir: PathBuf, allow: Vec<String>,
         remote: RemoteDaemonConfig,
     ) -> Result<Self, String> {
-        let RemoteDaemonConfig { session, allowed_tools, tool_policies, environment, backend, resources, artifact_policy, artifact_limits } = remote;
+        let RemoteDaemonConfig {
+            session,
+            allowed_tools,
+            tool_policies,
+            environment,
+            backend,
+            resources,
+            artifact_policy,
+            artifact_limits,
+            admission_limits,
+        } = remote;
         let remote_policy = match (tool_policies, environment) {
             (Some(tool_policies), Some(environment)) => {
                 RemoteAuthorizationPolicy::from_policies(session.target(), session.session_id(), tool_policies, environment)?
@@ -190,15 +569,20 @@ impl VsockDaemon {
             RemoteBackendSelection::Loopback { tools, target_environment } => Arc::new(
                 LoopbackBackend::new(session, tools)
                     .with_target_environment(target_environment)
-                    .with_timeout(resources.build_timeout)
-                    .with_output_limit(resources.max_output_bytes)
+                    .with_resources(resources)
                     .with_artifacts(artifact_policy.clone(), artifact_limits),
             ),
             RemoteBackendSelection::Ssh { target } => {
                 Arc::new(SshBackend::new(session, *target)?.with_artifacts(artifact_policy.clone(), artifact_limits))
             }
         };
-        let remote_components = RemoteComponents { context: remote_context, policy: remote_policy, backend };
+        let remote_components = RemoteComponents {
+            context: remote_context,
+            policy: remote_policy,
+            backend,
+            admission_limits,
+            cleanup_timeout: resources.cleanup_timeout,
+        };
         Self::start_inner(passthrough, env_mode, workspace, profiles, share_dir, allow, remote_components)
     }
 
@@ -244,7 +628,11 @@ impl VsockDaemon {
         }
 
         let connections = Arc::new(Mutex::new(Vec::new()));
-        let remote_broker = Arc::new(RemoteBroker::new(remote.policy, remote.context, remote.backend));
+        let remote_broker = Arc::new(
+            RemoteBroker::new(remote.policy, remote.context, remote.backend)
+                .with_admission_limits(remote.admission_limits)
+                .with_cleanup_timeout(remote.cleanup_timeout),
+        );
         let session = Arc::new(VsockSession {
             passthrough: Arc::new(passthrough),
             env_mode,
@@ -316,12 +704,22 @@ async fn daemon_loop(
         }
     }
 
+    session.remote_broker.cancel_all();
     let tasks = connections.lock().map_err(|_| "connection task lock poisoned".to_string())?.drain(..).collect::<Vec<_>>();
-    for task in &tasks {
-        task.abort();
-    }
-    for task in tasks {
-        let _ = task.await;
+    let cleanup_deadline = session.remote_broker.cleanup_timeout();
+    let mut tasks = tasks;
+    if tokio::time::timeout(cleanup_deadline, async {
+        for task in &mut tasks {
+            let _ = task.await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     Ok(())
@@ -376,7 +774,10 @@ pub async fn dispatch_remote_frame<W: AsyncWriteExt + Unpin>(frame: Frame, broke
             };
             let response =
                 crate::vscomm::RemoteEvent::from_backend_event(request_id, event).to_frame().map_err(|err| format!("encode remote event: {err}"))?;
-            write_frame(writer, &response).await?;
+            if let Err(error) = write_frame(writer, &response).await {
+                broker.cancel_request(request_id);
+                return Err(error);
+            }
             continue;
         }
 
@@ -387,7 +788,10 @@ pub async fn dispatch_remote_frame<W: AsyncWriteExt + Unpin>(frame: Frame, broke
                 let response = crate::vscomm::RemoteEvent::from_backend_event(request_id, event)
                     .to_frame()
                     .map_err(|err| format!("encode remote event: {err}"))?;
-                write_frame(writer, &response).await?;
+                if let Err(error) = write_frame(writer, &response).await {
+                    broker.cancel_request(request_id);
+                    return Err(error);
+                }
             }
         }
     }

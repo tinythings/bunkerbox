@@ -1,7 +1,8 @@
 use super::*;
+use crate::artifact::{ArtifactLimits, ArtifactPolicy};
 use crate::remote::{
-    RemoteAuthorizationPolicy, RemoteBuild, RemoteExecutionContext, RemoteRequest, RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTool, RequestId,
-    WorkspaceRelativePath,
+    RemoteAuthorizationPolicy, RemoteBuild, RemoteExecutionContext, RemoteFailureClass, RemoteRequest, RemoteSnapshotAuthority, RemoteSnapshotId,
+    RemoteTool, RequestId, WorkspaceRelativePath,
 };
 use tempfile::TempDir;
 
@@ -471,4 +472,42 @@ async fn output_limit_kills_a_flooding_direct_child() {
     let (events, _receiver) = mpsc::channel(8);
     let request = authorized_build(target, session_id, "printf", vec!["0123456789".into()], Vec::new(), snapshot_id);
     assert_eq!(backend.execute(request, events).await, Err(RemoteBackendError::OutputLimit { limit: 8 }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_retrieves_only_trusted_declared_artifacts_after_successful_build() {
+    let (_temp, session, target, session_id) = fixture();
+    fs::write(session.workspace_root().join("src/Makefile"), ".PHONY: artifact\nartifact:\n\t@printf 'data' > result\n").unwrap();
+    let snapshot_id = session.sync_snapshot().unwrap();
+    let tools = resolve_fixed_tools(["make".to_string()]);
+    if tools.is_empty() {
+        return;
+    }
+    let backend = LoopbackBackend::new(session.clone(), tools)
+        .with_artifacts(ArtifactPolicy::new(vec!["src/result".to_string()]).unwrap(), ArtifactLimits::default());
+    let (events, receiver) = mpsc::channel(16);
+    let request = authorized_build(target, session_id, "make", vec!["artifact".into()], Vec::new(), snapshot_id);
+    assert_eq!(backend.execute(request, events).await, Ok(()));
+    let events = collect_events(receiver).await;
+    assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { exit_code: 0 })));
+    assert_eq!(fs::read(session.workspace_root().join(".bunkerbox/artifacts/03030303030303030303030303030303/src/result")).unwrap(), b"data");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_missing_required_artifact_is_a_terminal_artifact_failure() {
+    let (_temp, session, target, session_id) = fixture();
+    fs::write(session.workspace_root().join("src/Makefile"), ".PHONY: ok\nok:\n\t@true\n").unwrap();
+    let snapshot_id = session.sync_snapshot().unwrap();
+    let tools = resolve_fixed_tools(["make".to_string()]);
+    if tools.is_empty() {
+        return;
+    }
+    let backend = LoopbackBackend::new(session.clone(), tools)
+        .with_artifacts(ArtifactPolicy::new(vec!["src/missing".to_string()]).unwrap(), ArtifactLimits::default());
+    let (events, receiver) = mpsc::channel(16);
+    let request = authorized_build(target, session_id, "make", vec!["ok".into()], Vec::new(), snapshot_id);
+    assert!(matches!(backend.execute(request, events).await, Err(RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, .. })));
+    let events = collect_events(receiver).await;
+    assert!(!events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { .. })));
+    assert!(fs::read_dir(&session.jobs_root).unwrap().next().is_none());
 }

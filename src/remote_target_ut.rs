@@ -319,3 +319,55 @@ fn config_version_and_transport_are_strict() {
     write_config(&fixture, &transport);
     assert!(RemoteTargetConfig::load_from(&fixture.config).is_err());
 }
+
+#[test]
+fn project_artifact_policy_and_limits_are_loaded_from_trusted_binding() {
+    let fixture = Fixture::new();
+    let marker = format!("  {}:\n    backend: ssh\n    target: ssh-one\n", scalar(fixture.project.to_str().unwrap()));
+    let yaml = valid_yaml(&fixture, &fixture.project, "ssh", Some("ssh-one"))
+        .replace(
+            "      max-output-bytes: 67108864\n",
+            "      max-output-bytes: 67108864\n      artifact-timeout-seconds: 7\n      max-artifact-bytes: 1M\n      max-artifact-total-bytes: 2M\n      max-artifact-entries: 3\n",
+        )
+        .replace(
+            &marker,
+            &format!(
+                "{marker}    artifacts:\n      paths:\n        - target/result\n        - dist/package.tar.gz\n"
+            ),
+        );
+    write_config(&fixture, &yaml);
+
+    let config = RemoteTargetConfig::load_from(&fixture.config).unwrap();
+    let resolved = config.resolve_for_project(&fixture.project).unwrap();
+    assert_eq!(resolved.artifacts().paths(), ["target/result", "dist/package.tar.gz"]);
+    let limits = resolved.target().unwrap().resources().artifact_limits();
+    assert_eq!(limits.timeout, Duration::from_secs(7));
+    assert_eq!(limits.max_entries, 3);
+    assert_eq!(limits.max_file_bytes, 1024 * 1024);
+    assert_eq!(limits.max_total_bytes, 2 * 1024 * 1024);
+}
+
+#[test]
+fn project_artifact_policy_must_fit_target_limits() {
+    let fixture = Fixture::new();
+    let marker = format!("  {}:\n    backend: ssh\n    target: ssh-one\n", scalar(fixture.project.to_str().unwrap()));
+    let yaml = valid_yaml(&fixture, &fixture.project, "ssh", Some("ssh-one"))
+        .replace("      max-output-bytes: 67108864\n", "      max-output-bytes: 67108864\n      max-artifact-entries: 1\n")
+        .replace(&marker, &format!("{marker}    artifacts:\n      paths:\n        - target/result\n        - dist/package.tar.gz\n"));
+    write_config(&fixture, &yaml);
+
+    let error = RemoteTargetConfig::load_from(&fixture.config).unwrap_err();
+    assert!(error.contains("artifact policy exceeds configured entry count 1"));
+}
+
+#[test]
+fn project_artifact_paths_reject_traversal_globs_and_duplicates() {
+    let fixture = Fixture::new();
+    let marker = format!("  {}:\n    backend: loopback\n", scalar(fixture.project.to_str().unwrap()));
+    for paths in ["        - /absolute\n", "        - ../escape\n", "        - dist/*\n", "        - result\n        - result\n"] {
+        let yaml =
+            valid_yaml(&fixture, &fixture.project, "loopback", None).replace(&marker, &format!("{marker}    artifacts:\n      paths:\n{paths}"));
+        write_config(&fixture, &yaml);
+        assert!(RemoteTargetConfig::load_from(&fixture.config).is_err());
+    }
+}

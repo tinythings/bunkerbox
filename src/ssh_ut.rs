@@ -1,11 +1,16 @@
 use super::*;
+use crate::artifact::{ArtifactLimits, ArtifactPolicy};
 use crate::remote::{
     RemoteAuthorizationPolicy, RemoteBuild, RemoteExecutionContext, RemoteRequest, RemoteSnapshotId, RemoteTool, RequestId, WorkspaceRelativePath,
     WorkspaceSessionId,
 };
 use crate::remote_target::RemoteTargetConfig;
 use crate::snapshot::{SnapshotBuilder, SnapshotExclusionPolicy, SnapshotLimits, SnapshotStore};
-use crate::worker_protocol::{self, WorkerErrorKind, WorkerMessage, WorkerOperation, WorkerSessionId, WorkerUploadEntry, WorkerUploadId};
+use crate::worker_protocol::{
+    self, WorkerArtifactEntry, WorkerArtifactSetId, WorkerErrorKind, WorkerMessage, WorkerOperation, WorkerSessionId, WorkerUploadEntry,
+    WorkerUploadId,
+};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,6 +27,7 @@ enum ScriptMode {
     Success,
     WrongVersion,
     ProtocolError,
+    ArtifactSuccess,
 }
 
 struct ScriptedFactory {
@@ -106,7 +112,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let Ok(WorkerMessage::Hello { request_id, session_id, .. }) = worker_protocol::read_message(&mut reader).await else {
+    let Ok((hello_version, WorkerMessage::Hello { request_id, session_id, .. })) = worker_protocol::read_message_versioned(&mut reader).await else {
         return 71;
     };
     if matches!(mode, ScriptMode::WrongVersion) {
@@ -115,9 +121,15 @@ where
         writer.write_all(&frame).await.unwrap();
         return 0;
     }
-    worker_protocol::write_message(&mut writer, &WorkerMessage::hello(request_id, session_id, true)).await.unwrap();
+    worker_protocol::write_message_versioned(
+        &mut writer,
+        &WorkerMessage::hello_for_version(request_id, session_id, true, hello_version),
+        hello_version,
+    )
+    .await
+    .unwrap();
 
-    let Ok(first) = worker_protocol::read_message(&mut reader).await else { return 72 };
+    let Ok((_, first)) = worker_protocol::read_message_versioned(&mut reader).await else { return 72 };
     messages.lock().unwrap().push(first.clone());
     if matches!(mode, ScriptMode::ProtocolError) {
         worker_protocol::write_message(
@@ -131,7 +143,7 @@ where
     }
     match first {
         WorkerMessage::UploadBegin { request_id, session_id, upload_id, .. } => loop {
-            let Ok(message) = worker_protocol::read_message(&mut reader).await else { return 73 };
+            let Ok((_, message)) = worker_protocol::read_message_versioned(&mut reader).await else { return 73 };
             messages.lock().unwrap().push(message.clone());
             match message {
                 WorkerMessage::UploadFileChunk { .. } => {}
@@ -139,13 +151,20 @@ where
                     if received_request != request_id || received_session != session_id || received_upload != upload_id {
                         return 74;
                     }
-                    worker_protocol::write_message(
+                    worker_protocol::write_message_versioned(
                         &mut writer,
                         &WorkerMessage::SyncProgress { request_id, session_id, upload_id, completed_bytes: 1, total_bytes: Some(1) },
+                        hello_version,
                     )
                     .await
                     .unwrap();
-                    worker_protocol::write_message(&mut writer, &WorkerMessage::UploadComplete { request_id, session_id, upload_id }).await.unwrap();
+                    worker_protocol::write_message_versioned(
+                        &mut writer,
+                        &WorkerMessage::UploadComplete { request_id, session_id, upload_id },
+                        hello_version,
+                    )
+                    .await
+                    .unwrap();
                     return 0;
                 }
                 _ => return 75,
@@ -153,18 +172,84 @@ where
         },
         WorkerMessage::Build { request_id, session_id, build } => {
             messages.lock().unwrap().push(WorkerMessage::Build { request_id, session_id, build: build.clone() });
-            worker_protocol::write_message(&mut writer, &WorkerMessage::stdout(request_id, session_id, b"remote stdout\n".to_vec())).await.unwrap();
-            worker_protocol::write_message(&mut writer, &WorkerMessage::stderr(request_id, session_id, b"remote stderr\n".to_vec())).await.unwrap();
-            worker_protocol::write_message(&mut writer, &WorkerMessage::completed(request_id, session_id, WorkerOperation::Build, 7)).await.unwrap();
-            let Ok(cleanup) = worker_protocol::read_message(&mut reader).await else { return 76 };
+            worker_protocol::write_message_versioned(
+                &mut writer,
+                &WorkerMessage::stdout(request_id, session_id, b"remote stdout\n".to_vec()),
+                hello_version,
+            )
+            .await
+            .unwrap();
+            worker_protocol::write_message_versioned(
+                &mut writer,
+                &WorkerMessage::stderr(request_id, session_id, b"remote stderr\n".to_vec()),
+                hello_version,
+            )
+            .await
+            .unwrap();
+            let exit_code = if matches!(mode, ScriptMode::ArtifactSuccess) { 0 } else { 7 };
+            worker_protocol::write_message_versioned(
+                &mut writer,
+                &WorkerMessage::completed(request_id, session_id, WorkerOperation::Build, exit_code),
+                hello_version,
+            )
+            .await
+            .unwrap();
+            if matches!(mode, ScriptMode::ArtifactSuccess) {
+                let digest: [u8; 32] = Sha256::digest(b"data").into();
+                worker_protocol::write_message_versioned(
+                    &mut writer,
+                    &WorkerMessage::ArtifactManifest {
+                        request_id,
+                        session_id,
+                        artifact_set_id: WorkerArtifactSetId([9; 16]),
+                        entries: vec![WorkerArtifactEntry::new("result", 0o644, 4, digest).unwrap()],
+                        total_bytes: 4,
+                    },
+                    hello_version,
+                )
+                .await
+                .unwrap();
+                let Ok((_, fetch)) = worker_protocol::read_message_versioned(&mut reader).await else { return 76 };
+                messages.lock().unwrap().push(fetch.clone());
+                if !matches!(fetch, WorkerMessage::FetchArtifact { artifact_set_id, entry_index: 0, .. } if artifact_set_id == WorkerArtifactSetId([9; 16]))
+                {
+                    return 77;
+                }
+                worker_protocol::write_message_versioned(
+                    &mut writer,
+                    &WorkerMessage::ArtifactChunk {
+                        request_id,
+                        session_id,
+                        artifact_set_id: WorkerArtifactSetId([9; 16]),
+                        entry_index: 0,
+                        offset: 0,
+                        data: b"data".to_vec(),
+                    },
+                    hello_version,
+                )
+                .await
+                .unwrap();
+                worker_protocol::write_message_versioned(
+                    &mut writer,
+                    &WorkerMessage::ArtifactComplete { request_id, session_id, artifact_set_id: WorkerArtifactSetId([9; 16]), entry_index: 0 },
+                    hello_version,
+                )
+                .await
+                .unwrap();
+            }
+            let Ok((_, cleanup)) = worker_protocol::read_message_versioned(&mut reader).await else { return 76 };
             messages.lock().unwrap().push(cleanup.clone());
             if !matches!(cleanup, WorkerMessage::Cleanup { request_id: received_request, session_id: received_session, upload_token } if received_request == request_id && received_session == session_id && upload_token == build.upload_token())
             {
                 return 77;
             }
-            worker_protocol::write_message(&mut writer, &WorkerMessage::completed(request_id, session_id, WorkerOperation::Cleanup, 0))
-                .await
-                .unwrap();
+            worker_protocol::write_message_versioned(
+                &mut writer,
+                &WorkerMessage::completed(request_id, session_id, WorkerOperation::Cleanup, 0),
+                hello_version,
+            )
+            .await
+            .unwrap();
             0
         }
         _ => 78,
@@ -342,4 +427,39 @@ async fn worker_protocol_failure_is_terminal_without_local_fallback() {
     let error = backend.execute(authorize_sync(&fixture), tx).await.unwrap_err();
     assert!(matches!(error, RemoteBackendError::Transport { class: RemoteFailureClass::WorkerProtocol, .. }), "{error:?}");
     assert_eq!(fixture.session.snapshot_capability_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artifact_capable_worker_manifest_is_fetched_verified_published_and_cleaned() {
+    let fixture = fixture();
+    let factory = ScriptedFactory::new(vec![ScriptMode::Success, ScriptMode::ArtifactSuccess]);
+    let backend = SshBackend::new(fixture.session.clone(), fixture.ssh_target.clone())
+        .unwrap()
+        .with_process_factory(factory.clone())
+        .with_artifacts(ArtifactPolicy::new(vec!["result".to_string()]).unwrap(), ArtifactLimits::default());
+
+    let (sync_tx, sync_rx) = tokio::sync::mpsc::channel(64);
+    backend.execute(authorize_sync(&fixture), sync_tx).await.unwrap();
+    let snapshot_id = collect(sync_rx)
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            RemoteBackendEvent::SyncCompleted { snapshot_id } => Some(snapshot_id),
+            _ => None,
+        })
+        .unwrap();
+
+    let (build_tx, build_rx) = tokio::sync::mpsc::channel(64);
+    backend.execute(authorize_build(&fixture, snapshot_id), build_tx).await.unwrap();
+    let events = collect(build_rx).await;
+    assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { exit_code: 0 })));
+    let published = fixture.session.workspace_root().join(".bunkerbox/artifacts/04040404040404040404040404040404/result");
+    assert_eq!(fs::read(published).unwrap(), b"data");
+
+    let messages = factory.messages.lock().unwrap();
+    assert!(messages
+        .iter()
+        .any(|message| matches!(message, WorkerMessage::Build { build, .. } if build.artifact_paths().iter().any(|path| path.as_str() == "result"))));
+    assert!(messages.iter().any(|message| matches!(message, WorkerMessage::FetchArtifact { entry_index: 0, .. })));
+    assert!(messages.iter().any(|message| matches!(message, WorkerMessage::Cleanup { .. })));
 }

@@ -297,3 +297,47 @@ fn unknown_nested_kinds_and_flags_are_rejected() {
     frame[WORKER_FRAME_HEADER_LEN + 34] = 9;
     assert!(WorkerMessage::decode(&frame).is_err());
 }
+
+#[test]
+fn artifact_messages_round_trip_only_in_protocol_v2() {
+    let (request_id, session_id, _upload_id) = ids();
+    let artifact_set_id = WorkerArtifactSetId([4; 16]);
+    let artifact = WorkerArtifactEntry::new("dist/result", 0o755, 4, [8; 32]).unwrap();
+    let artifact_build = build().with_artifacts(vec![WorkerArtifactPath::new("dist/result").unwrap()], 1024, 2048).unwrap();
+    let messages = [
+        WorkerMessage::Build { request_id, session_id, build: artifact_build },
+        WorkerMessage::ArtifactManifest { request_id, session_id, artifact_set_id, entries: vec![artifact], total_bytes: 4 },
+        WorkerMessage::FetchArtifact { request_id, session_id, artifact_set_id, entry_index: 0 },
+        WorkerMessage::ArtifactChunk { request_id, session_id, artifact_set_id, entry_index: 0, offset: 0, data: b"data".to_vec() },
+        WorkerMessage::ArtifactComplete { request_id, session_id, artifact_set_id, entry_index: 0 },
+    ];
+
+    for message in messages {
+        let frame = message.encode_version(WORKER_ARTIFACT_PROTOCOL_VERSION).unwrap();
+        assert_eq!(frame[4..6], WORKER_ARTIFACT_PROTOCOL_VERSION.to_le_bytes());
+        let (version, decoded) = WorkerMessage::decode_versioned(&frame).unwrap();
+        assert_eq!(version, WORKER_ARTIFACT_PROTOCOL_VERSION);
+        assert_eq!(decoded, message);
+        assert!(message.encode().is_err());
+    }
+
+    let v1_build = WorkerMessage::Build { request_id, session_id, build: build() };
+    let v1 = v1_build.encode().unwrap();
+    assert_eq!(WorkerMessage::decode(&v1).unwrap(), v1_build);
+}
+
+#[test]
+fn artifact_protocol_rejects_bad_identity_offsets_and_manifest_totals() {
+    let (request_id, session_id, _) = ids();
+    let artifact_set_id = WorkerArtifactSetId([4; 16]);
+    assert!(WorkerMessage::FetchArtifact { request_id, session_id, artifact_set_id, entry_index: MAX_WORKER_ARTIFACT_ENTRIES as u32 }
+        .encode_version(WORKER_ARTIFACT_PROTOCOL_VERSION)
+        .is_err());
+    assert!(WorkerMessage::ArtifactChunk { request_id, session_id, artifact_set_id, entry_index: 0, offset: u64::MAX, data: vec![1] }
+        .encode_version(WORKER_ARTIFACT_PROTOCOL_VERSION)
+        .is_err());
+    let entry = WorkerArtifactEntry::new("result", 0o644, 4, [1; 32]).unwrap();
+    assert!(WorkerMessage::ArtifactManifest { request_id, session_id, artifact_set_id, entries: vec![entry], total_bytes: 3 }
+        .encode_version(WORKER_ARTIFACT_PROTOCOL_VERSION)
+        .is_err());
+}

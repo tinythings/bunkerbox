@@ -1,13 +1,16 @@
 use super::*;
 use crate::platform;
 use bunkerbox_worker_protocol::{
-    WorkerBuild, WorkerEntryKind, WorkerMessage, WorkerOperation, WorkerRequestId, WorkerSessionId, WorkerUploadEntry, WorkerUploadId,
+    WorkerArtifactPath, WorkerBuild, WorkerEntryKind, WorkerMessage, WorkerOperation, WorkerRequestId, WorkerSessionId, WorkerUploadEntry,
+    WorkerUploadId, WORKER_ARTIFACT_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Cursor;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::thread;
 use tempfile::{tempdir, TempDir};
 
 const REQUEST_ID: WorkerRequestId = WorkerRequestId([1; 16]);
@@ -182,4 +185,78 @@ fn root_and_protocol_paths_are_confined() {
     assert!(platform::open_root(Path::new(&fixture.script)).is_err());
     assert!(bunkerbox_worker_protocol::WorkerUploadEntry::file("../escape", 0o644, 1, [0; 32]).is_err());
     assert!(bunkerbox_worker_protocol::WorkerUploadEntry::new("src/a", WorkerEntryKind::Directory, 0o755, 0, None).is_ok());
+}
+
+#[test]
+fn artifact_capable_build_emits_manifest_fetches_from_spool_and_cleans() {
+    let fixture = fixture();
+    let success_script = fixture._temp.path().join("success.sh");
+    fs::write(&success_script, b"#!/bin/sh\nprintf 'data' > result\nexit 0\n").unwrap();
+    fs::set_permissions(&success_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (mut host, worker) = UnixStream::pair().unwrap();
+    let worker_input = worker.try_clone().unwrap();
+    let service = WorkerService::new(&fixture.root).unwrap();
+    let worker_thread = thread::spawn(move || {
+        let writer = FrameWriter::new(worker);
+        service.run(worker_input, &writer)
+    });
+
+    let request = WorkerRequestId([4; 16]);
+    write_v2(&mut host, &WorkerMessage::hello_for_version(request, SESSION_ID, false, WORKER_ARTIFACT_PROTOCOL_VERSION));
+    write_v2(
+        &mut host,
+        &WorkerMessage::UploadBegin {
+            request_id: request,
+            session_id: SESSION_ID,
+            upload_id: UPLOAD_ID,
+            entries: vec![WorkerUploadEntry::directory("src", 0o755).unwrap(), file_entry("src/input", b"input")],
+        },
+    );
+    write_v2(
+        &mut host,
+        &WorkerMessage::UploadFileChunk {
+            request_id: request,
+            session_id: SESSION_ID,
+            upload_id: UPLOAD_ID,
+            path: bunkerbox_worker_protocol::WorkerRelativePath::new("src/input").unwrap(),
+            offset: 0,
+            data: b"input".to_vec(),
+        },
+    );
+    write_v2(&mut host, &WorkerMessage::UploadComplete { request_id: request, session_id: SESSION_ID, upload_id: UPLOAD_ID });
+    let build = WorkerBuild::new("tool", success_script.to_string_lossy().into_owned(), Vec::new(), "src", Vec::new(), Vec::new(), UPLOAD_ID)
+        .unwrap()
+        .with_artifacts(vec![WorkerArtifactPath::new("src/result").unwrap()], 1024, 2048)
+        .unwrap();
+    write_v2(&mut host, &WorkerMessage::Build { request_id: request, session_id: SESSION_ID, build });
+
+    let artifact_set_id = loop {
+        let (_, message) = WorkerMessage::read_blocking_versioned(&mut host).unwrap();
+        match message {
+            WorkerMessage::ArtifactManifest { artifact_set_id: id, entries, total_bytes, .. } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].path().as_str(), "src/result");
+                assert_eq!(entries[0].size(), 4);
+                assert_eq!(total_bytes, 4);
+                break id;
+            }
+            WorkerMessage::Hello { .. } | WorkerMessage::UploadComplete { .. } | WorkerMessage::Completed { .. } => {}
+            other => panic!("unexpected worker message: {other:?}"),
+        }
+    };
+    write_v2(&mut host, &WorkerMessage::FetchArtifact { request_id: request, session_id: SESSION_ID, artifact_set_id, entry_index: 0 });
+    let (_, chunk) = WorkerMessage::read_blocking_versioned(&mut host).unwrap();
+    assert!(matches!(chunk, WorkerMessage::ArtifactChunk { offset: 0, data, .. } if data == b"data"));
+    let (_, complete) = WorkerMessage::read_blocking_versioned(&mut host).unwrap();
+    assert!(matches!(complete, WorkerMessage::ArtifactComplete { entry_index: 0, .. }));
+    write_v2(&mut host, &WorkerMessage::Cleanup { request_id: request, session_id: SESSION_ID, upload_token: UPLOAD_ID });
+    let (_, cleanup) = WorkerMessage::read_blocking_versioned(&mut host).unwrap();
+    assert!(matches!(cleanup, WorkerMessage::Completed { operation: WorkerOperation::Cleanup, exit_code: 0, .. }));
+    drop(host);
+    assert_eq!(worker_thread.join().unwrap(), Ok(()));
+}
+
+fn write_v2(stream: &mut UnixStream, message: &WorkerMessage) {
+    message.write_blocking_version(stream, WORKER_ARTIFACT_PROTOCOL_VERSION).unwrap();
 }

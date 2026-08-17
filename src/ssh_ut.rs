@@ -28,6 +28,8 @@ enum ScriptMode {
     WrongVersion,
     ProtocolError,
     ArtifactSuccess,
+    ArtifactManifestError,
+    ArtifactTransferError,
 }
 
 struct ScriptedFactory {
@@ -186,7 +188,11 @@ where
             )
             .await
             .unwrap();
-            let exit_code = if matches!(mode, ScriptMode::ArtifactSuccess) { 0 } else { 7 };
+            let exit_code = if matches!(mode, ScriptMode::ArtifactSuccess | ScriptMode::ArtifactManifestError | ScriptMode::ArtifactTransferError) {
+                0
+            } else {
+                7
+            };
             worker_protocol::write_message_versioned(
                 &mut writer,
                 &WorkerMessage::completed(request_id, session_id, WorkerOperation::Build, exit_code),
@@ -194,7 +200,21 @@ where
             )
             .await
             .unwrap();
-            if matches!(mode, ScriptMode::ArtifactSuccess) {
+            if matches!(mode, ScriptMode::ArtifactManifestError) {
+                worker_protocol::write_message_versioned(
+                    &mut writer,
+                    &WorkerMessage::error(
+                        request_id,
+                        session_id,
+                        WorkerOperation::Artifact,
+                        WorkerErrorKind::Artifact,
+                        "configured artifact is missing",
+                    ),
+                    hello_version,
+                )
+                .await
+                .unwrap();
+            } else if matches!(mode, ScriptMode::ArtifactSuccess | ScriptMode::ArtifactTransferError) {
                 let digest: [u8; 32] = Sha256::digest(b"data").into();
                 worker_protocol::write_message_versioned(
                     &mut writer,
@@ -215,6 +235,7 @@ where
                 {
                     return 77;
                 }
+                let data = if matches!(mode, ScriptMode::ArtifactTransferError) { b"da".to_vec() } else { b"data".to_vec() };
                 worker_protocol::write_message_versioned(
                     &mut writer,
                     &WorkerMessage::ArtifactChunk {
@@ -223,7 +244,7 @@ where
                         artifact_set_id: WorkerArtifactSetId([9; 16]),
                         entry_index: 0,
                         offset: 0,
-                        data: b"data".to_vec(),
+                        data,
                     },
                     hello_version,
                 )
@@ -462,4 +483,54 @@ async fn artifact_capable_worker_manifest_is_fetched_verified_published_and_clea
         .any(|message| matches!(message, WorkerMessage::Build { build, .. } if build.artifact_paths().iter().any(|path| path.as_str() == "result"))));
     assert!(messages.iter().any(|message| matches!(message, WorkerMessage::FetchArtifact { entry_index: 0, .. })));
     assert!(messages.iter().any(|message| matches!(message, WorkerMessage::Cleanup { .. })));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_artifact_capture_failure_is_typed_as_manifest_failure() {
+    let fixture = fixture();
+    let factory = ScriptedFactory::new(vec![ScriptMode::Success, ScriptMode::ArtifactManifestError]);
+    let backend = SshBackend::new(fixture.session.clone(), fixture.ssh_target.clone())
+        .unwrap()
+        .with_process_factory(factory)
+        .with_artifacts(ArtifactPolicy::new(vec!["result".to_string()]).unwrap(), ArtifactLimits::default());
+
+    let (sync_tx, sync_rx) = tokio::sync::mpsc::channel(64);
+    backend.execute(authorize_sync(&fixture), sync_tx).await.unwrap();
+    let snapshot_id = collect(sync_rx)
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            RemoteBackendEvent::SyncCompleted { snapshot_id } => Some(snapshot_id),
+            _ => None,
+        })
+        .unwrap();
+
+    let (build_tx, _build_rx) = tokio::sync::mpsc::channel(64);
+    let error = backend.execute(authorize_build(&fixture, snapshot_id), build_tx).await.unwrap_err();
+    assert!(matches!(error, RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, .. }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_artifact_fetch_failure_is_typed_as_transfer_failure() {
+    let fixture = fixture();
+    let factory = ScriptedFactory::new(vec![ScriptMode::Success, ScriptMode::ArtifactTransferError]);
+    let backend = SshBackend::new(fixture.session.clone(), fixture.ssh_target.clone())
+        .unwrap()
+        .with_process_factory(factory)
+        .with_artifacts(ArtifactPolicy::new(vec!["result".to_string()]).unwrap(), ArtifactLimits::default());
+
+    let (sync_tx, sync_rx) = tokio::sync::mpsc::channel(64);
+    backend.execute(authorize_sync(&fixture), sync_tx).await.unwrap();
+    let snapshot_id = collect(sync_rx)
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            RemoteBackendEvent::SyncCompleted { snapshot_id } => Some(snapshot_id),
+            _ => None,
+        })
+        .unwrap();
+
+    let (build_tx, _build_rx) = tokio::sync::mpsc::channel(64);
+    let error = backend.execute(authorize_build(&fixture, snapshot_id), build_tx).await.unwrap_err();
+    assert!(matches!(error, RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, .. }));
 }

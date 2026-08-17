@@ -75,6 +75,33 @@ fn publication_rejects_collisions_and_cleans_partial_staging() {
 
 #[cfg(unix)]
 #[test]
+fn publication_stays_anchored_when_workspace_component_is_swapped() {
+    let temp = tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    let original_bunkerbox = temp.path().join("original-bunkerbox");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let policy = ArtifactPolicy::new(vec!["nested/result".to_string()]).unwrap();
+    let entry = ArtifactEntry::new("nested/result", 0o644, 1, sha256(b"x")).unwrap();
+    let manifest = ArtifactManifest::new(vec![entry], 1, &policy, limits()).unwrap();
+
+    let mut publication = ArtifactPublication::new(&workspace, [3; 16], manifest).unwrap();
+    fs::rename(workspace.join(ARTIFACT_ROOT), &original_bunkerbox).unwrap();
+    std::os::unix::fs::symlink(&outside, workspace.join(ARTIFACT_ROOT)).unwrap();
+
+    let mut writer = publication.begin(0).unwrap();
+    writer.write_chunk(b"x").unwrap();
+    publication.complete(writer).unwrap();
+    publication.publish().unwrap();
+
+    let request = "03030303030303030303030303030303";
+    assert_eq!(fs::read(original_bunkerbox.join(format!("artifacts/{request}/nested/result"))).unwrap(), b"x");
+    assert!(!outside.join(format!("artifacts/{request}")).exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn local_capture_rejects_symlink_outputs() {
     let temp = tempdir().unwrap();
     let job = temp.path().join("job");

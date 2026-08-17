@@ -1,9 +1,10 @@
 .DEFAULT_GOAL := help
-.PHONY: help ensure-toolchain dev release check test integration-test setup image install-image prepare config docs docs-dev docs-clean musl-vscomm clean
+.PHONY: help ensure-toolchain dev release check test integration-test setup image install-image prepare config docs docs-dev docs-clean musl-vscomm worker-netbsd clean
 
 DOCS_VENV := .venv-docs
 DOCS_MKDOCS := $(DOCS_VENV)/bin/mkdocs
 VSCOMM_TARGET := x86_64-unknown-linux-musl
+WORKER_TARGET ?= x86_64-unknown-netbsd
 IMAGE ?=
 OCI ?=
 
@@ -18,6 +19,7 @@ help:
 	@printf "  %-24s %s\n"    "Toolchain" ""
 	@printf "  %-24s %s\n"    "  ensure-toolchain" "Install/update Rust stable and musl target"
 	@printf "  %-24s %s\n"    "  musl-vscomm" "Build static vscomm binary only"
+	@printf "  %-24s %s\n"    "  worker-netbsd" "Build the portable worker for NetBSD"
 	@printf "  %-24s %s\n"    "" ""
 	@printf "  %-24s %s\n"    "Image" ""
 	@printf "  %-24s %s\n"    "  image" "Build OCI agent image (requires IMAGE=)"
@@ -43,6 +45,7 @@ ensure-toolchain:
 
 dev: ensure-toolchain
 	cargo build --bin bunkerbox --bin bunkerbox-image
+	cargo build -p bunkerbox-worker
 	cargo build --bin bunkerbox-netrelay --bin bunkerbox-vscomm --bin bunkerbox-remote --target $(VSCOMM_TARGET)
 	cargo build --bin bunkerbox-status --target $(VSCOMM_TARGET)
 	rm -rf target/dist
@@ -85,6 +88,9 @@ setup: dev
 musl-vscomm: ensure-toolchain
 	cargo build --bin bunkerbox-vscomm --bin bunkerbox-remote --target $(VSCOMM_TARGET)
 	cargo build --bin bunkerbox-status --target $(VSCOMM_TARGET)
+
+worker-netbsd:
+	cargo build -p bunkerbox-worker --target $(WORKER_TARGET) --release
 
 image: dev
 	@if [ -z "$(IMAGE)" ]; then echo "usage: make image IMAGE=images/name.conf" >&2; exit 1; fi

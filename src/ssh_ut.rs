@@ -5,7 +5,7 @@ use crate::remote::{
 };
 use crate::remote_target::RemoteTargetConfig;
 use crate::snapshot::{SnapshotBuilder, SnapshotExclusionPolicy, SnapshotLimits, SnapshotStore};
-use crate::worker_protocol::{self, WorkerErrorKind, WorkerMessage, WorkerOperation};
+use crate::worker_protocol::{self, WorkerErrorKind, WorkerMessage, WorkerOperation, WorkerSessionId, WorkerUploadEntry, WorkerUploadId};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -308,6 +308,15 @@ fn launch_spec_contains_only_fixed_trusted_ssh_arguments() {
     assert!(spec.args().contains(&"ControlMaster=no".to_string()));
     assert!(spec.args().contains(&"EscapeChar=none".to_string()));
     assert!(!spec.args().iter().any(|arg| arg == "-tt" || arg == "accept-new" || arg.contains("SSH_AUTH_SOCK")));
+}
+
+#[test]
+fn impossible_v1_uploads_fail_before_transport_spawn() {
+    let entries = (0..worker_protocol::MAX_WORKER_UPLOAD_ENTRIES + 1)
+        .map(|index| WorkerUploadEntry::directory(format!("d{index:04}"), 0o755).unwrap())
+        .collect::<Vec<_>>();
+    let error = preflight_upload([1; 16], WorkerSessionId([2; 16]), WorkerUploadId([3; 16]), &entries).unwrap_err();
+    assert!(matches!(error, RemoteBackendError::Transport { class: RemoteFailureClass::SnapshotTransfer, .. }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

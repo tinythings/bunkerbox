@@ -1,0 +1,16 @@
+[package]
+name = "bunkerbox-worker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bunkerbox-worker"
+path = "src/main.rs"
+
+[dependencies]
+bunkerbox-worker-protocol = { path = "../bunkerbox-worker-protocol", default-features = false }
+libc = "0.2"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

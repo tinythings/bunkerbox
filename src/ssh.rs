@@ -268,6 +268,19 @@ impl SshExecution {
             }
         };
         let upload_id = random_upload_id();
+        let entries = match export.entries().iter().map(worker_entry).collect::<Result<Vec<_>, _>>() {
+            Ok(entries) => entries,
+            Err(error) => {
+                drop(export);
+                let _ = self.session.abort_snapshot_capability(snapshot_id);
+                return Err(error);
+            }
+        };
+        if let Err(error) = preflight_upload(request_id, session_id_for(&self.session), upload_id, &entries) {
+            drop(export);
+            let _ = self.session.abort_snapshot_capability(snapshot_id);
+            return Err(error);
+        }
         let mut connection = match WorkerConnection::spawn(&self.factory, &self.target) {
             Ok(connection) => connection,
             Err(error) => {
@@ -276,8 +289,19 @@ impl SshExecution {
                 return Err(error);
             }
         };
-        let session_id = WorkerSessionId(self.session.session_id().0);
-        let operation = upload_and_finish(&mut connection, WorkerRequestId(request_id), session_id, upload_id, &export, &events, !retain_capability);
+        let session_id = session_id_for(&self.session);
+        let operation = upload_and_finish(
+            &mut connection,
+            UploadPlan {
+                request_id: WorkerRequestId(request_id),
+                session_id,
+                upload_id,
+                entries: &entries,
+                export: &export,
+                events: &events,
+                cleanup: !retain_capability,
+            },
+        );
         let result = match timeout(self.target.resources().sync_timeout(), operation).await {
             Ok(result) => result,
             Err(_) => {
@@ -478,14 +502,21 @@ impl Drop for WorkerConnection {
     }
 }
 
-async fn upload_and_finish(
-    connection: &mut WorkerConnection, request_id: WorkerRequestId, session_id: WorkerSessionId, upload_id: WorkerUploadId,
-    export: &SnapshotExportClaim, events: &tokio::sync::mpsc::Sender<RemoteBackendEvent>, cleanup: bool,
-) -> Result<(), RemoteBackendError> {
+struct UploadPlan<'a> {
+    request_id: WorkerRequestId,
+    session_id: WorkerSessionId,
+    upload_id: WorkerUploadId,
+    entries: &'a [WorkerUploadEntry],
+    export: &'a SnapshotExportClaim,
+    events: &'a tokio::sync::mpsc::Sender<RemoteBackendEvent>,
+    cleanup: bool,
+}
+
+async fn upload_and_finish(connection: &mut WorkerConnection, plan: UploadPlan<'_>) -> Result<(), RemoteBackendError> {
+    let UploadPlan { request_id, session_id, upload_id, entries, export, events, cleanup } = plan;
     connection.handshake(request_id, session_id).await?;
-    let entries = export.entries().iter().map(worker_entry).collect::<Result<Vec<_>, _>>()?;
     let total_bytes = export.total_file_bytes();
-    connection.write(&WorkerMessage::UploadBegin { request_id, session_id, upload_id, entries }).await?;
+    connection.write(&WorkerMessage::UploadBegin { request_id, session_id, upload_id, entries: entries.to_vec() }).await?;
     let mut completed_bytes = 0u64;
     for entry in export.entries() {
         if entry.kind() != SnapshotEntryKind::RegularFile {
@@ -590,6 +621,27 @@ fn worker_entry(entry: &crate::snapshot::SnapshotEntry) -> Result<WorkerUploadEn
         )
         .map_err(worker_io_error),
     }
+}
+
+fn preflight_upload(
+    request_id: [u8; 16], session_id: WorkerSessionId, upload_id: WorkerUploadId, entries: &[WorkerUploadEntry],
+) -> Result<(), RemoteBackendError> {
+    worker_protocol::validate_upload_manifest(entries).map_err(|error| upload_preflight_error(error.to_string()))?;
+    WorkerMessage::UploadBegin { request_id: WorkerRequestId(request_id), session_id, upload_id, entries: entries.to_vec() }
+        .encode()
+        .map_err(|error| upload_preflight_error(error.to_string()))?;
+    Ok(())
+}
+
+fn upload_preflight_error(message: String) -> RemoteBackendError {
+    RemoteBackendError::Transport {
+        class: RemoteFailureClass::SnapshotTransfer,
+        message: format!("snapshot cannot fit worker V1 upload protocol: {message}"),
+    }
+}
+
+fn session_id_for(session: &RunRemoteSession) -> WorkerSessionId {
+    WorkerSessionId(session.session_id().0)
 }
 
 fn check_correlation(

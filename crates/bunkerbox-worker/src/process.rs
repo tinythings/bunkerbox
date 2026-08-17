@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)]
 pub const WORKER_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 pub const WORKER_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 const OUTPUT_BUFFER_BYTES: usize = 8192;
@@ -81,6 +82,15 @@ impl JobWorkspace {
     pub fn root(&self) -> &File {
         &self.root
     }
+
+    pub fn create_with_reservation(parent: &File, reservation: storage::JobReservation) -> Result<Self, String> {
+        let job = Self::create(parent)?;
+        if let Err(error) = reservation.commit() {
+            drop(job);
+            return Err(error);
+        }
+        Ok(job)
+    }
 }
 
 impl Drop for JobWorkspace {
@@ -94,7 +104,7 @@ impl Drop for JobWorkspace {
 pub fn cleanup_stale_jobs(parent: &File) -> io::Result<()> {
     for lock_name in platform::list_names(parent)?.into_iter().take(MAX_STALE_JOBS) {
         let Some(name) = lock_name.strip_suffix(".lock") else { continue };
-        if !name.starts_with("job-") && !name.starts_with("artifact-") {
+        if !name.starts_with("job-") && !name.starts_with("artifact-") && !name.starts_with("reservation-job-") {
             continue;
         }
         let Ok(lock) = platform::open_lock_at(parent, &lock_name) else { continue };
@@ -106,8 +116,17 @@ pub fn cleanup_stale_jobs(parent: &File) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn execute_build<S: OutputSink>(
     job: &JobWorkspace, build: &WorkerBuild, request_id: WorkerRequestId, session_id: WorkerSessionId, sink: &S, disconnected: &dyn Fn() -> bool,
+) -> Result<i32, String> {
+    execute_build_with_limits(job, build, request_id, session_id, sink, disconnected, WORKER_BUILD_TIMEOUT, WORKER_MAX_OUTPUT_BYTES)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_build_with_limits<S: OutputSink>(
+    job: &JobWorkspace, build: &WorkerBuild, request_id: WorkerRequestId, session_id: WorkerSessionId, sink: &S, disconnected: &dyn Fn() -> bool,
+    build_timeout: Duration, max_output_bytes: u64,
 ) -> Result<i32, String> {
     validate_executable(build.trusted_executable_path())?;
     let cwd = storage::open_relative_directory(job.root(), build.cwd().as_str())?;
@@ -159,9 +178,9 @@ pub fn execute_build<S: OutputSink>(
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let (events_tx, events_rx) = mpsc::channel();
-    let stdout_thread = spawn_pump(stdout, StreamKind::Stdout, events_tx.clone(), stop.clone());
-    let stderr_thread = spawn_pump(stderr, StreamKind::Stderr, events_tx, stop.clone());
+    let (events_tx, events_rx) = mpsc::sync_channel(32);
+    let stdout_thread = spawn_pump(stdout, StreamKind::Stdout, events_tx.clone(), stop.clone(), max_output_bytes);
+    let stderr_thread = spawn_pump(stderr, StreamKind::Stderr, events_tx, stop.clone(), max_output_bytes);
 
     let started = Instant::now();
     let mut child_status = None;
@@ -180,7 +199,7 @@ pub fn execute_build<S: OutputSink>(
             group_killed = true;
             final_deadline = Some(Instant::now() + FINAL_DRAIN_TIMEOUT);
         }
-        if child_status.is_none() && failure.is_none() && started.elapsed() >= WORKER_BUILD_TIMEOUT {
+        if child_status.is_none() && failure.is_none() && started.elapsed() >= build_timeout {
             failure = Some("worker build timed out".to_string());
             kill_group(pgid);
             group_killed = true;
@@ -231,7 +250,7 @@ pub fn execute_build<S: OutputSink>(
                     continue;
                 }
                 output_total = output_total.saturating_add(bytes.len() as u64);
-                if output_total > WORKER_MAX_OUTPUT_BYTES {
+                if output_total > max_output_bytes {
                     failure = Some("worker combined output limit exceeded".to_string());
                     kill_group(pgid);
                     group_killed = true;
@@ -272,6 +291,7 @@ pub fn execute_build<S: OutputSink>(
     if !group_killed {
         kill_group(pgid);
     }
+    drop(events_rx);
     stop.store(true, Ordering::Release);
     let status = match child_status {
         Some(status) => status,
@@ -286,7 +306,7 @@ pub fn execute_build<S: OutputSink>(
 }
 
 fn spawn_pump<R: Read + Send + 'static>(
-    mut reader: R, stream: StreamKind, sender: mpsc::Sender<PumpEvent>, stop: Arc<AtomicBool>,
+    mut reader: R, stream: StreamKind, sender: mpsc::SyncSender<PumpEvent>, stop: Arc<AtomicBool>, max_output_bytes: u64,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0u8; OUTPUT_BUFFER_BYTES];
@@ -302,7 +322,7 @@ fn spawn_pump<R: Read + Send + 'static>(
                 }
                 Ok(count) => {
                     total = total.saturating_add(count as u64);
-                    if total > WORKER_MAX_OUTPUT_BYTES {
+                    if total > max_output_bytes {
                         let _ = sender.send(PumpEvent::Failed(stream, "worker output limit exceeded".to_string()));
                         return;
                     }

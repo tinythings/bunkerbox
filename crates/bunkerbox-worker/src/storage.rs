@@ -19,6 +19,7 @@ const MANIFEST_FILE: &str = "manifest";
 const COMPLETE_FILE: &str = "complete";
 const LOCK_FILE: &str = "lock";
 const FILES_DIRECTORY: &str = "files";
+const QUOTA_LOCK_FILE: &str = "quota.lock";
 const MANIFEST_MAGIC: [u8; 4] = *b"BBWM";
 const MANIFEST_VERSION: u16 = 1;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -27,17 +28,99 @@ const MAX_STALE_UPLOADS_PER_SESSION: usize = 256;
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerStateLimits {
+    pub max_uploads: usize,
+    pub max_upload_bytes: u64,
+    pub max_jobs: usize,
+    pub max_job_bytes: u64,
+    pub max_artifact_spools: usize,
+    pub max_artifact_spool_bytes: u64,
+    pub max_state_entries: usize,
+}
+
+impl Default for WorkerStateLimits {
+    fn default() -> Self {
+        Self {
+            max_uploads: 2,
+            max_upload_bytes: 1024 * 1024 * 1024,
+            max_jobs: 1,
+            max_job_bytes: 512 * 1024 * 1024,
+            max_artifact_spools: 1,
+            max_artifact_spool_bytes: 512 * 1024 * 1024,
+            max_state_entries: 20_000,
+        }
+    }
+}
+
+impl WorkerStateLimits {
+    pub const MAX_COUNT: usize = 1_000;
+    pub const MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+    pub const MAX_ENTRIES: usize = 1_000_000;
+
+    pub fn validate(self) -> Result<(), String> {
+        if self.max_uploads == 0
+            || self.max_jobs == 0
+            || self.max_artifact_spools == 0
+            || self.max_uploads > Self::MAX_COUNT
+            || self.max_jobs > Self::MAX_COUNT
+            || self.max_artifact_spools > Self::MAX_COUNT
+        {
+            return Err(format!("worker state counts must be between 1 and {}", Self::MAX_COUNT));
+        }
+        if self.max_upload_bytes == 0
+            || self.max_job_bytes == 0
+            || self.max_artifact_spool_bytes == 0
+            || self.max_upload_bytes > Self::MAX_BYTES
+            || self.max_job_bytes > Self::MAX_BYTES
+            || self.max_artifact_spool_bytes > Self::MAX_BYTES
+        {
+            return Err(format!("worker state byte limits must be between 1 and {}", Self::MAX_BYTES));
+        }
+        if self.max_state_entries == 0 || self.max_state_entries > Self::MAX_ENTRIES {
+            return Err(format!("worker state entry limit must be between 1 and {}", Self::MAX_ENTRIES));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct StateUsage {
+    uploads: usize,
+    upload_bytes: u64,
+    jobs: usize,
+    job_bytes: u64,
+    artifact_spools: usize,
+    artifact_spool_bytes: u64,
+    entries: usize,
+}
+
 pub struct UploadStore {
     sessions: File,
     jobs: File,
+    quota_lock: File,
+    limits: WorkerStateLimits,
 }
 
 impl UploadStore {
+    #[allow(dead_code)]
     pub fn new(root: &File) -> Result<Self, String> {
+        Self::new_with_limits(root, WorkerStateLimits::default())
+    }
+
+    pub fn new_with_limits(root: &File, limits: WorkerStateLimits) -> Result<Self, String> {
+        limits.validate()?;
         let state = private_directory(root, STATE_DIRECTORY)?;
         let sessions = private_directory(&state, SESSIONS_DIRECTORY)?;
         let jobs = private_directory(&state, JOBS_DIRECTORY)?;
-        let store = Self { sessions, jobs };
+        let quota_lock = match platform::create_file_at(&state, QUOTA_LOCK_FILE, 0o600) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                platform::open_lock_at(&state, QUOTA_LOCK_FILE).map_err(|error| format!("open worker quota lock: {error}"))?
+            }
+            Err(error) => return Err(format!("create worker quota lock: {error}")),
+        };
+        let store = Self { sessions, jobs, quota_lock, limits };
         store.cleanup_stale().map_err(|error| format!("clean stale worker state: {error}"))?;
         Ok(store)
     }
@@ -49,6 +132,11 @@ impl UploadStore {
         require_nonzero_id(upload_id.0, "worker upload")?;
         validate_upload_manifest(&entries).map_err(protocol_error)?;
         validate_manifest_structure(&entries)?;
+
+        let requested_bytes = manifest_file_bytes(&entries)?;
+        let _quota = self.acquire_quota_lock()?;
+        let usage = self.state_usage()?;
+        self.check_upload_quota(&usage, requested_bytes, entries.len())?;
 
         let session = private_directory(&self.sessions, &hex_id(session_id.0))?;
         let uploads = private_directory(&session, UPLOADS_DIRECTORY)?;
@@ -125,12 +213,20 @@ impl UploadStore {
             return Err("worker upload identity mismatch".to_string());
         }
         let files = open_existing_private_directory(&token, FILES_DIRECTORY, "worker upload files")?;
-        Ok(StoredUpload { token, lock, files, entries: manifest.entries })
+        Ok(StoredUpload {
+            uploads: uploads.try_clone().map_err(|error| format!("clone worker uploads directory: {error}"))?,
+            token_name,
+            token,
+            lock,
+            files,
+            entries: manifest.entries,
+        })
     }
 
     pub fn cleanup(&self, session_id: WorkerSessionId, upload_id: WorkerUploadId) -> Result<(), String> {
         require_nonzero_id(session_id.0, "worker session")?;
         require_nonzero_id(upload_id.0, "worker upload")?;
+        let _quota = self.acquire_quota_lock()?;
         let session = open_existing_private_directory(&self.sessions, &hex_id(session_id.0), "worker session")?;
         let uploads = open_existing_private_directory(&session, UPLOADS_DIRECTORY, "worker uploads")?;
         let token_name = hex_id(upload_id.0);
@@ -144,6 +240,186 @@ impl UploadStore {
 
     pub fn jobs_directory(&self) -> Result<File, String> {
         self.jobs.try_clone().map_err(|error| format!("clone worker jobs directory: {error}"))
+    }
+
+    pub fn reserve_job(&self, bytes: u64, entries: usize) -> Result<JobReservation, String> {
+        let _quota = self.acquire_quota_lock()?;
+        let usage = self.state_usage()?;
+        if usage.jobs.saturating_add(1) > self.limits.max_jobs {
+            return Err("worker job quota exceeded".to_string());
+        }
+        if usage.job_bytes.saturating_add(bytes) > self.limits.max_job_bytes {
+            return Err("worker job byte quota exceeded".to_string());
+        }
+        if usage.entries.saturating_add(entries) > self.limits.max_state_entries {
+            return Err("worker state entry quota exceeded".to_string());
+        }
+        for _ in 0..32 {
+            let name = format!("reservation-job-{bytes}-{entries}-{}-{}.lock", unsafe { libc::getpid() }, next_job_id());
+            let marker = match platform::create_file_at(&self.jobs, &name, 0o600) {
+                Ok(marker) => marker,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("reserve worker job quota: {error}")),
+            };
+            if !platform::lock_exclusive(&marker).map_err(|error| format!("lock worker job quota: {error}"))? {
+                let _ = platform::unlink_at(&self.jobs, &name, 0);
+                continue;
+            }
+            return Ok(JobReservation {
+                parent: self.jobs.try_clone().map_err(|error| format!("clone worker jobs directory: {error}"))?,
+                name,
+                marker,
+                committed: false,
+            });
+        }
+        Err("could not reserve worker job quota".to_string())
+    }
+
+    pub fn validate_job(&self, job: &File) -> Result<(), String> {
+        let usage = walk_tree(job)?;
+        if usage.bytes > self.limits.max_job_bytes {
+            return Err("worker job exceeded its byte quota".to_string());
+        }
+        if usage.entries > self.limits.max_state_entries {
+            return Err("worker job exceeded the state entry quota".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn capture_artifacts_with_interrupt(
+        &self, job_root: &File, paths: &[WorkerArtifactPath], max_file_bytes: u64, max_total_bytes: u64, disconnected: &dyn Fn() -> bool,
+    ) -> Result<ArtifactSpool, String> {
+        ArtifactSpool::capture_with_store(self, job_root, paths, max_file_bytes, max_total_bytes, disconnected)
+    }
+
+    fn acquire_quota_lock(&self) -> Result<File, String> {
+        let lock = self.quota_lock.try_clone().map_err(|error| format!("clone worker quota lock: {error}"))?;
+        for _ in 0..5000 {
+            if platform::lock_exclusive(&lock).map_err(|error| format!("lock worker quota: {error}"))? {
+                return Ok(lock);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Err("worker state quota lock timed out".to_string())
+    }
+
+    fn check_upload_quota(&self, usage: &StateUsage, bytes: u64, entries: usize) -> Result<(), String> {
+        if usage.uploads.saturating_add(1) > self.limits.max_uploads {
+            return Err("worker upload quota exceeded".to_string());
+        }
+        if usage.upload_bytes.saturating_add(bytes) > self.limits.max_upload_bytes {
+            return Err("worker upload byte quota exceeded".to_string());
+        }
+        if usage.entries.saturating_add(entries) > self.limits.max_state_entries {
+            return Err("worker state entry quota exceeded".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_current_usage(&self) -> Result<(), String> {
+        let usage = self.state_usage()?;
+        if usage.uploads > self.limits.max_uploads || usage.upload_bytes > self.limits.max_upload_bytes {
+            return Err("worker upload quota exceeded".to_string());
+        }
+        if usage.jobs > self.limits.max_jobs || usage.job_bytes > self.limits.max_job_bytes {
+            return Err("worker job quota exceeded".to_string());
+        }
+        if usage.artifact_spools > self.limits.max_artifact_spools || usage.artifact_spool_bytes > self.limits.max_artifact_spool_bytes {
+            return Err("worker artifact spool quota exceeded".to_string());
+        }
+        if usage.entries > self.limits.max_state_entries {
+            return Err("worker state entry quota exceeded".to_string());
+        }
+        Ok(())
+    }
+
+    fn state_usage(&self) -> Result<StateUsage, String> {
+        let mut usage = StateUsage::default();
+        for session_name in platform::list_names(&self.sessions).map_err(|error| format!("list worker sessions: {error}"))? {
+            if !is_hex_id(&session_name) {
+                continue;
+            }
+            let Ok(session) = platform::open_dir_at(&self.sessions, &session_name) else { continue };
+            let Ok(uploads) = platform::open_dir_at(&session, UPLOADS_DIRECTORY) else { continue };
+            for upload_name in platform::list_names(&uploads).map_err(|error| format!("list worker uploads: {error}"))? {
+                if !is_hex_id(&upload_name) {
+                    continue;
+                }
+                usage.uploads = usage.uploads.saturating_add(1);
+                let Ok(upload) = platform::open_dir_at(&uploads, &upload_name) else { continue };
+                if let Ok(manifest_file) = platform::open_file_at(&upload, MANIFEST_FILE) {
+                    if let Ok(manifest) = StoredManifest::read(manifest_file) {
+                        usage.upload_bytes = usage.upload_bytes.saturating_add(manifest_file_bytes(&manifest.entries)?);
+                        usage.entries = usage.entries.saturating_add(manifest.entries.len());
+                    }
+                }
+            }
+        }
+        for name in platform::list_names(&self.jobs).map_err(|error| format!("list worker jobs: {error}"))? {
+            if let Some((bytes, entries)) = reservation_name(&name, "reservation-job-") {
+                usage.jobs = usage.jobs.saturating_add(1);
+                usage.job_bytes = usage.job_bytes.saturating_add(bytes);
+                usage.entries = usage.entries.saturating_add(entries);
+                continue;
+            }
+            if name.ends_with(".lock") {
+                continue;
+            }
+            if name.starts_with("job-") {
+                usage.jobs = usage.jobs.saturating_add(1);
+                if let Ok(job) = platform::open_dir_at(&self.jobs, &name) {
+                    let tree = walk_tree(&job)?;
+                    usage.job_bytes = usage.job_bytes.saturating_add(tree.bytes);
+                    usage.entries = usage.entries.saturating_add(tree.entries);
+                }
+            } else if name.starts_with("artifact-") {
+                usage.artifact_spools = usage.artifact_spools.saturating_add(1);
+                if let Ok(spool) = platform::open_dir_at(&self.jobs, &name) {
+                    let tree = walk_tree(&spool)?;
+                    let (reserved_bytes, reserved_entries) = artifact_reservation_name(&name).unwrap_or((0, 0));
+                    usage.artifact_spool_bytes = usage.artifact_spool_bytes.saturating_add(tree.bytes.max(reserved_bytes));
+                    usage.entries = usage.entries.saturating_add(tree.entries.max(reserved_entries));
+                }
+            }
+        }
+        Ok(usage)
+    }
+
+    fn reserve_artifact_root(&self, bytes: u64, entries: usize) -> Result<(File, String, String, File, File), String> {
+        let _quota = self.acquire_quota_lock()?;
+        let usage = self.state_usage()?;
+        if usage.artifact_spools.saturating_add(1) > self.limits.max_artifact_spools {
+            return Err("worker artifact spool quota exceeded".to_string());
+        }
+        if usage.artifact_spool_bytes.saturating_add(bytes) > self.limits.max_artifact_spool_bytes {
+            return Err("worker artifact spool byte quota exceeded".to_string());
+        }
+        if usage.entries.saturating_add(entries) > self.limits.max_state_entries {
+            return Err("worker state entry quota exceeded".to_string());
+        }
+        for _ in 0..32 {
+            let name = format!("artifact-{}-{}-{bytes}-{entries}", unsafe { libc::getpid() }, next_job_id());
+            let lock_name = format!("{name}.lock");
+            let lock = match platform::create_file_at(&self.jobs, &lock_name, 0o600) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("create worker artifact lock: {error}")),
+            };
+            if !platform::lock_exclusive(&lock).map_err(|error| format!("lock worker artifact spool: {error}"))? {
+                let _ = platform::unlink_at(&self.jobs, &lock_name, 0);
+                continue;
+            }
+            if let Err(error) = platform::create_dir_at(&self.jobs, &name, 0o700) {
+                let _ = platform::unlink_at(&self.jobs, &lock_name, 0);
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(format!("create worker artifact spool: {error}"));
+            }
+            let root = platform::open_dir_at(&self.jobs, &name).map_err(|error| format!("open worker artifact spool: {error}"))?;
+            return Ok((self.jobs.try_clone().map_err(|error| format!("clone worker jobs directory: {error}"))?, name, lock_name, lock, root));
+        }
+        Err("could not reserve a worker artifact spool".to_string())
     }
 
     fn cleanup_stale(&self) -> io::Result<()> {
@@ -169,6 +445,31 @@ impl UploadStore {
             }
         }
         Ok(())
+    }
+}
+
+pub struct JobReservation {
+    parent: File,
+    name: String,
+    marker: File,
+    committed: bool,
+}
+
+impl JobReservation {
+    pub fn commit(mut self) -> Result<(), String> {
+        platform::unlink_at(&self.parent, &self.name, 0).map_err(|error| format!("release worker job reservation: {error}"))?;
+        self.committed = true;
+        let _ = &self.marker;
+        Ok(())
+    }
+}
+
+impl Drop for JobReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = &self.marker;
+            let _ = platform::unlink_at(&self.parent, &self.name, 0);
+        }
     }
 }
 
@@ -267,16 +568,33 @@ impl Drop for UploadTransaction {
 }
 
 pub struct StoredUpload {
+    uploads: File,
+    token_name: String,
     token: File,
     lock: File,
     files: File,
     entries: Vec<WorkerUploadEntry>,
 }
 
+impl Drop for StoredUpload {
+    fn drop(&mut self) {
+        let _ = (&self.token, &self.lock, &self.files);
+        let _ = platform::remove_tree_at(&self.uploads, &self.token_name);
+    }
+}
+
 impl StoredUpload {
+    #[allow(dead_code)]
     pub fn materialize(&self, destination: &File) -> Result<(), String> {
+        self.materialize_with_interrupt(destination, &|| false)
+    }
+
+    pub fn materialize_with_interrupt(&self, destination: &File, disconnected: &dyn Fn() -> bool) -> Result<(), String> {
         let _ = (&self.token, &self.lock);
         for entry in &self.entries {
+            if disconnected() {
+                return Err("worker input disconnected during materialization".to_string());
+            }
             match entry.kind() {
                 WorkerEntryKind::Directory => ensure_directory(destination, entry.path().as_str(), entry.mode())?,
                 WorkerEntryKind::File => {
@@ -284,18 +602,27 @@ impl StoredUpload {
                     let source_metadata = platform::stat_fd(source.as_raw_fd()).map_err(|error| format!("stat stored worker file: {error}"))?;
                     validate_regular_file(&source_metadata, entry.size(), entry.mode(), entry.path().as_str())?;
                     let target = create_relative_file(destination, entry.path().as_str(), entry.mode())?;
-                    copy_and_verify(&source, &target, entry)?;
+                    copy_and_verify_with_interrupt(&source, &target, entry, disconnected)?;
                 }
             }
         }
         platform::sync_fd(destination).map_err(|error| format!("flush worker job workspace: {error}"))?;
         Ok(())
     }
+
+    pub fn declared_bytes(&self) -> Result<u64, String> {
+        manifest_file_bytes(&self.entries)
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 pub struct ArtifactSpool {
     parent: File,
     name: String,
+    lock_name: String,
     root: File,
     lock: File,
     files: File,
@@ -305,19 +632,37 @@ pub struct ArtifactSpool {
 }
 
 impl ArtifactSpool {
-    pub fn capture(parent: &File, job_root: &File, paths: &[WorkerArtifactPath], max_file_bytes: u64, max_total_bytes: u64) -> Result<Self, String> {
+    fn capture_with_store(
+        store: &UploadStore, job_root: &File, paths: &[WorkerArtifactPath], max_file_bytes: u64, max_total_bytes: u64,
+        disconnected: &dyn Fn() -> bool,
+    ) -> Result<Self, String> {
+        let reserved_entries = paths.len().saturating_add(2);
+        let (parent, name, lock_name, lock, root) = store.reserve_artifact_root(max_total_bytes, reserved_entries)?;
+        let spool = Self::capture_reserved(parent, name, lock_name, lock, root, job_root, paths, max_file_bytes, max_total_bytes, disconnected)?;
+        let _quota = store.acquire_quota_lock()?;
+        if let Err(error) = store.validate_current_usage() {
+            drop(spool);
+            return Err(error);
+        }
+        Ok(spool)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_reserved(
+        parent: File, name: String, lock_name: String, lock: File, root: File, job_root: &File, paths: &[WorkerArtifactPath], max_file_bytes: u64,
+        max_total_bytes: u64, disconnected: &dyn Fn() -> bool,
+    ) -> Result<Self, String> {
         if max_file_bytes == 0 || max_file_bytes > MAX_WORKER_ARTIFACT_FILE_BYTES {
             return Err("worker artifact per-file limit is invalid".to_string());
         }
         if max_total_bytes == 0 || max_total_bytes > MAX_WORKER_ARTIFACT_TOTAL_BYTES {
             return Err("worker artifact total limit is invalid".to_string());
         }
-        let (name, lock_name, lock, root) = reserve_artifact_root(parent)?;
         let files = match private_directory(&root, FILES_DIRECTORY) {
             Ok(files) => files,
             Err(error) => {
-                let _ = platform::remove_tree_at(parent, &name);
-                let _ = platform::unlink_at(parent, &lock_name, 0);
+                let _ = platform::remove_tree_at(&parent, &name);
+                let _ = platform::unlink_at(&parent, &lock_name, 0);
                 return Err(error);
             }
         };
@@ -326,6 +671,9 @@ impl ArtifactSpool {
             let mut entries = Vec::with_capacity(paths.len());
             let mut total_bytes = 0u64;
             for path in paths {
+                if disconnected() {
+                    return Err("worker input disconnected during artifact capture".to_string());
+                }
                 let source = open_relative_file(job_root, path.as_str())?;
                 let before = platform::stat_fd(source.as_raw_fd()).map_err(|error| format!("stat worker artifact {}: {error}", path.as_str()))?;
                 validate_artifact_source(&before, path.as_str())?;
@@ -342,7 +690,7 @@ impl ArtifactSpool {
                     ensure_directory(&files, parents, 0o700)?;
                 }
                 let destination = create_relative_file(&files, path.as_str(), mode)?;
-                let digest = copy_artifact(&source, &destination, size, path.as_str())?;
+                let digest = copy_artifact_with_interrupt(&source, &destination, size, path.as_str(), disconnected)?;
                 let after = platform::stat_fd(source.as_raw_fd()).map_err(|error| format!("restat worker artifact {}: {error}", path.as_str()))?;
                 if after.st_dev != before.st_dev
                     || after.st_ino != before.st_ino
@@ -359,19 +707,12 @@ impl ArtifactSpool {
         })();
 
         match result {
-            Ok((artifact_set_id, entries, total_bytes)) => Ok(Self {
-                parent: parent.try_clone().map_err(|error| format!("clone worker jobs directory: {error}"))?,
-                name,
-                root,
-                lock,
-                files,
-                artifact_set_id,
-                entries,
-                total_bytes,
-            }),
+            Ok((artifact_set_id, entries, total_bytes)) => {
+                Ok(Self { parent, name, lock_name, root, lock, files, artifact_set_id, entries, total_bytes })
+            }
             Err(error) => {
-                let _ = platform::remove_tree_at(parent, &name);
-                let _ = platform::unlink_at(parent, &lock_name, 0);
+                let _ = platform::remove_tree_at(&parent, &name);
+                let _ = platform::unlink_at(&parent, &lock_name, 0);
                 Err(error)
             }
         }
@@ -402,6 +743,7 @@ impl Drop for ArtifactSpool {
     fn drop(&mut self) {
         let _ = (&self.root, &self.lock, &self.files);
         let _ = platform::remove_tree_at(&self.parent, &self.name);
+        let _ = platform::unlink_at(&self.parent, &self.lock_name, 0);
     }
 }
 
@@ -554,44 +896,6 @@ fn private_directory(parent: &File, name: &str) -> Result<File, String> {
     Ok(directory)
 }
 
-fn reserve_artifact_root(parent: &File) -> Result<(String, String, File, File), String> {
-    for _ in 0..32 {
-        let name = format!("artifact-{}-{}", unsafe { libc::getpid() }, next_job_id());
-        let lock_name = format!("{name}.lock");
-        let lock = match platform::create_file_at(parent, &lock_name, 0o600) {
-            Ok(lock) => lock,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("create worker artifact lock: {error}")),
-        };
-        if !platform::lock_exclusive(&lock).map_err(|error| format!("lock worker artifact spool: {error}"))? {
-            let _ = platform::unlink_at(parent, &lock_name, 0);
-            continue;
-        }
-        if let Err(error) = platform::create_dir_at(parent, &name, 0o700) {
-            let _ = platform::unlink_at(parent, &lock_name, 0);
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                continue;
-            }
-            return Err(format!("create worker artifact spool: {error}"));
-        }
-        let root = match platform::open_dir_at(parent, &name) {
-            Ok(root) => root,
-            Err(error) => {
-                let _ = platform::remove_tree_at(parent, &name);
-                let _ = platform::unlink_at(parent, &lock_name, 0);
-                return Err(format!("open worker artifact spool: {error}"));
-            }
-        };
-        if let Err(error) = platform::validate_private_directory(&root, "worker artifact spool") {
-            let _ = platform::remove_tree_at(parent, &name);
-            let _ = platform::unlink_at(parent, &lock_name, 0);
-            return Err(error);
-        }
-        return Ok((name, lock_name, lock, root));
-    }
-    Err("could not reserve a worker artifact spool".to_string())
-}
-
 fn validate_artifact_source(metadata: &libc::stat, path: &str) -> Result<(), String> {
     if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_nlink != 1 {
         return Err(format!("worker artifact is not a private regular file: {path}"));
@@ -602,13 +906,18 @@ fn validate_artifact_source(metadata: &libc::stat, path: &str) -> Result<(), Str
     Ok(())
 }
 
-fn copy_artifact(source: &File, destination: &File, expected_size: u64, path: &str) -> Result<WorkerDigest, String> {
+fn copy_artifact_with_interrupt(
+    source: &File, destination: &File, expected_size: u64, path: &str, disconnected: &dyn Fn() -> bool,
+) -> Result<WorkerDigest, String> {
     let mut source = source.try_clone().map_err(|error| format!("clone worker artifact {path}: {error}"))?;
     let mut destination = destination.try_clone().map_err(|error| format!("clone worker artifact spool {path}: {error}"))?;
     let mut hasher = Sha256::new();
     let mut copied = 0u64;
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     loop {
+        if disconnected() {
+            return Err(format!("worker input disconnected during artifact capture: {path}"));
+        }
         let count = source.read(&mut buffer).map_err(|error| format!("read worker artifact {path}: {error}"))?;
         if count == 0 {
             break;
@@ -735,13 +1044,23 @@ fn validate_manifest_structure(entries: &[WorkerUploadEntry]) -> Result<(), Stri
     Ok(())
 }
 
+#[allow(dead_code)]
 fn copy_and_verify(source: &File, destination: &File, entry: &WorkerUploadEntry) -> Result<(), String> {
+    copy_and_verify_with_interrupt(source, destination, entry, &|| false)
+}
+
+fn copy_and_verify_with_interrupt(
+    source: &File, destination: &File, entry: &WorkerUploadEntry, disconnected: &dyn Fn() -> bool,
+) -> Result<(), String> {
     let mut source = source.try_clone().map_err(|error| format!("clone stored worker file: {error}"))?;
     let mut destination = destination.try_clone().map_err(|error| format!("clone materialized worker file: {error}"))?;
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     let mut hasher = Sha256::new();
     let mut copied = 0u64;
     loop {
+        if disconnected() {
+            return Err("worker input disconnected during materialization".to_string());
+        }
         let count = source.read(&mut buffer).map_err(|error| format!("read stored worker file: {error}"))?;
         if count == 0 {
             break;
@@ -782,6 +1101,62 @@ fn read_bounded(mut file: File, maximum: usize) -> Result<Vec<u8>, String> {
         return Err("worker state exceeds its maximum length".to_string());
     }
     Ok(bytes)
+}
+
+fn manifest_file_bytes(entries: &[WorkerUploadEntry]) -> Result<u64, String> {
+    entries
+        .iter()
+        .filter(|entry| entry.kind() == WorkerEntryKind::File)
+        .try_fold(0u64, |total, entry| total.checked_add(entry.size()).ok_or_else(|| "worker manifest byte total overflow".to_string()))
+}
+
+#[derive(Default)]
+struct TreeUsage {
+    bytes: u64,
+    entries: usize,
+}
+
+fn walk_tree(directory: &File) -> Result<TreeUsage, String> {
+    let mut usage = TreeUsage::default();
+    for name in platform::list_names(directory).map_err(|error| format!("list worker state: {error}"))? {
+        let metadata = platform::stat_at(directory, &name).map_err(|error| format!("stat worker state entry: {error}"))?;
+        match metadata.st_mode & libc::S_IFMT {
+            mode if mode == libc::S_IFDIR => {
+                usage.entries = usage.entries.saturating_add(1);
+                let child = platform::open_dir_at(directory, &name).map_err(|error| format!("open worker state directory: {error}"))?;
+                let child_usage = walk_tree(&child)?;
+                usage.bytes = usage.bytes.saturating_add(child_usage.bytes);
+                usage.entries = usage.entries.saturating_add(child_usage.entries);
+            }
+            mode if mode == libc::S_IFREG => {
+                usage.entries = usage.entries.saturating_add(1);
+                if metadata.st_size < 0 {
+                    return Err("worker state file has a negative size".to_string());
+                }
+                usage.bytes = usage.bytes.saturating_add(metadata.st_size as u64);
+            }
+            _ => return Err(format!("worker state contains an unsupported file type: {name}")),
+        }
+    }
+    Ok(usage)
+}
+
+fn reservation_name(name: &str, prefix: &str) -> Option<(u64, usize)> {
+    let value = name.strip_prefix(prefix)?.trim_end_matches(".lock");
+    let mut parts = value.split('-');
+    let bytes = parts.next()?.parse().ok()?;
+    let entries = parts.next()?.parse().ok()?;
+    Some((bytes, entries))
+}
+
+fn artifact_reservation_name(name: &str) -> Option<(u64, usize)> {
+    let value = name.strip_prefix("artifact-")?;
+    let mut parts = value.split('-');
+    let _pid = parts.next()?.parse::<u64>().ok()?;
+    let _id = parts.next()?.parse::<u64>().ok()?;
+    let bytes = parts.next()?.parse().ok()?;
+    let entries = parts.next()?.parse().ok()?;
+    Some((bytes, entries))
 }
 
 fn put_u32(bytes: &mut Vec<u8>, value: usize) -> Result<(), String> {

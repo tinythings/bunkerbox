@@ -147,6 +147,7 @@ pub fn list_names(directory: &File) -> io::Result<Vec<String>> {
         unsafe { libc::close(duplicate) };
         return Err(io::Error::last_os_error());
     }
+    unsafe { libc::rewinddir(stream) };
     let mut names = Vec::new();
     loop {
         let entry = unsafe { libc::readdir(stream) };

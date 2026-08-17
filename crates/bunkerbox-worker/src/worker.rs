@@ -42,14 +42,33 @@ impl<W: Write + Send> OutputSink for FrameWriter<W> {
 
 pub struct WorkerService {
     store: UploadStore,
+    build_timeout: std::time::Duration,
+    max_output_bytes: u64,
 }
 
 impl WorkerService {
+    #[allow(dead_code)]
     pub fn new(root: &std::fs::File) -> Result<Self, String> {
-        let store = UploadStore::new(root)?;
+        Self::new_with_limits(root, crate::storage::WorkerStateLimits::default(), process::WORKER_BUILD_TIMEOUT)
+    }
+
+    #[allow(dead_code)]
+    pub fn new_with_limits(
+        root: &std::fs::File, limits: crate::storage::WorkerStateLimits, build_timeout: std::time::Duration,
+    ) -> Result<Self, String> {
+        Self::new_with_config(root, limits, build_timeout, process::WORKER_MAX_OUTPUT_BYTES)
+    }
+
+    pub fn new_with_config(
+        root: &std::fs::File, limits: crate::storage::WorkerStateLimits, build_timeout: std::time::Duration, max_output_bytes: u64,
+    ) -> Result<Self, String> {
+        if max_output_bytes == 0 || max_output_bytes > process::WORKER_MAX_OUTPUT_BYTES {
+            return Err(format!("worker output limit must be between 1 and {}", process::WORKER_MAX_OUTPUT_BYTES));
+        }
+        let store = UploadStore::new_with_limits(root, limits)?;
         let jobs = store.jobs_directory()?;
         process::cleanup_stale_jobs(&jobs).map_err(|error| format!("clean stale worker jobs: {error}"))?;
-        Ok(Self { store })
+        Ok(Self { store, build_timeout, max_output_bytes })
     }
 
     pub fn run<R: Read + Send + 'static, W: Write + Send>(&self, input: R, writer: &FrameWriter<W>) -> Result<(), String> {
@@ -196,27 +215,56 @@ impl WorkerService {
             }
         };
         let jobs = self.store.jobs_directory()?;
-        let job = match JobWorkspace::create(&jobs) {
+        let reservation = match self.store.reserve_job(upload.declared_bytes()?, upload.entry_count()) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                send_error(writer, request_id, session_id, WorkerOperation::Build, WorkerErrorKind::Build, &error)?;
+                return Ok(());
+            }
+        };
+        let job = match JobWorkspace::create_with_reservation(&jobs, reservation) {
             Ok(job) => job,
             Err(error) => {
                 send_error(writer, request_id, session_id, WorkerOperation::Build, WorkerErrorKind::Build, &error)?;
                 return Ok(());
             }
         };
-        if let Err(error) = upload.materialize(job.root()) {
+        if let Err(error) = upload.materialize_with_interrupt(job.root(), &|| input.disconnected()) {
             send_error(writer, request_id, session_id, WorkerOperation::Upload, WorkerErrorKind::Upload, &error)?;
             return Ok(());
         }
-        let exit_code = match process::execute_build(&job, &build, request_id, session_id, writer, &|| input.disconnected()) {
+        let exit_code = match process::execute_build_with_limits(
+            &job,
+            &build,
+            request_id,
+            session_id,
+            writer,
+            &|| input.disconnected(),
+            self.build_timeout,
+            self.max_output_bytes,
+        ) {
             Ok(exit_code) => exit_code,
             Err(error) => {
                 send_error(writer, request_id, session_id, WorkerOperation::Build, WorkerErrorKind::Build, &error)?;
                 return Ok(());
             }
         };
+        if let Err(error) = self.store.validate_job(job.root()) {
+            send_error(writer, request_id, session_id, WorkerOperation::Build, WorkerErrorKind::Build, &error)?;
+            return self.wait_for_cleanup(
+                input,
+                writer,
+                BuildCleanup { request_id, session_id, upload_token: build.upload_token(), protocol_version },
+            );
+        }
         let artifact_spool = if exit_code == 0 && !build.artifact_paths().is_empty() {
-            match ArtifactSpool::capture(&jobs, job.root(), build.artifact_paths(), build.artifact_max_file_bytes(), build.artifact_max_total_bytes())
-            {
+            match self.store.capture_artifacts_with_interrupt(
+                job.root(),
+                build.artifact_paths(),
+                build.artifact_max_file_bytes(),
+                build.artifact_max_total_bytes(),
+                &|| input.disconnected(),
+            ) {
                 Ok(spool) => Some(spool),
                 Err(error) => {
                     send_error(writer, request_id, session_id, WorkerOperation::Artifact, WorkerErrorKind::Artifact, &error)?;
@@ -441,9 +489,11 @@ fn truncate_message(message: &str) -> &str {
     &message[..end]
 }
 
-pub fn run_stdio(root: &std::path::Path) -> Result<(), String> {
+pub fn run_stdio_with_config(
+    root: &std::path::Path, limits: crate::storage::WorkerStateLimits, build_timeout: std::time::Duration, max_output_bytes: u64,
+) -> Result<(), String> {
     let root = crate::platform::open_root(root)?;
-    let service = WorkerService::new(&root)?;
+    let service = WorkerService::new_with_config(&root, limits, build_timeout, max_output_bytes)?;
     let stdin = io::stdin();
     let input = stdin;
     let writer = Arc::new(FrameWriter::new(io::stdout()));

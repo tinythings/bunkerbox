@@ -21,6 +21,16 @@ fn store_fixture() -> (TempDir, UploadStore) {
     (temp, store)
 }
 
+fn limited_store(limits: WorkerStateLimits) -> (TempDir, UploadStore) {
+    let temp = tempdir().unwrap();
+    let root_path = temp.path().join("root");
+    fs::create_dir(&root_path).unwrap();
+    fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let root = platform::open_root(&root_path).unwrap();
+    let store = UploadStore::new_with_limits(&root, limits).unwrap();
+    (temp, store)
+}
+
 fn entries(contents: &[u8]) -> Vec<WorkerUploadEntry> {
     vec![
         WorkerUploadEntry::directory("src", 0o755).unwrap(),
@@ -101,4 +111,25 @@ fn replaced_stored_file_symlink_is_rejected_during_materialization() {
 #[test]
 fn unsupported_entry_kind_is_not_accepted_by_the_manifest_constructor() {
     assert!(WorkerUploadEntry::new("node", WorkerEntryKind::Directory, 0o755, 1, None).is_err());
+}
+
+#[test]
+fn live_upload_reservation_enforces_count_and_releases_on_drop() {
+    let limits = WorkerStateLimits { max_uploads: 1, ..WorkerStateLimits::default() };
+    let (_temp, store) = limited_store(limits);
+    let contents = b"stored";
+    let transaction = store.begin(SESSION, UPLOAD, entries(contents)).unwrap();
+    assert!(store.begin(WorkerSessionId([3; 16]), WorkerUploadId([4; 16]), entries(contents)).is_err());
+    drop(transaction);
+    assert!(store.begin(WorkerSessionId([3; 16]), WorkerUploadId([4; 16]), entries(contents)).is_ok());
+}
+
+#[test]
+fn live_job_reservation_enforces_bytes_and_releases_on_drop() {
+    let limits = WorkerStateLimits { max_jobs: 1, max_job_bytes: 5, ..WorkerStateLimits::default() };
+    let (_temp, store) = limited_store(limits);
+    let reservation = store.reserve_job(5, 1).unwrap();
+    assert!(store.reserve_job(1, 1).is_err());
+    drop(reservation);
+    assert!(store.reserve_job(5, 1).is_ok());
 }

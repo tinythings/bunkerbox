@@ -69,3 +69,34 @@ fn disconnect_and_inherited_pipes_do_not_leave_a_build_running() {
     assert!(error.contains("disconnected"));
     assert!(started.elapsed() < Duration::from_secs(2));
 }
+
+#[test]
+fn configured_build_timeout_overrides_worker_default() {
+    let temp = tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let jobs = platform::open_root(temp.path()).unwrap();
+    let job = JobWorkspace::create(&jobs).unwrap();
+    let build = WorkerBuild::new(
+        "shell",
+        "/bin/sh",
+        vec!["-c".to_string(), "sleep 1".to_string()],
+        "",
+        Vec::new(),
+        vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+        WorkerUploadId([5; 16]),
+    )
+    .unwrap();
+    let writer = FrameWriter::new(Vec::new());
+    let error = execute_build_with_limits(
+        &job,
+        &build,
+        WorkerRequestId([9; 16]),
+        WorkerSessionId([10; 16]),
+        &writer,
+        &|| false,
+        Duration::from_millis(20),
+        WORKER_MAX_OUTPUT_BYTES,
+    )
+    .unwrap_err();
+    assert!(error.contains("timed out"));
+}

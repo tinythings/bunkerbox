@@ -330,7 +330,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
                 let snapshot_root = std::env::temp_dir().join(format!("bunkerbox-snapshots-{}-{}", std::process::id(), remote_session.to_hex()));
                 let jobs_root = std::env::temp_dir().join(format!("bunkerbox-loopback-{}-{}", std::process::id(), remote_session.to_hex()));
                 let snapshot_store = snapshot::SnapshotStore::new(&snapshot_root);
-                let exclusion_policy = snapshot::SnapshotExclusionPolicy::from_config(&env, exclude.as_deref())?;
+                let exclusion_policy = snapshot::SnapshotExclusionPolicy::from_remote_config(&env, exclude.as_deref())?;
                 let snapshot_builder = snapshot::SnapshotBuilder::new(snapshot_store.clone(), snapshot::SnapshotLimits::default(), exclusion_policy);
                 let session = Arc::new(loopback::RunRemoteSession::new(
                     bunkerbox::remote::WorkspaceSessionId(remote_session.0),

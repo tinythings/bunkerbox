@@ -124,6 +124,10 @@ impl SnapshotExclusionPolicy {
         Self::from_patterns(config.effective_exclude(runtime_exclude))
     }
 
+    pub fn from_remote_config(config: &ProjectConfig, runtime_exclude: Option<&[String]>) -> Result<Self, String> {
+        Self::from_patterns(config.effective_exclude(runtime_exclude).into_iter().chain(config.project.remote.exclude.iter().cloned()))
+    }
+
     pub fn from_patterns(patterns: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut policy = Self { basename_prunes: BTreeSet::new(), anchored_prunes: BTreeSet::new() };
         for name in [".git", ".bunker", ".bunkerbox", ".env", ".envrc", ".ssh"] {

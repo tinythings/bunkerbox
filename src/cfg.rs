@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::remote::{RemoteEnvironmentPolicy, RemoteTool};
+use crate::snapshot::SnapshotExclusionPolicy;
 use crate::vscomm::buildsys::{self, PassthroughMode};
 
 pub const DEFAULT_SHARE_DIR: &str = "/usr/share/bunkerbox";
@@ -204,6 +205,8 @@ pub struct ProjectSection {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RemoteSection {
     #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
     pub environment: Vec<String>,
     #[serde(default)]
     pub tools: Vec<RemoteToolSpec>,
@@ -278,6 +281,7 @@ impl ProjectConfig {
             }
         }
         RemoteEnvironmentPolicy::from_names(self.project.remote.environment.clone())?;
+        SnapshotExclusionPolicy::from_patterns(self.project.remote.exclude.clone())?;
         let mut tools = std::collections::BTreeSet::new();
         for tool in &self.project.remote.tools {
             RemoteTool::new(tool.name.clone())?;
@@ -381,8 +385,16 @@ impl ProjectConfig {
             }
         }
 
-        if !self.project.remote.environment.is_empty() || !self.project.remote.tools.is_empty() {
+        if !self.project.remote.exclude.is_empty() || !self.project.remote.environment.is_empty() || !self.project.remote.tools.is_empty() {
             y.push_str("  remote:\n");
+            y.push_str("    exclude:\n");
+            if self.project.remote.exclude.is_empty() {
+                y.push_str("      []\n");
+            } else {
+                for pattern in &self.project.remote.exclude {
+                    y.push_str(&format!("      - {pattern}\n"));
+                }
+            }
             y.push_str("    environment:\n");
             if self.project.remote.environment.is_empty() {
                 y.push_str("      []\n");

@@ -12,10 +12,13 @@ pub mod overlay;
 pub mod proxy;
 pub mod remote;
 pub mod remote_client;
+pub mod remote_target;
 pub mod sandbox;
 pub mod snapshot;
+pub mod ssh;
 pub mod tui;
 pub mod vscomm;
+pub mod worker_protocol;
 pub mod workspace;
 pub mod wrap;
 

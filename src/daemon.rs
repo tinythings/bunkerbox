@@ -6,7 +6,9 @@ use crate::remote::{
     RemoteAuthorizationError, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteEnvironmentPolicy,
     RemoteExecutionContext, RemoteRequest, RemoteResourcePolicy, RemoteToolPolicy,
 };
+use crate::remote_target::SshTarget;
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
+use crate::ssh::SshBackend;
 use crate::vscomm::{validate_exec_request, validate_process_path, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
 use crate::workspace::WorkspaceCwd;
 use rand::Rng;
@@ -98,22 +100,37 @@ pub struct RemoteDaemonConfig {
     allowed_tools: Vec<String>,
     tool_policies: Option<Vec<(String, RemoteToolPolicy)>>,
     environment: Option<RemoteEnvironmentPolicy>,
-    tools: std::collections::BTreeMap<String, PathBuf>,
-    target_environment: std::collections::BTreeMap<String, String>,
+    backend: RemoteBackendSelection,
     resources: RemoteResourcePolicy,
 }
 
+enum RemoteBackendSelection {
+    Loopback { tools: std::collections::BTreeMap<String, PathBuf>, target_environment: std::collections::BTreeMap<String, String> },
+    Ssh { target: Box<SshTarget> },
+}
+
 impl RemoteDaemonConfig {
-    pub fn new(session: Arc<RunRemoteSession>, allowed_tools: Vec<String>, tools: std::collections::BTreeMap<String, PathBuf>) -> Self {
+    pub fn loopback(session: Arc<RunRemoteSession>, allowed_tools: Vec<String>, tools: std::collections::BTreeMap<String, PathBuf>) -> Self {
         Self {
             session,
             allowed_tools,
             tool_policies: None,
             environment: None,
-            tools,
-            target_environment: std::collections::BTreeMap::new(),
+            backend: RemoteBackendSelection::Loopback { tools, target_environment: std::collections::BTreeMap::new() },
             resources: RemoteResourcePolicy::default(),
         }
+    }
+
+    pub fn ssh(session: Arc<RunRemoteSession>, target: SshTarget) -> Result<Self, String> {
+        crate::ssh::SshLaunchSpec::from_target(&target)?;
+        Ok(Self {
+            session,
+            allowed_tools: Vec::new(),
+            tool_policies: None,
+            environment: None,
+            backend: RemoteBackendSelection::Ssh { target: Box::new(target) },
+            resources: RemoteResourcePolicy::default(),
+        })
     }
 
     pub fn with_policy(mut self, tools: Vec<(String, RemoteToolPolicy)>, environment: RemoteEnvironmentPolicy) -> Self {
@@ -123,7 +140,9 @@ impl RemoteDaemonConfig {
     }
 
     pub fn with_target_environment(mut self, environment: std::collections::BTreeMap<String, String>) -> Self {
-        self.target_environment = environment;
+        if let RemoteBackendSelection::Loopback { target_environment, .. } = &mut self.backend {
+            *target_environment = environment;
+        }
         self
     }
 
@@ -144,7 +163,7 @@ impl VsockDaemon {
         passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, profiles: Vec<String>, share_dir: PathBuf, allow: Vec<String>,
         remote: RemoteDaemonConfig,
     ) -> Result<Self, String> {
-        let RemoteDaemonConfig { session, allowed_tools, tool_policies, environment, tools, target_environment, resources } = remote;
+        let RemoteDaemonConfig { session, allowed_tools, tool_policies, environment, backend, resources } = remote;
         let remote_policy = match (tool_policies, environment) {
             (Some(tool_policies), Some(environment)) => {
                 RemoteAuthorizationPolicy::from_policies(session.target(), session.session_id(), tool_policies, environment)?
@@ -154,11 +173,16 @@ impl VsockDaemon {
         }
         .with_snapshot_authority(session.clone());
         let remote_context = RemoteExecutionContext { target: session.target(), workspace_session_id: session.session_id() };
-        let backend = LoopbackBackend::new(session, tools)
-            .with_target_environment(target_environment)
-            .with_timeout(resources.build_timeout)
-            .with_output_limit(resources.max_output_bytes);
-        let remote_components = RemoteComponents { context: remote_context, policy: remote_policy, backend: Arc::new(backend) };
+        let backend: Arc<dyn RemoteBackend> = match backend {
+            RemoteBackendSelection::Loopback { tools, target_environment } => Arc::new(
+                LoopbackBackend::new(session, tools)
+                    .with_target_environment(target_environment)
+                    .with_timeout(resources.build_timeout)
+                    .with_output_limit(resources.max_output_bytes),
+            ),
+            RemoteBackendSelection::Ssh { target } => Arc::new(SshBackend::new(session, *target)?),
+        };
+        let remote_components = RemoteComponents { context: remote_context, policy: remote_policy, backend };
         Self::start_inner(passthrough, env_mode, workspace, profiles, share_dir, allow, remote_components)
     }
 

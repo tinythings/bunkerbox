@@ -407,15 +407,48 @@ pub enum RemoteBackendEvent {
 pub enum RemoteBackendError {
     Failed(String),
     Spawn(String),
+    Transport { class: RemoteFailureClass, message: String },
     Timeout,
     OutputLimit { limit: u64 },
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteFailureClass {
+    Dns,
+    Connect,
+    Authentication,
+    HostIdentity,
+    WorkerUnavailable,
+    WorkerVersion,
+    WorkerProtocol,
+    SnapshotTransfer,
+    Disconnect,
+    Cleanup,
+}
+
+impl RemoteFailureClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dns => "dns",
+            Self::Connect => "connect",
+            Self::Authentication => "authentication",
+            Self::HostIdentity => "host identity",
+            Self::WorkerUnavailable => "worker unavailable",
+            Self::WorkerVersion => "worker version",
+            Self::WorkerProtocol => "worker protocol",
+            Self::SnapshotTransfer => "snapshot transfer",
+            Self::Disconnect => "disconnect",
+            Self::Cleanup => "cleanup",
+        }
+    }
 }
 
 impl RemoteBackendError {
     pub fn event(&self) -> RemoteBackendEvent {
         match self {
             Self::Failed(message) | Self::Spawn(message) => RemoteBackendEvent::Error { message: message.clone() },
+            Self::Transport { class, message } => RemoteBackendEvent::Error { message: format!("remote {} failure: {message}", class.as_str()) },
             Self::Timeout => RemoteBackendEvent::Error { message: "remote backend timed out".to_string() },
             Self::OutputLimit { limit } => RemoteBackendEvent::Error { message: format!("remote output exceeded limit of {limit} bytes") },
             Self::Cancelled => RemoteBackendEvent::Cancelled,

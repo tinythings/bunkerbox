@@ -1,0 +1,831 @@
+use serde::de::{self, MapAccess, Visitor};
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::env;
+use std::fmt;
+use std::fs::{self, File};
+use std::marker::PhantomData;
+use std::net::IpAddr;
+use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+pub const CONFIG_VERSION: u64 = 1;
+pub const CONFIG_FILE_NAME: &str = "remote-targets.yaml";
+pub const CONFIG_DIRECTORY_NAME: &str = "bunkerbox";
+
+const MAX_CONFIG_PATH_BYTES: usize = 4096;
+const MAX_REMOTE_PATH_BYTES: usize = 4096;
+const MAX_HOST_BYTES: usize = 253;
+const MAX_USER_BYTES: usize = 64;
+const MAX_NAME_BYTES: usize = 64;
+const MAX_TOOL_PATH_BYTES: usize = 4096;
+const MAX_ENV_NAME_BYTES: usize = 256;
+const MAX_ENV_VALUE_BYTES: usize = 16 * 1024;
+
+/// Selects the host-side facility used for a project.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendMode {
+    Loopback,
+    Ssh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceLimits {
+    pub connect_timeout: Duration,
+    pub sync_timeout: Duration,
+    pub build_timeout: Duration,
+    pub max_output_bytes: u64,
+}
+
+impl ResourceLimits {
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub fn sync_timeout(&self) -> Duration {
+        self.sync_timeout
+    }
+
+    pub fn build_timeout(&self) -> Duration {
+        self.build_timeout
+    }
+
+    pub fn max_output(&self) -> u64 {
+        self.max_output_bytes
+    }
+
+    pub fn max_output_bytes(&self) -> u64 {
+        self.max_output_bytes
+    }
+}
+
+/// An SSH target after all configuration and local-file checks have passed.
+///
+/// The identity and known-hosts files are intentionally represented only by
+/// their paths. The files are never read by this module.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    name: String,
+    host: String,
+    port: u16,
+    user: String,
+    identity_file: PathBuf,
+    known_hosts_file: PathBuf,
+    worker_path: String,
+    workspace_root: String,
+    tools: BTreeMap<String, String>,
+    environment: BTreeMap<String, String>,
+    resources: ResourceLimits,
+}
+
+/// Alias emphasizing that an `SshTarget` can only be obtained after validation.
+pub type ValidatedSshTarget = SshTarget;
+
+impl fmt::Debug for SshTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SshTarget")
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("identity_file", &self.identity_file)
+            .field("known_hosts_file", &self.known_hosts_file)
+            .field("worker_path", &self.worker_path)
+            .field("workspace_root", &self.workspace_root)
+            .field("tools", &self.tools)
+            .field("environment", &RedactedEnvironment(self.environment.len()))
+            .field("resources", &self.resources)
+            .finish()
+    }
+}
+
+impl SshTarget {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub fn identity_file(&self) -> &Path {
+        &self.identity_file
+    }
+
+    pub fn known_hosts_file(&self) -> &Path {
+        &self.known_hosts_file
+    }
+
+    pub fn worker_path(&self) -> &str {
+        &self.worker_path
+    }
+
+    pub fn workspace_root(&self) -> &str {
+        &self.workspace_root
+    }
+
+    pub fn tools(&self) -> &BTreeMap<String, String> {
+        &self.tools
+    }
+
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
+
+    pub fn resources(&self) -> ResourceLimits {
+        self.resources
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectBinding {
+    pub backend: BackendMode,
+    pub target: Option<String>,
+}
+
+impl ProjectBinding {
+    pub fn backend(&self) -> BackendMode {
+        self.backend
+    }
+
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+}
+
+/// The result of resolving a canonical project path.
+///
+/// Loopback resolutions always contain `None` for `target`, even if a
+/// loopback project entry happens to contain an unused target name.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedBackend {
+    pub project_root: PathBuf,
+    pub backend: BackendMode,
+    pub target: Option<SshTarget>,
+}
+
+impl fmt::Debug for ResolvedBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedBackend")
+            .field("project_root", &self.project_root)
+            .field("backend", &self.backend)
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+impl ResolvedBackend {
+    pub fn backend(&self) -> BackendMode {
+        self.backend
+    }
+
+    pub fn mode(&self) -> BackendMode {
+        self.backend
+    }
+
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    pub fn target(&self) -> Option<&SshTarget> {
+        self.target.as_ref()
+    }
+}
+
+/// Configuration loaded from the host's remote-targets file.
+pub struct RemoteTargetConfig {
+    source_path: PathBuf,
+    targets: BTreeMap<String, SshTarget>,
+    projects: BTreeMap<PathBuf, ProjectBinding>,
+}
+
+pub type RemoteConfig = RemoteTargetConfig;
+
+impl fmt::Debug for RemoteTargetConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteTargetConfig")
+            .field("source_path", &self.source_path)
+            .field("targets", &self.targets)
+            .field("projects", &self.projects)
+            .finish()
+    }
+}
+
+impl RemoteTargetConfig {
+    pub fn load_default() -> Result<Self, String> {
+        let helper = ConfigPathHelper::from_environment()?;
+        Self::load_default_with(&helper)
+    }
+
+    pub fn load_default_with(helper: &ConfigPathHelper) -> Result<Self, String> {
+        Self::load_from(helper.config_path()?)
+    }
+
+    pub fn load_default_with_path_helper(helper: &ConfigPathHelper) -> Result<Self, String> {
+        Self::load_default_with(helper)
+    }
+
+    pub fn load_default_with_paths(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> Result<Self, String> {
+        Self::load_default_with(&ConfigPathHelper::new(xdg_config_home, home))
+    }
+
+    pub fn load_from(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let contents = fs::read_to_string(path).map_err(|error| format!("failed to read remote target config {}: {error}", path.display()))?;
+        let raw: RawConfig =
+            serde_yaml::from_str(&contents).map_err(|error| format!("failed to parse remote target config {}: {error}", path.display()))?;
+        Self::from_raw(raw, path.to_path_buf())
+    }
+
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub fn targets(&self) -> &BTreeMap<String, SshTarget> {
+        &self.targets
+    }
+
+    pub fn target(&self, name: &str) -> Option<&SshTarget> {
+        self.targets.get(name)
+    }
+
+    pub fn ssh_target(&self, name: &str) -> Result<&SshTarget, String> {
+        self.targets.get(name).ok_or_else(|| format!("unknown SSH target '{name}'"))
+    }
+
+    pub fn projects(&self) -> &BTreeMap<PathBuf, ProjectBinding> {
+        &self.projects
+    }
+
+    pub fn binding_for_project(&self, project: impl AsRef<Path>) -> Result<&ProjectBinding, String> {
+        let canonical = canonical_project_for_resolution(project.as_ref())?;
+        self.projects.get(&canonical).ok_or_else(|| format!("project has no remote backend binding: {}", canonical.display()))
+    }
+
+    pub fn resolve_for_project(&self, project: impl AsRef<Path>) -> Result<ResolvedBackend, String> {
+        let canonical = canonical_project_for_resolution(project.as_ref())?;
+        let binding = self.projects.get(&canonical).ok_or_else(|| format!("project has no remote backend binding: {}", canonical.display()))?;
+
+        match binding.backend {
+            BackendMode::Loopback => Ok(ResolvedBackend { project_root: canonical, backend: BackendMode::Loopback, target: None }),
+            BackendMode::Ssh => {
+                let target_name = binding.target.as_deref().ok_or_else(|| "SSH project binding is missing a target".to_string())?;
+                let target = self.targets.get(target_name).ok_or_else(|| format!("unknown SSH target '{target_name}'"))?;
+                Ok(ResolvedBackend { project_root: canonical, backend: BackendMode::Ssh, target: Some(target.clone()) })
+            }
+        }
+    }
+
+    fn from_raw(raw: RawConfig, source_path: PathBuf) -> Result<Self, String> {
+        if raw.version != CONFIG_VERSION {
+            return Err(format!("unsupported remote target config version {}; expected {}", raw.version, CONFIG_VERSION));
+        }
+
+        let mut targets = BTreeMap::new();
+        for (name, target) in raw.targets.0 {
+            validate_name("target name", &name)?;
+            let validated = validate_target(name.clone(), target)?;
+            if targets.insert(name.clone(), validated).is_some() {
+                return Err(format!("duplicate target name '{name}'"));
+            }
+        }
+
+        let mut projects = BTreeMap::new();
+        for (project, binding) in raw.projects.0 {
+            let canonical = validate_project_binding_path(&project)?;
+            validate_project_binding(&binding)?;
+            if binding.backend == BackendMode::Ssh {
+                let Some(target_name) = binding.target.as_deref() else {
+                    return Err("SSH project binding requires a target".to_string());
+                };
+                if !targets.contains_key(target_name) {
+                    return Err(format!("unknown SSH target '{target_name}'"));
+                }
+            }
+            if projects.insert(canonical, binding.into_public()).is_some() {
+                return Err("duplicate project binding after canonicalization".to_string());
+            }
+        }
+
+        Ok(Self { source_path, targets, projects })
+    }
+}
+
+/// Inputs used to resolve the host-level default configuration path.
+///
+/// Keeping environment lookup outside `config_path` makes default-path
+/// behavior deterministic in callers and unit tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigPathHelper {
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
+
+impl ConfigPathHelper {
+    pub fn new(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> Self {
+        Self { xdg_config_home: nonempty_path(xdg_config_home), home: nonempty_path(home) }
+    }
+
+    pub fn from_paths(xdg_config_home: Option<&Path>, home: Option<&Path>) -> Self {
+        Self::new(xdg_config_home.map(Path::to_path_buf), home.map(Path::to_path_buf))
+    }
+
+    pub fn from_environment() -> Result<Self, String> {
+        Ok(Self::new(env::var_os("XDG_CONFIG_HOME").map(PathBuf::from), env::var_os("HOME").map(PathBuf::from)))
+    }
+
+    pub fn xdg_config_home(&self) -> Option<&Path> {
+        self.xdg_config_home.as_deref()
+    }
+
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
+    pub fn config_path(&self) -> Result<PathBuf, String> {
+        let base = match (&self.xdg_config_home, &self.home) {
+            (Some(xdg), _) => xdg.clone(),
+            (None, Some(home)) => home.join(".config"),
+            (None, None) => return Err("cannot resolve remote target config path: HOME is not set".to_string()),
+        };
+
+        validate_config_base(&base)?;
+        Ok(base.join(CONFIG_DIRECTORY_NAME).join(CONFIG_FILE_NAME))
+    }
+
+    pub fn default_path(&self) -> Result<PathBuf, String> {
+        self.config_path()
+    }
+}
+
+pub fn default_config_path() -> Result<PathBuf, String> {
+    ConfigPathHelper::from_environment()?.config_path()
+}
+
+pub fn default_config_path_with(xdg_config_home: Option<&Path>, home: Option<&Path>) -> Result<PathBuf, String> {
+    ConfigPathHelper::from_paths(xdg_config_home, home).config_path()
+}
+
+struct UniqueMap<K, V>(BTreeMap<K, V>);
+
+impl<K, V> Default for UniqueMap<K, V> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+impl<'de, K, V> Deserialize<'de> for UniqueMap<K, V>
+where
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
+    }
+}
+
+struct UniqueMapVisitor<K, V>(PhantomData<(K, V)>);
+
+impl<'de, K, V> Visitor<'de> for UniqueMapVisitor<K, V>
+where
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    type Value = UniqueMap<K, V>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a YAML mapping with unique keys")
+    }
+
+    fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut entries = BTreeMap::new();
+        while let Some(key) = access.next_key::<K>()? {
+            if entries.contains_key(&key) {
+                return Err(de::Error::custom("duplicate YAML map key"));
+            }
+            let value = access.next_value::<V>()?;
+            entries.insert(key, value);
+        }
+        Ok(UniqueMap(entries))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    version: u64,
+    targets: UniqueMap<String, RawTarget>,
+    projects: UniqueMap<String, RawProjectBinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTarget {
+    transport: String,
+    host: String,
+    port: u64,
+    user: String,
+    #[serde(rename = "identity-file", alias = "identity_file")]
+    identity_file: String,
+    #[serde(rename = "known-hosts-file", alias = "known_hosts_file")]
+    known_hosts_file: String,
+    #[serde(rename = "worker-path", alias = "worker_path")]
+    worker_path: String,
+    #[serde(rename = "workspace-root", alias = "workspace_root")]
+    workspace_root: String,
+    #[serde(default)]
+    tools: UniqueMap<String, String>,
+    #[serde(default)]
+    environment: UniqueMap<String, String>,
+    resources: RawResources,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProjectBinding {
+    backend: BackendMode,
+    #[serde(default)]
+    target: Option<String>,
+}
+
+impl RawProjectBinding {
+    fn into_public(self) -> ProjectBinding {
+        ProjectBinding { backend: self.backend, target: self.target }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResources {
+    #[serde(
+        rename = "connect-timeout-seconds",
+        alias = "connect-timeout",
+        alias = "connect_timeout_seconds",
+        alias = "connect_timeout",
+        alias = "connect"
+    )]
+    connect_timeout: RawQuantity,
+    #[serde(rename = "sync-timeout-seconds", alias = "sync-timeout", alias = "sync_timeout_seconds", alias = "sync_timeout", alias = "sync")]
+    sync_timeout: RawQuantity,
+    #[serde(rename = "build-timeout-seconds", alias = "build-timeout", alias = "build_timeout_seconds", alias = "build_timeout", alias = "build")]
+    build_timeout: RawQuantity,
+    #[serde(rename = "max-output-bytes", alias = "max-output", alias = "max_output_bytes", alias = "max_output")]
+    max_output: RawQuantity,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawQuantity {
+    Integer(u64),
+    Text(String),
+}
+
+fn validate_target(name: String, raw: RawTarget) -> Result<SshTarget, String> {
+    if raw.transport != "ssh" {
+        return Err("remote target transport must be 'ssh'".to_string());
+    }
+
+    validate_hostname(&raw.host)?;
+    if raw.port == 0 || raw.port > u16::MAX as u64 {
+        return Err("remote target port must be between 1 and 65535".to_string());
+    }
+    validate_username(&raw.user)?;
+
+    let identity_file = validate_local_absolute_path("identity-file", &raw.identity_file)?;
+    validate_identity_file(&identity_file)?;
+
+    let known_hosts_file = validate_local_absolute_path("known-hosts-file", &raw.known_hosts_file)?;
+    validate_known_hosts_file(&known_hosts_file)?;
+
+    let worker_path = validate_remote_path("worker-path", &raw.worker_path, false)?;
+    let workspace_root = validate_remote_path("workspace-root", &raw.workspace_root, true)?;
+
+    let mut tools = BTreeMap::new();
+    for (identity, path) in raw.tools.0 {
+        validate_tool_identity(&identity)?;
+        let path = validate_remote_tool_path(&path)?;
+        if tools.insert(identity.clone(), path).is_some() {
+            return Err(format!("duplicate tool identity '{identity}'"));
+        }
+    }
+
+    let mut environment = BTreeMap::new();
+    for (name, value) in raw.environment.0 {
+        validate_environment_name(&name)?;
+        validate_environment_value(&value)?;
+        if environment.insert(name.clone(), value).is_some() {
+            return Err(format!("duplicate environment name '{name}'"));
+        }
+    }
+
+    let resources = validate_resources(raw.resources)?;
+
+    Ok(SshTarget {
+        name,
+        host: raw.host,
+        port: raw.port as u16,
+        user: raw.user,
+        identity_file,
+        known_hosts_file,
+        worker_path,
+        workspace_root,
+        tools,
+        environment,
+        resources,
+    })
+}
+
+fn validate_project_binding(binding: &RawProjectBinding) -> Result<(), String> {
+    if let Some(target) = &binding.target {
+        validate_name("project target name", target)?;
+    }
+    if binding.backend == BackendMode::Ssh && binding.target.is_none() {
+        return Err("SSH project binding requires a target".to_string());
+    }
+    Ok(())
+}
+
+fn validate_resources(raw: RawResources) -> Result<ResourceLimits, String> {
+    let connect_timeout = parse_duration("connect-timeout", raw.connect_timeout)?;
+    let sync_timeout = parse_duration("sync-timeout", raw.sync_timeout)?;
+    let build_timeout = parse_duration("build-timeout", raw.build_timeout)?;
+    let max_output_bytes = parse_size("max-output", raw.max_output)?;
+    Ok(ResourceLimits { connect_timeout, sync_timeout, build_timeout, max_output_bytes })
+}
+
+fn parse_duration(field: &str, quantity: RawQuantity) -> Result<Duration, String> {
+    let (number, suffix) = quantity_parts(field, quantity)?;
+    let multiplier_nanos = match suffix.to_ascii_lowercase().as_str() {
+        "" | "s" => 1_000_000_000u64,
+        "ms" => 1_000_000,
+        "us" => 1_000,
+        "ns" => 1,
+        "m" => 60 * 1_000_000_000,
+        "h" => 60 * 60 * 1_000_000_000,
+        "d" => 24 * 60 * 60 * 1_000_000_000,
+        _ => return Err(format!("{field} has an unsupported duration unit")),
+    };
+    let nanos = number.checked_mul(multiplier_nanos).ok_or_else(|| format!("{field} is too large"))?;
+    if nanos == 0 {
+        return Err(format!("{field} must be positive"));
+    }
+    let seconds = nanos / 1_000_000_000;
+    let subsecond_nanos = (nanos % 1_000_000_000) as u32;
+    Ok(Duration::new(seconds, subsecond_nanos))
+}
+
+fn parse_size(field: &str, quantity: RawQuantity) -> Result<u64, String> {
+    let (number, suffix) = quantity_parts(field, quantity)?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1u64,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024 * 1024 * 1024 * 1024,
+        _ => return Err(format!("{field} has an unsupported size unit")),
+    };
+    let bytes = number.checked_mul(multiplier).ok_or_else(|| format!("{field} is too large"))?;
+    if bytes == 0 {
+        return Err(format!("{field} must be positive"));
+    }
+    Ok(bytes)
+}
+
+fn quantity_parts(field: &str, quantity: RawQuantity) -> Result<(u64, String), String> {
+    let text = match quantity {
+        RawQuantity::Integer(number) => return Ok((number, String::new())),
+        RawQuantity::Text(text) => text,
+    };
+    let text = text.trim();
+    let split = text.find(|character: char| !character.is_ascii_digit()).unwrap_or(text.len());
+    if split == 0 {
+        return Err(format!("{field} must start with a positive integer"));
+    }
+    let number = text[..split].parse::<u64>().map_err(|_| format!("{field} is too large"))?;
+    Ok((number, text[split..].to_string()))
+}
+
+fn validate_name(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > MAX_NAME_BYTES || value == "." || value == ".." {
+        return Err(format!("{field} is invalid"));
+    }
+    let mut characters = value.bytes();
+    let Some(first) = characters.next() else {
+        return Err(format!("{field} is invalid"));
+    };
+    if !first.is_ascii_alphanumeric() {
+        return Err(format!("{field} is invalid"));
+    }
+    if !characters.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+')) {
+        return Err(format!("{field} is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_hostname(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.len() > MAX_HOST_BYTES || !host.is_ascii() || host.chars().any(char::is_whitespace) {
+        return Err("remote target host has unsafe hostname syntax".to_string());
+    }
+    if IpAddr::from_str(host).is_ok() {
+        return Ok(());
+    }
+    if host.ends_with('.') {
+        return Err("remote target host has unsafe hostname syntax".to_string());
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("remote target host has unsafe hostname syntax".to_string());
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return Err("remote target host has unsafe hostname syntax".to_string());
+        }
+        if !bytes.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-') {
+            return Err("remote target host has unsafe hostname syntax".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_username(user: &str) -> Result<(), String> {
+    if user.is_empty() || user.len() > MAX_USER_BYTES || !user.is_ascii() {
+        return Err("remote target username is invalid".to_string());
+    }
+    let bytes = user.as_bytes();
+    if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
+        return Err("remote target username is invalid".to_string());
+    }
+    if !bytes[1..].iter().all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.')) {
+        return Err("remote target username is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_local_absolute_path(field: &str, value: &str) -> Result<PathBuf, String> {
+    if value.is_empty() || value.len() > MAX_CONFIG_PATH_BYTES || value.chars().any(char::is_control) {
+        return Err(format!("{field} is invalid"));
+    }
+    let path = Path::new(value);
+    validate_absolute_no_parent_path(field, path)?;
+    Ok(path.to_path_buf())
+}
+
+fn validate_absolute_no_parent_path(field: &str, path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{field} must be absolute"));
+    }
+    if path.components().any(|component| matches!(component, Component::ParentDir | Component::CurDir)) {
+        return Err(format!("{field} must not contain '.' or '..' path components"));
+    }
+    Ok(())
+}
+
+fn validate_remote_path(field: &str, value: &str, allow_root: bool) -> Result<String, String> {
+    if value.is_empty() || value.len() > MAX_REMOTE_PATH_BYTES || !value.is_ascii() || value.chars().any(char::is_whitespace) {
+        return Err(format!("{field} has invalid path syntax"));
+    }
+    if !value.starts_with('/') || value.contains("//") || (value != "/" && value.ends_with('/')) {
+        return Err(format!("{field} must be an absolute normalized path"));
+    }
+    let path = Path::new(value);
+    validate_absolute_no_parent_path(field, path)?;
+    if !allow_root && value == "/" {
+        return Err(format!("{field} must name a worker"));
+    }
+    if value.bytes().any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'@' | b'%' | b'~')) {
+        return Err(format!("{field} has invalid path syntax"));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_remote_tool_path(value: &str) -> Result<String, String> {
+    if value.len() > MAX_TOOL_PATH_BYTES {
+        return Err("tool path is too long".to_string());
+    }
+    validate_remote_path("tool path", value, false)
+}
+
+fn validate_tool_identity(identity: &str) -> Result<(), String> {
+    validate_name("tool identity", identity)
+}
+
+fn validate_environment_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > MAX_ENV_NAME_BYTES {
+        return Err("environment name is invalid".to_string());
+    }
+    let bytes = name.as_bytes();
+    if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
+        return Err("environment name is invalid".to_string());
+    }
+    if !bytes[1..].iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+        return Err("environment name is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_environment_value(value: &str) -> Result<(), String> {
+    if value.len() > MAX_ENV_VALUE_BYTES || value.chars().any(char::is_control) {
+        return Err("environment value is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_project_binding_path(value: &str) -> Result<PathBuf, String> {
+    let path = validate_local_absolute_path("project binding", value)?;
+    let canonical = fs::canonicalize(&path).map_err(|_| "project binding must refer to an existing canonical project path".to_string())?;
+    if canonical != path {
+        return Err("project binding must use the canonical project path".to_string());
+    }
+    let metadata = fs::metadata(&canonical).map_err(|_| "project binding cannot be inspected".to_string())?;
+    if !metadata.is_dir() {
+        return Err("project binding must refer to a directory".to_string());
+    }
+    Ok(canonical)
+}
+
+fn canonical_project_for_resolution(path: &Path) -> Result<PathBuf, String> {
+    validate_absolute_no_parent_path("project path", path)?;
+    let canonical = fs::canonicalize(path).map_err(|_| "project path cannot be canonicalized".to_string())?;
+    let metadata = fs::metadata(&canonical).map_err(|_| "project path cannot be inspected".to_string())?;
+    if !metadata.is_dir() {
+        return Err("project path must refer to a directory".to_string());
+    }
+    Ok(canonical)
+}
+
+fn validate_identity_file(path: &Path) -> Result<(), String> {
+    let metadata = regular_file_metadata(path, "identity-file")?;
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode();
+        if mode & 0o7777 != 0o400 && mode & 0o7777 != 0o600 {
+            return Err("identity-file has insecure permissions".to_string());
+        }
+    }
+    File::open(path).map_err(|_| "identity-file is not readable".to_string())?;
+    Ok(())
+}
+
+fn validate_known_hosts_file(path: &Path) -> Result<(), String> {
+    let metadata = regular_file_metadata(path, "known-hosts-file")?;
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o444 == 0 {
+        return Err("known-hosts-file is not readable".to_string());
+    }
+    File::open(path).map_err(|_| "known-hosts-file is not readable".to_string())?;
+    Ok(())
+}
+
+fn regular_file_metadata(path: &Path, field: &str) -> Result<fs::Metadata, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| format!("{field} does not exist"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{field} must be a regular file"));
+    }
+    Ok(metadata)
+}
+
+fn validate_config_base(path: &Path) -> Result<(), String> {
+    validate_absolute_no_parent_path("configuration directory", path)?;
+    if path.as_os_str().len() > MAX_CONFIG_PATH_BYTES {
+        return Err("configuration directory path is too long".to_string());
+    }
+    Ok(())
+}
+
+fn nonempty_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.filter(|path| !path.as_os_str().is_empty())
+}
+
+struct RedactedEnvironment(usize);
+
+impl fmt::Debug for RedactedEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("RedactedEnvironment").field("entries", &self.0).finish()
+    }
+}
+
+#[cfg(test)]
+#[path = "remote_target_ut.rs"]
+mod tests;

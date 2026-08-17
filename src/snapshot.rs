@@ -222,16 +222,21 @@ impl SnapshotStore {
     }
 
     pub fn resolve(&self, handle: &SnapshotHandle) -> Result<WorkspaceSnapshot, String> {
-        let manifest_path = self.manifest_path(handle);
-        let metadata = fs::symlink_metadata(&manifest_path).map_err(|error| format!("snapshot is unavailable: {error}"))?;
-        if !metadata.file_type().is_file() {
+        let mut manifest = open_snapshot_manifest(self, handle)?;
+        let metadata = stat_fd(manifest.as_raw_fd())?;
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
             return Err("snapshot manifest is not a regular file".to_string());
         }
-        if metadata.len() > MAX_SNAPSHOT_MANIFEST_BYTES as u64 {
+        if metadata.st_size < 0 || metadata.st_size as u64 > MAX_SNAPSHOT_MANIFEST_BYTES as u64 {
             return Err("stored snapshot manifest exceeds limit".to_string());
         }
-        let stored: StoredSnapshot = serde_json::from_slice(&fs::read(&manifest_path).map_err(|error| format!("read snapshot manifest: {error}"))?)
-            .map_err(|error| format!("decode snapshot manifest: {error}"))?;
+        let mut manifest_bytes = Vec::new();
+        let mut bounded_manifest = (&mut manifest).take(MAX_SNAPSHOT_MANIFEST_BYTES as u64 + 1);
+        bounded_manifest.read_to_end(&mut manifest_bytes).map_err(|error| format!("read snapshot manifest: {error}"))?;
+        if manifest_bytes.len() > MAX_SNAPSHOT_MANIFEST_BYTES {
+            return Err("stored snapshot manifest exceeds limit".to_string());
+        }
+        let stored: StoredSnapshot = serde_json::from_slice(&manifest_bytes).map_err(|error| format!("decode snapshot manifest: {error}"))?;
         if stored.session_id != handle.session_id.0 {
             return Err("snapshot session mismatch".to_string());
         }
@@ -241,6 +246,13 @@ impl SnapshotStore {
             return Err("snapshot manifest identity mismatch".to_string());
         }
         Ok(WorkspaceSnapshot { handle: handle.clone(), entries, total_file_bytes })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resolve_export(&self, handle: &SnapshotHandle) -> Result<SnapshotExport, String> {
+        let snapshot = self.resolve(handle)?;
+        let _files = open_snapshot_files(self, handle)?;
+        Ok(SnapshotExport { store: self.clone(), snapshot })
     }
 
     pub fn remove(&self, handle: &SnapshotHandle) -> Result<(), String> {
@@ -288,8 +300,66 @@ impl SnapshotStore {
         Ok(MaterializedWorkspace { root: destination.to_path_buf() })
     }
 
-    fn manifest_path(&self, handle: &SnapshotHandle) -> PathBuf {
-        self.snapshot_path(handle).join("manifest.json")
+    #[allow(dead_code)]
+    fn read_staged_file(&self, handle: &SnapshotHandle, entry: &SnapshotEntry, max_bytes: u64) -> Result<Vec<u8>, String> {
+        if entry.kind != SnapshotEntryKind::RegularFile {
+            return Err(format!("snapshot export entry is not a regular file: {}", entry.path.as_str()));
+        }
+        let expected_digest = *entry.content_digest.as_ref().ok_or_else(|| format!("regular file has no digest: {}", entry.path.as_str()))?;
+        let limit = max_bytes.min(MAX_SNAPSHOT_FILE_BYTES);
+        if entry.size > limit {
+            return Err(format!("snapshot export file exceeds read limit: {}", entry.path.as_str()));
+        }
+
+        let source_root = open_snapshot_files(self, handle)?;
+        let source = open_relative_file(&source_root, entry.path.as_str(), libc::O_RDONLY)?;
+        let initial_stat = stat_fd(source.as_raw_fd())?;
+        if initial_stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(format!("snapshot export content is not a regular file: {}", entry.path.as_str()));
+        }
+        if initial_stat.st_nlink != 1 {
+            return Err(format!("snapshot export rejects linked content: {}", entry.path.as_str()));
+        }
+        if initial_stat.st_size < 0 || initial_stat.st_size as u64 != entry.size {
+            return Err(format!("snapshot export content size mismatch: {}", entry.path.as_str()));
+        }
+        if normalized_mode(initial_stat.st_mode) != entry.mode {
+            return Err(format!("snapshot export content mode mismatch: {}", entry.path.as_str()));
+        }
+
+        let capacity = usize::try_from(entry.size).map_err(|_| format!("snapshot export file is too large to read: {}", entry.path.as_str()))?;
+        let mut contents = Vec::with_capacity(capacity);
+        let mut buffer = vec![0u8; SNAPSHOT_COPY_BUFFER_BYTES];
+        let mut hasher = Sha256::new();
+        let mut read_bytes = 0u64;
+        loop {
+            let count = (&source).read(&mut buffer).map_err(|error| format!("read snapshot export file {}: {error}", entry.path.as_str()))?;
+            if count == 0 {
+                break;
+            }
+            read_bytes =
+                read_bytes.checked_add(count as u64).ok_or_else(|| format!("snapshot export file size overflow: {}", entry.path.as_str()))?;
+            if read_bytes > entry.size || read_bytes > limit {
+                return Err(format!("snapshot export content exceeds manifest size: {}", entry.path.as_str()));
+            }
+            hasher.update(&buffer[..count]);
+            contents.extend_from_slice(&buffer[..count]);
+        }
+
+        let final_stat = stat_fd(source.as_raw_fd())?;
+        if final_stat.st_dev != initial_stat.st_dev
+            || final_stat.st_ino != initial_stat.st_ino
+            || final_stat.st_mode & libc::S_IFMT != initial_stat.st_mode & libc::S_IFMT
+            || final_stat.st_size != initial_stat.st_size
+            || final_stat.st_nlink != initial_stat.st_nlink
+            || final_stat.st_mode & 0o777 != initial_stat.st_mode & 0o777
+        {
+            return Err(format!("snapshot export content changed while reading: {}", entry.path.as_str()));
+        }
+        if read_bytes != entry.size || hasher.finalize().as_slice() != expected_digest {
+            return Err(format!("snapshot export content digest mismatch: {}", entry.path.as_str()));
+        }
+        Ok(contents)
     }
 
     fn snapshot_path(&self, handle: &SnapshotHandle) -> PathBuf {
@@ -302,6 +372,40 @@ impl SnapshotStore {
 
     pub(crate) fn root_for_cleanup(&self) -> PathBuf {
         self.root.clone()
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct SnapshotExport {
+    store: SnapshotStore,
+    snapshot: WorkspaceSnapshot,
+}
+
+#[allow(dead_code)]
+impl SnapshotExport {
+    pub(crate) fn entries(&self) -> &[SnapshotEntry] {
+        self.snapshot.entries()
+    }
+
+    pub(crate) fn total_file_bytes(&self) -> u64 {
+        self.snapshot.total_file_bytes()
+    }
+
+    pub(crate) fn read_file(&self, entry: &SnapshotEntry) -> Result<Vec<u8>, String> {
+        self.read_file_bounded(entry, MAX_SNAPSHOT_FILE_BYTES)
+    }
+
+    pub(crate) fn read_file_bounded(&self, entry: &SnapshotEntry, max_bytes: u64) -> Result<Vec<u8>, String> {
+        let manifest_entry = self
+            .snapshot
+            .entries
+            .iter()
+            .find(|candidate| candidate.path == entry.path)
+            .ok_or_else(|| format!("snapshot export entry is not in the manifest: {}", entry.path.as_str()))?;
+        if manifest_entry != entry {
+            return Err(format!("snapshot export entry does not match the manifest: {}", entry.path.as_str()));
+        }
+        self.store.read_staged_file(self.snapshot.handle(), manifest_entry, max_bytes)
     }
 }
 
@@ -627,6 +731,29 @@ fn open_directory(path: &Path) -> Result<File, String> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|error| format!("open snapshot workspace: {error}"))
+}
+
+fn open_snapshot_directory(store: &SnapshotStore, handle: &SnapshotHandle) -> Result<File, String> {
+    let store_root = open_directory(&store.root).map_err(|error| format!("open snapshot store: {error}"))?;
+    let session_name = hex(&handle.session_id.0);
+    let session = open_at(store_root.as_raw_fd(), OsStr::new(&session_name), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .map_err(|error| format!("open snapshot session: {error}"))?;
+    let snapshot_name = hex(&handle.snapshot_id.0);
+    open_at(session.as_raw_fd(), OsStr::new(&snapshot_name), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .map_err(|error| format!("open snapshot publication: {error}"))
+}
+
+fn open_snapshot_manifest(store: &SnapshotStore, handle: &SnapshotHandle) -> Result<File, String> {
+    let snapshot = open_snapshot_directory(store, handle)?;
+    open_at(snapshot.as_raw_fd(), OsStr::new("manifest.json"), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .map_err(|error| format!("open snapshot manifest: {error}"))
+}
+
+#[allow(dead_code)]
+fn open_snapshot_files(store: &SnapshotStore, handle: &SnapshotHandle) -> Result<File, String> {
+    let snapshot = open_snapshot_directory(store, handle)?;
+    open_at(snapshot.as_raw_fd(), OsStr::new("files"), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .map_err(|error| format!("open snapshot content directory: {error}"))
 }
 
 fn open_child_directory(parent: RawFd, name: &OsStr, path: &str) -> Result<File, String> {

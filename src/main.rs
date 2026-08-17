@@ -1,6 +1,6 @@
 use bunkerbox::cfg::{ProjectConfig, RemoteToolSpec, WorkspaceMode};
 use bunkerbox::remote::{RemoteEnvironmentPolicy, RemoteToolPolicy};
-use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, logging, loopback, overlay, snapshot, tui, vscomm, workspace};
+use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, logging, loopback, overlay, remote_target, snapshot, tui, vscomm, workspace};
 use rand::RngCore;
 use std::ffi::OsString;
 use std::fs::File;
@@ -190,6 +190,15 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
     let repo_root = workspace::project_root()?;
     let env = ProjectConfig::load_or_create(&repo_root)?;
+    let remote_backend = remote_target::RemoteTargetConfig::load_default()?.resolve_for_project(&repo_root)?;
+    if let remote_target::BackendMode::Ssh = remote_backend.backend() {
+        let target = remote_backend.target().ok_or_else(|| "SSH backend selection has no target".to_string())?;
+        for tool in &env.project.remote.tools {
+            if !target.tools().contains_key(&tool.name) {
+                return Err(format!("SSH target '{}' does not configure remote tool '{}'", target.name(), tool.name));
+            }
+        }
+    }
 
     let merged_allow: Vec<String> = config.allow.clone().unwrap_or_default().into_iter().chain(env.image.allow.clone().unwrap_or_default()).collect();
 
@@ -342,6 +351,13 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
                 )?);
                 let tools = loopback::resolve_fixed_tools(configured_remote_tool_names.clone());
                 logging::log("Starting remote daemon...");
+                let remote_config = match remote_backend.backend() {
+                    remote_target::BackendMode::Loopback => daemon::RemoteDaemonConfig::loopback(session.clone(), Vec::new(), tools),
+                    remote_target::BackendMode::Ssh => {
+                        let target = remote_backend.target().cloned().ok_or_else(|| "SSH backend selection has no target".to_string())?;
+                        daemon::RemoteDaemonConfig::ssh(session.clone(), target)?
+                    }
+                };
                 let daemon = daemon::VsockDaemon::start_with_remote(
                     passthrough,
                     env_mode,
@@ -349,7 +365,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
                     profiles,
                     share_dir_owned,
                     merged_allow,
-                    daemon::RemoteDaemonConfig::new(session.clone(), Vec::new(), tools).with_policy(remote_tool_policies, remote_environment),
+                    remote_config.with_policy(remote_tool_policies, remote_environment),
                 )?;
                 if let Err(error) = write_run_handoff(&mut setup_parent, workspace.path(), remote_session) {
                     tokio::runtime::Handle::current().block_on(daemon.shutdown());

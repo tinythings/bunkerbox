@@ -59,10 +59,14 @@ fn run_handoff_rejects_zero_session() {
 }
 
 #[test]
-fn remote_tool_names_only_enables_the_make_wrapper() {
+fn remote_tool_names_only_enables_the_fixed_make_and_cargo_wrappers() {
     assert_eq!(
-        remote_tool_names(&[RemoteToolSpec { name: "make".into(), allow_args: true }, RemoteToolSpec { name: "cargo".into(), allow_args: false },]),
-        vec!["make"]
+        remote_tool_names(&[
+            RemoteToolSpec { name: "make".into(), allow_args: true },
+            RemoteToolSpec { name: "cargo".into(), allow_args: false },
+            RemoteToolSpec { name: "cmake".into(), allow_args: true },
+        ]),
+        vec!["make", "cargo"]
     );
 }
 

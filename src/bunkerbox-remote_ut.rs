@@ -1,5 +1,5 @@
 use super::*;
-use bunkerbox::vscomm::{Frame, RemoteEvent, RemoteEventKind};
+use bunkerbox::vscomm::{Frame, RemoteEvent, RemoteEventKind, RemoteOperation};
 
 fn snapshot_id() -> bunkerbox::remote::RemoteSnapshotId {
     bunkerbox::remote::RemoteSnapshotId::from_bytes([9; 16])
@@ -51,6 +51,14 @@ fn parses_build_tool_and_args_without_joining() {
 }
 
 #[test]
+fn parses_cargo_toolchain_and_arguments_without_joining() {
+    assert_eq!(
+        parse_command(&["build".into(), "cargo".into(), "+nightly".into(), "build".into(), "literal $(value)".into()]),
+        Ok(RemoteCommand::Build { tool: "cargo".into(), args: vec!["+nightly".into(), "build".into(), "literal $(value)".into()] })
+    );
+}
+
+#[test]
 fn build_request_preserves_logical_cwd_and_arguments() {
     let request = build_request(
         RemoteCommand::Build { tool: "make".into(), args: vec!["release mode".into(), "$(literal)".into()] },
@@ -66,6 +74,23 @@ fn build_request_preserves_logical_cwd_and_arguments() {
     assert_eq!(build.cwd.as_str(), "src");
     assert_eq!(build.tool.as_str(), "make");
     assert_eq!(build.argv, ["release mode", "$(literal)"]);
+}
+
+#[test]
+fn cargo_build_request_preserves_structured_toolchain_arguments() {
+    let request = build_request(
+        RemoteCommand::Build { tool: "cargo".into(), args: vec!["+nightly".into(), "build".into(), "$(literal)".into()] },
+        "crates/app".into(),
+        RequestId([1; 16]),
+        WorkspaceSessionId([2; 16]),
+        snapshot_id(),
+    )
+    .unwrap();
+    let RemoteOperation::Build(build) = request.operation else { panic!("expected build") };
+    assert_eq!(build.tool.as_str(), "cargo");
+    assert_eq!(build.cwd.as_str(), "crates/app");
+    assert_eq!(build.argv, ["+nightly", "build", "$(literal)"]);
+    assert!(build.env.is_empty());
 }
 
 #[test]
@@ -205,6 +230,16 @@ fn configured_remote_make_does_not_overwrite_unmanaged_entry() {
     std::fs::write(root.path().join("make"), b"native").unwrap();
     assert!(install_remote_make_link(root.path(), &executable, true).is_err());
     assert_eq!(std::fs::read(root.path().join("make")).unwrap(), b"native");
+}
+
+#[test]
+fn configured_remote_cargo_does_not_overwrite_unmanaged_entry() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("bunkerbox-remote");
+    std::fs::write(&executable, b"remote").unwrap();
+    std::fs::write(root.path().join("cargo"), b"native").unwrap();
+    assert!(install_remote_cargo_link(root.path(), &executable, true).is_err());
+    assert_eq!(std::fs::read(root.path().join("cargo")).unwrap(), b"native");
 }
 
 #[test]

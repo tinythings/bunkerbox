@@ -16,3 +16,17 @@ fn selected_environment_uses_only_targeted_names() {
     std::env::remove_var("BB_TEST_REMOTE_ALLOWED");
     std::env::remove_var("BB_TEST_REMOTE_PATH");
 }
+
+#[test]
+fn cargo_environment_is_empty_even_when_names_are_requested() {
+    std::env::set_var("BB_TEST_CARGO_FLAGS", "should-not-forward");
+    assert!(selected_remote_environment_for_tool("cargo", vec!["BB_TEST_CARGO_FLAGS".into()]).is_empty());
+    std::env::remove_var("BB_TEST_CARGO_FLAGS");
+}
+
+#[test]
+fn cancel_request_uses_a_distinct_request_and_target_identity() {
+    let request = remote_cancel_request(RequestId([8; 16]), WorkspaceSessionId([2; 16]), RequestId([7; 16]));
+    assert_eq!(request.request_id, RequestId([8; 16]));
+    assert_eq!(request.operation, crate::vscomm::RemoteOperation::Cancel { target_request_id: RequestId([7; 16]) });
+}

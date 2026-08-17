@@ -371,3 +371,34 @@ fn project_artifact_paths_reject_traversal_globs_and_duplicates() {
         assert!(RemoteTargetConfig::load_from(&fixture.config).is_err());
     }
 }
+
+#[test]
+fn lifecycle_admission_and_worker_limits_are_loaded_with_safe_defaults() {
+    let fixture = Fixture::new();
+    let yaml = valid_yaml(&fixture, &fixture.project, "ssh", Some("ssh-one")).replace(
+        "      max-output-bytes: 67108864\n",
+        "      max-output-bytes: 67108864\n      idle-output-timeout-seconds: 7\n      cleanup-timeout-seconds: 3\n      max-active-builds: 2\n      max-worker-uploads: 3\n      max-worker-upload-bytes: 2M\n      max-worker-jobs: 2\n      max-worker-job-bytes: 4M\n      max-worker-artifact-spools: 2\n      max-worker-artifact-spool-bytes: 5M\n      max-worker-state-entries: 99\n",
+    );
+    write_config(&fixture, &yaml);
+    let target = RemoteTargetConfig::load_from(&fixture.config).unwrap().ssh_target("ssh-one").unwrap().resources();
+    assert_eq!(target.idle_output_timeout(), Duration::from_secs(7));
+    assert_eq!(target.cleanup_timeout(), Duration::from_secs(3));
+    assert_eq!(target.max_active_builds(), 2);
+    assert_eq!(target.worker_state_limits().max_uploads, 3);
+    assert_eq!(target.worker_state_limits().max_upload_bytes, 2 * 1024 * 1024);
+    assert_eq!(target.worker_state_limits().max_state_entries, 99);
+}
+
+#[test]
+fn lifecycle_and_admission_limits_reject_zero_or_excessive_values() {
+    let fixture = Fixture::new();
+    for replacement in [
+        ("      connect-timeout-seconds: 5", "      connect-timeout-seconds: 0"),
+        ("      max-output-bytes: 67108864", "      max-active-builds: 65\n      max-output-bytes: 67108864"),
+        ("      max-output-bytes: 67108864", "      cleanup-timeout-seconds: 0\n      max-output-bytes: 67108864"),
+    ] {
+        let yaml = valid_yaml(&fixture, &fixture.project, "ssh", Some("ssh-one")).replace(replacement.0, replacement.1);
+        write_config(&fixture, &yaml);
+        assert!(RemoteTargetConfig::load_from(&fixture.config).is_err());
+    }
+}

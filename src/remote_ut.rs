@@ -115,6 +115,36 @@ fn environment_policy_rejects_duplicates_and_control_data() {
 }
 
 #[test]
+fn cargo_requires_an_empty_guest_environment() {
+    let cargo = RemoteBuild::new(
+        WorkspaceRelativePath::new("src").unwrap(),
+        RemoteTool::new("cargo").unwrap(),
+        vec!["build".into()],
+        Vec::new(),
+        RemoteSnapshotId::from_bytes([9; 16]),
+    )
+    .unwrap();
+    let authorized =
+        policy(vec!["cargo".into()]).authorize(&context(), RemoteRequest::build(RequestId([1; 16]), WorkspaceSessionId([2; 16]), cargo)).unwrap();
+    let RemoteOperation::Build(build) = authorized.request().operation() else { panic!("expected build") };
+    assert!(build.env().is_empty());
+
+    let cargo_with_rustflags = RemoteBuild::new(
+        WorkspaceRelativePath::new("src").unwrap(),
+        RemoteTool::new("cargo").unwrap(),
+        vec!["build".into()],
+        vec![("RUSTFLAGS".into(), "-C opt-level=3".into())],
+        RemoteSnapshotId::from_bytes([9; 16]),
+    )
+    .unwrap();
+    assert_eq!(
+        policy(vec!["cargo".into()])
+            .authorize(&context(), RemoteRequest::build(RequestId([1; 16]), WorkspaceSessionId([2; 16]), cargo_with_rustflags)),
+        Err(RemoteAuthorizationError::ForbiddenEnvironment("RUSTFLAGS".into()))
+    );
+}
+
+#[test]
 fn command_policy_rejects_unapproved_arguments() {
     let policy = RemoteAuthorizationPolicy::from_policies(
         RemoteTargetId([3; 16]),
@@ -125,4 +155,34 @@ fn command_policy_rejects_unapproved_arguments() {
     .unwrap()
     .with_snapshot_authority(std::sync::Arc::new(TestSnapshotAuthority));
     assert_eq!(policy.authorize(&context(), request("make")), Err(RemoteAuthorizationError::ToolArgumentsNotAllowed("make".into())));
+
+    let cargo_policy = RemoteAuthorizationPolicy::from_policies(
+        RemoteTargetId([3; 16]),
+        WorkspaceSessionId([2; 16]),
+        [("cargo".into(), RemoteToolPolicy::new(false))],
+        RemoteEnvironmentPolicy::default(),
+    )
+    .unwrap()
+    .with_snapshot_authority(std::sync::Arc::new(TestSnapshotAuthority));
+    assert_eq!(cargo_policy.authorize(&context(), request("cargo")), Err(RemoteAuthorizationError::ToolArgumentsNotAllowed("cargo".into())));
+}
+
+#[test]
+fn request_and_cancel_ids_must_be_nonzero() {
+    let policy = policy(vec!["make".into()]);
+    assert_eq!(
+        policy.authorize(&context(), RemoteRequest::sync(RequestId([0; 16]), WorkspaceSessionId([2; 16]))),
+        Err(RemoteAuthorizationError::InvalidRequestId)
+    );
+    assert_eq!(
+        policy.authorize(&context(), RemoteRequest::cancel(RequestId([8; 16]), WorkspaceSessionId([2; 16]), RequestId([0; 16]))),
+        Err(RemoteAuthorizationError::InvalidCancelTarget)
+    );
+}
+
+#[test]
+fn admission_limits_have_safe_bounds() {
+    assert_eq!(RemoteAdmissionLimits::new(2, 1).unwrap(), RemoteAdmissionLimits { global_active: 2, target_active: 1 });
+    assert!(RemoteAdmissionLimits::new(0, 1).is_err());
+    assert!(RemoteAdmissionLimits::new(RemoteAdmissionLimits::MAX + 1, 1).is_err());
 }

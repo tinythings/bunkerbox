@@ -399,7 +399,11 @@ async fn scripted_worker_proves_end_to_end_ssh_transport_and_exact_build_result(
         assert!(joined.contains("IdentityAgent=none"));
         assert!(!joined.contains("literal $(arg)"));
         assert!(!joined.contains("snapshot_id"));
-        assert_eq!(spec.remote_command(), "exec '/usr/local/libexec/bunkerbox-worker' --stdio --workspace-root '/var/tmp/bunkerbox-workers'");
+        assert!(spec
+            .remote_command()
+            .starts_with("exec '/usr/local/libexec/bunkerbox-worker' --stdio --workspace-root '/var/tmp/bunkerbox-workers'"));
+        assert!(spec.remote_command().contains("--build-timeout-ms 5000"));
+        assert!(spec.remote_command().contains("--max-worker-uploads 2"));
     }
 }
 

@@ -2,8 +2,9 @@ use super::{dispatch_remote_frame, is_allowed, RemoteBroker, RemoteDispatchError
 use super::{monitor_bwrap_status, ChildEvent};
 use crate::cfg::EnvMode;
 use crate::remote::{
-    AuthorizedRemoteRequest, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteExecutionContext, RemoteFuture,
-    RemoteRequest, RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTargetId, RequestId, WorkspaceRelativePath, WorkspaceSessionId,
+    AuthorizedRemoteRequest, RemoteAdmissionLimits, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent,
+    RemoteExecutionContext, RemoteExecutionControl, RemoteFuture, RemoteRequest, RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTargetId,
+    RequestId, WorkspaceRelativePath, WorkspaceSessionId,
 };
 use crate::vscomm::{
     Frame, RemoteBuild as WireRemoteBuild, RemoteRequest as WireRemoteRequest, RemoteTool as WireRemoteTool, RequestId as WireRequestId,
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 #[test]
 fn bwrap_status_reports_command_start() {
@@ -64,7 +66,7 @@ impl RemoteSnapshotAuthority for RejectSnapshotAuthority {
 
 impl RemoteBackend for RecordingBackend {
     fn execute<'a>(
-        &'a self, request: AuthorizedRemoteRequest, events: mpsc::Sender<RemoteBackendEvent>,
+        &'a self, request: AuthorizedRemoteRequest, _control: RemoteExecutionControl, events: mpsc::Sender<RemoteBackendEvent>,
     ) -> RemoteFuture<'a, Result<(), RemoteBackendError>> {
         self.calls.lock().unwrap().push(request);
         let emit = self.emit.clone();
@@ -85,7 +87,7 @@ struct StreamingBackend {
 
 impl RemoteBackend for StreamingBackend {
     fn execute<'a>(
-        &'a self, _request: AuthorizedRemoteRequest, events: mpsc::Sender<RemoteBackendEvent>,
+        &'a self, _request: AuthorizedRemoteRequest, _control: RemoteExecutionControl, events: mpsc::Sender<RemoteBackendEvent>,
     ) -> RemoteFuture<'a, Result<(), RemoteBackendError>> {
         let event_count = self.event_count;
         let release = self.release.clone();
@@ -103,11 +105,33 @@ struct HangingBackend;
 
 impl RemoteBackend for HangingBackend {
     fn execute<'a>(
-        &'a self, _request: AuthorizedRemoteRequest, events: mpsc::Sender<RemoteBackendEvent>,
+        &'a self, _request: AuthorizedRemoteRequest, _control: RemoteExecutionControl, events: mpsc::Sender<RemoteBackendEvent>,
     ) -> RemoteFuture<'a, Result<(), RemoteBackendError>> {
         Box::pin(async move {
             events.send(RemoteBackendEvent::Stdout(b"first".to_vec())).await.map_err(|_| RemoteBackendError::Cancelled)?;
             std::future::pending::<Result<(), RemoteBackendError>>().await
+        })
+    }
+}
+
+struct HoldingBackend {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl RemoteBackend for HoldingBackend {
+    fn execute<'a>(
+        &'a self, _request: AuthorizedRemoteRequest, control: RemoteExecutionControl, events: mpsc::Sender<RemoteBackendEvent>,
+    ) -> RemoteFuture<'a, Result<(), RemoteBackendError>> {
+        let started = self.started.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            events.send(RemoteBackendEvent::Stdout(b"active".to_vec())).await.map_err(|_| RemoteBackendError::Cancelled)?;
+            started.notify_one();
+            tokio::select! {
+                _ = release.notified() => events.send(RemoteBackendEvent::Completed { exit_code: 0 }).await.map_err(|_| RemoteBackendError::Cancelled),
+                _ = control.cancelled() => Err(RemoteBackendError::Cancelled),
+            }
         })
     }
 }
@@ -129,8 +153,12 @@ impl AsyncWrite for FailingWriter {
 }
 
 fn remote_request(tool: &str) -> RemoteRequest {
+    remote_request_with_id(tool, RequestId([1; 16]))
+}
+
+fn remote_request_with_id(tool: &str, request_id: RequestId) -> RemoteRequest {
     RemoteRequest::build(
-        RequestId([1; 16]),
+        request_id,
         WorkspaceSessionId([2; 16]),
         crate::remote::RemoteBuild::new(
             WorkspaceRelativePath::new("src").unwrap(),
@@ -352,6 +380,56 @@ async fn writer_failure_cancels_hanging_backend_without_waiting_forever() {
             .unwrap();
 
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn admission_rejects_active_excess_without_calling_backend() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let broker = Arc::new(
+        remote_broker(Arc::new(HoldingBackend { started: started.clone(), release: release.clone() }))
+            .with_admission_limits(RemoteAdmissionLimits::new(1, 1).unwrap()),
+    );
+    let (first_tx, mut first_rx) = mpsc::channel(8);
+    let first = tokio::spawn({
+        let broker = broker.clone();
+        async move { broker.dispatch(remote_request_with_id("make", RequestId([1; 16])), first_tx).await }
+    });
+    started.notified().await;
+
+    let (second_tx, mut second_rx) = mpsc::channel(8);
+    let error = broker.dispatch(remote_request_with_id("make", RequestId([2; 16])), second_tx).await.unwrap_err();
+    assert!(matches!(error, RemoteDispatchError::Backend(RemoteBackendError::Transport { class: crate::remote::RemoteFailureClass::Busy, .. })));
+    assert!(matches!(second_rx.recv().await, Some(RemoteBackendEvent::Error { message }) if message.contains("busy")));
+
+    release.notify_one();
+    assert!(first.await.unwrap().is_ok());
+    assert_eq!(first_rx.recv().await, Some(RemoteBackendEvent::Stdout(b"active".to_vec())));
+    assert_eq!(first_rx.recv().await, Some(RemoteBackendEvent::Completed { exit_code: 0 }));
+}
+
+#[tokio::test]
+async fn cancel_acknowledges_separately_and_emits_one_target_terminal() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let broker = Arc::new(
+        remote_broker(Arc::new(HoldingBackend { started: started.clone(), release }))
+            .with_admission_limits(RemoteAdmissionLimits::new(2, 1).unwrap()),
+    );
+    let (target_tx, mut target_rx) = mpsc::channel(8);
+    let target = tokio::spawn({
+        let broker = broker.clone();
+        async move { broker.dispatch(remote_request_with_id("make", RequestId([1; 16])), target_tx).await }
+    });
+    started.notified().await;
+    assert_eq!(target_rx.recv().await, Some(RemoteBackendEvent::Stdout(b"active".to_vec())));
+
+    let (cancel_tx, mut cancel_rx) = mpsc::channel(8);
+    broker.dispatch(RemoteRequest::cancel(RequestId([8; 16]), WorkspaceSessionId([2; 16]), RequestId([1; 16])), cancel_tx).await.unwrap();
+    assert_eq!(cancel_rx.recv().await, Some(RemoteBackendEvent::Completed { exit_code: 0 }));
+    assert_eq!(target_rx.recv().await, Some(RemoteBackendEvent::Cancelled));
+    assert!(target_rx.try_recv().is_err());
+    assert!(matches!(target.await.unwrap(), Err(RemoteDispatchError::Backend(RemoteBackendError::Cancelled))));
 }
 
 #[test]

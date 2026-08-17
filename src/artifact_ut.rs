@@ -1,4 +1,5 @@
 use super::*;
+use crate::remote::RemoteExecutionControl;
 use std::fs;
 use std::io::Read;
 use tempfile::tempdir;
@@ -111,6 +112,30 @@ fn local_capture_rejects_symlink_outputs() {
     std::os::unix::fs::symlink("/etc/passwd", job.join("result")).unwrap();
     let policy = ArtifactPolicy::new(vec!["result".to_string()]).unwrap();
     assert!(LocalArtifactSpool::capture(&job, &jobs, &policy, limits()).is_err());
+}
+
+#[test]
+fn cancelled_artifact_capture_and_copy_leave_no_publication() {
+    let temp = tempdir().unwrap();
+    let job = temp.path().join("job");
+    let workspace = temp.path().join("workspace");
+    let jobs = temp.path().join("jobs");
+    fs::create_dir(&job).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&jobs).unwrap();
+    fs::write(job.join("result"), b"artifact").unwrap();
+    let policy = ArtifactPolicy::new(vec!["result".to_string()]).unwrap();
+    let control = RemoteExecutionControl::new();
+    control.cancel();
+
+    assert!(LocalArtifactSpool::capture_with_control(&job, &jobs, &policy, limits(), &control).is_err());
+
+    let entry = ArtifactEntry::new("result", 0o644, 8, sha256(b"artifact")).unwrap();
+    let manifest = ArtifactManifest::new(vec![entry], 8, &policy, limits()).unwrap();
+    let mut publication = ArtifactPublication::new(&workspace, [4; 16], manifest).unwrap();
+    assert!(publication.copy_from_reader_with_control(0, &mut &b"artifact"[..], &control).is_err());
+    drop(publication);
+    assert!(!workspace.join(".bunkerbox/artifacts/.staging/04040404040404040404040404040404").exists());
 }
 
 fn sha256(value: &[u8]) -> [u8; 32] {

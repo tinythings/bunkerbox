@@ -4,6 +4,8 @@ use crate::remote::{
     RemoteAuthorizationPolicy, RemoteBuild, RemoteExecutionContext, RemoteFailureClass, RemoteRequest, RemoteSnapshotAuthority, RemoteSnapshotId,
     RemoteTool, RequestId, WorkspaceRelativePath,
 };
+use std::env;
+use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 fn fixture() -> (TempDir, Arc<RunRemoteSession>, RemoteTargetId, WorkspaceSessionId) {
@@ -457,7 +459,7 @@ async fn timeout_kills_a_direct_child_process() {
     let backend = LoopbackBackend::new(session, tools).with_timeout(Duration::from_millis(50));
     let (events, _receiver) = mpsc::channel(8);
     let request = authorized_build(target, session_id, "sleep", vec!["5".to_string()], Vec::new(), snapshot_id);
-    assert_eq!(backend.execute(request, events).await, Err(RemoteBackendError::Timeout));
+    assert_eq!(backend.execute(request, events).await, Err(RemoteBackendError::Deadline { cause: crate::remote::RemoteTimeoutCause::Build }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -507,6 +509,99 @@ async fn loopback_missing_required_artifact_is_a_terminal_artifact_failure() {
     let (events, receiver) = mpsc::channel(16);
     let request = authorized_build(target, session_id, "make", vec!["ok".into()], Vec::new(), snapshot_id);
     assert!(matches!(backend.execute(request, events).await, Err(RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, .. })));
+    let events = collect_events(receiver).await;
+    assert!(!events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { .. })));
+    assert!(fs::read_dir(&session.jobs_root).unwrap().next().is_none());
+}
+
+fn cargo_fixture_session(temp: &TempDir) -> (Arc<RunRemoteSession>, RemoteTargetId, WorkspaceSessionId) {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/remote-cargo");
+    let workspace = temp.path().join("cargo-workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    for relative in ["Cargo.toml", "build.rs", "src/main.rs"] {
+        fs::copy(source.join(relative), workspace.join(relative)).unwrap();
+    }
+    let session_id = WorkspaceSessionId([11; 16]);
+    let target = RemoteTargetId([12; 16]);
+    let snapshot_store = SnapshotStore::new(temp.path().join("cargo-snapshots"));
+    let exclusions = crate::snapshot::SnapshotExclusionPolicy::from_patterns(Vec::<String>::new()).unwrap();
+    let builder = SnapshotBuilder::new(snapshot_store.clone(), crate::snapshot::SnapshotLimits::default(), exclusions);
+    let session = Arc::new(RunRemoteSession::new(session_id, target, workspace, snapshot_store, builder, temp.path().join("cargo-jobs")).unwrap());
+    (session, target, session_id)
+}
+
+fn cargo_executable() -> PathBuf {
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join("cargo"))
+        .find(|path| path.is_file() && fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0))
+        .expect("Cargo must be available on PATH for the remote Cargo fixture")
+}
+
+fn cargo_target_environment() -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    for name in ["PATH", "HOME", "RUSTUP_HOME", "CARGO_HOME"] {
+        if let Ok(value) = env::var(name) {
+            environment.insert(name.to_string(), value);
+        }
+    }
+    environment
+}
+
+fn authorized_cargo_build(
+    target: RemoteTargetId, session: WorkspaceSessionId, request_id: u8, args: Vec<String>, snapshot_id: RemoteSnapshotId,
+) -> crate::remote::AuthorizedRemoteRequest {
+    let build = RemoteBuild::new(WorkspaceRelativePath::new("").unwrap(), RemoteTool::new("cargo").unwrap(), args, Vec::new(), snapshot_id).unwrap();
+    let request = RemoteRequest::build(RequestId([request_id; 16]), session, build);
+    let policy = RemoteAuthorizationPolicy::new(target, session, vec!["cargo".to_string()]).with_snapshot_authority(Arc::new(TestSnapshotAuthority));
+    policy.authorize(&RemoteExecutionContext { target, workspace_session_id: session }, request).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cargo_fixture_runs_build_script_nested_cargo_and_trusted_artifact_flow() {
+    let temp = tempfile::tempdir().unwrap();
+    let (session, target, session_id) = cargo_fixture_session(&temp);
+    let cargo = cargo_executable();
+    let mut tools = BTreeMap::new();
+    tools.insert("cargo".to_string(), cargo);
+    let target_environment = cargo_target_environment();
+    let artifact = "target/debug/bunkerbox-cargo-fixture-artifact.txt".to_string();
+    let backend = LoopbackBackend::new(session.clone(), tools.clone())
+        .with_target_environment(target_environment.clone())
+        .with_artifacts(ArtifactPolicy::new(vec![artifact.clone()]).unwrap(), ArtifactLimits::default());
+    let snapshot_id = sync_capability(&backend, target, session_id).await;
+    let (events, receiver) = mpsc::channel(64);
+    assert_eq!(
+        backend.execute(authorized_cargo_build(target, session_id, 13, vec!["build".into(), "--offline".into()], snapshot_id), events).await,
+        Ok(())
+    );
+    let events = collect_events(receiver).await;
+    let output = events
+        .iter()
+        .filter_map(|event| match event {
+            RemoteBackendEvent::Stdout(bytes) | RemoteBackendEvent::Stderr(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(String::from_utf8_lossy(&output).contains("bunkerbox-cargo-fixture-build-script"));
+    assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { exit_code: 0 })));
+    assert!(session
+        .workspace_root()
+        .join(".bunkerbox/artifacts/0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d/target/debug/bunkerbox-cargo-fixture-artifact.txt")
+        .is_file());
+
+    let backend = LoopbackBackend::new(session.clone(), tools)
+        .with_target_environment(target_environment)
+        .with_artifacts(ArtifactPolicy::new(vec!["target/debug/missing-cargo-artifact".to_string()]).unwrap(), ArtifactLimits::default());
+    let snapshot_id = sync_capability(&backend, target, session_id).await;
+    let (events, receiver) = mpsc::channel(64);
+    assert!(matches!(
+        backend.execute(authorized_cargo_build(target, session_id, 14, vec!["build".into(), "--offline".into()], snapshot_id), events).await,
+        Err(RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, .. })
+    ));
     let events = collect_events(receiver).await;
     assert!(!events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { .. })));
     assert!(fs::read_dir(&session.jobs_root).unwrap().next().is_none());

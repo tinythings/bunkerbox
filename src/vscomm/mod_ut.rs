@@ -101,6 +101,28 @@ fn diagnostic_remote_sync_does_not_retain_capability() {
 }
 
 #[test]
+fn remote_cancel_round_trips_as_operation_kind_three() {
+    let (request_id, session_id) = ids();
+    let request = RemoteRequest::cancel(request_id, session_id, RequestId([7; 16]));
+    let frame = request.to_frame().unwrap();
+    assert_eq!(frame.payload[6], 3);
+    assert_eq!(RemoteRequest::from_frame(frame).unwrap(), request);
+    let domain = request.into_domain().unwrap();
+    assert_eq!(domain.operation(), &crate::remote::RemoteOperation::Cancel { target_request_id: crate::remote::RequestId([7; 16]) });
+}
+
+#[test]
+fn remote_cancel_rejects_zero_target() {
+    let (request_id, session_id) = ids();
+    assert!(RemoteRequest::cancel(request_id, session_id, RequestId([0; 16])).to_frame().is_err());
+}
+
+#[test]
+fn remote_event_rejects_zero_request_id() {
+    assert!(RemoteEvent { request_id: RequestId([0; 16]), kind: RemoteEventKind::Cancelled }.to_frame().is_err());
+}
+
+#[test]
 fn invalid_remote_sync_capability_flag_is_rejected() {
     let (request_id, session_id) = ids();
     let mut frame = RemoteRequest::diagnostic_sync(request_id, session_id).to_frame().unwrap();

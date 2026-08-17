@@ -540,6 +540,10 @@ fn load_or_create_validates_remote_policy_configuration() {
     let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
     assert_eq!(cfg.project.remote.environment, vec!["PROJECT_MODE"]);
     assert_eq!(cfg.project.remote.tools, vec![RemoteToolSpec { name: "make".into(), allow_args: false }]);
+
+    write_project_conf(root.path(), "project:\n  remote:\n    tools:\n      - name: cargo\n        allow-args: true\n");
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+    assert_eq!(cfg.project.remote.tools, vec![RemoteToolSpec { name: "cargo".into(), allow_args: true }]);
 }
 
 #[test]
@@ -547,4 +551,44 @@ fn load_or_create_rejects_forbidden_remote_environment() {
     let root = TempDir::new().unwrap();
     write_project_conf(root.path(), "project:\n  remote:\n    environment:\n      - SSH_AUTH_SOCK\n");
     assert!(ProjectConfig::load_or_create(root.path()).is_err());
+}
+
+#[test]
+fn remote_global_active_build_limit_defaults_and_rejects_invalid_values() {
+    let config = RuntimeConfig {
+        oci: PathBuf::from("/usr/bin/oci"),
+        image: "image".into(),
+        network: None,
+        allow: None,
+        workspace: None,
+        workspace_quota: None,
+        workspace_exclude: None,
+        home: None,
+        home_path: None,
+        encrypt: None,
+        session_mb: None,
+        session_cleanup: None,
+        command: None,
+        remote_max_active_builds: None,
+    };
+    assert_eq!(config.remote_max_active_builds().unwrap(), 2);
+    for value in [Some(0), Some((crate::remote::RemoteAdmissionLimits::MAX + 1) as u64)] {
+        let config = RuntimeConfig {
+            oci: PathBuf::from("/usr/bin/oci"),
+            image: "image".into(),
+            network: None,
+            allow: None,
+            workspace: None,
+            workspace_quota: None,
+            workspace_exclude: None,
+            home: None,
+            home_path: None,
+            encrypt: None,
+            session_mb: None,
+            session_cleanup: None,
+            command: None,
+            remote_max_active_builds: value,
+        };
+        assert!(config.remote_max_active_builds().is_err());
+    }
 }

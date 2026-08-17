@@ -1,6 +1,6 @@
 use super::*;
 use crate::cfg::{ProjectConfig, ProjectSection, RemoteSection};
-use crate::remote::WorkspaceSessionId;
+use crate::remote::{RemoteExecutionControl, WorkspaceSessionId};
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixListener;
@@ -46,6 +46,22 @@ fn write_file(root: &Path, path: &str, contents: &[u8]) {
     let path = root.join(path);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, contents).unwrap();
+}
+
+#[test]
+fn cancellation_stops_snapshot_creation_and_materialization_before_publication() {
+    let source = TempDir::new().unwrap();
+    let store = TempDir::new().unwrap();
+    write_file(source.path(), "result", b"snapshot");
+    let builder = builder(&store, SnapshotLimits::default(), &[]);
+    let control = RemoteExecutionControl::new();
+    control.cancel();
+    assert!(builder.build_root_with_control(source.path(), session(1), control.clone()).is_err());
+
+    let snapshot = builder.build_root(source.path(), session(1)).unwrap();
+    let destination = store.path().join("materialized");
+    assert!(builder.store.materialize_with_control(&snapshot.handle, &destination, control).is_err());
+    assert!(!destination.exists());
 }
 
 #[test]

@@ -163,6 +163,78 @@ fn outstanding_snapshot_capabilities_are_bounded_and_consumption_frees_a_slot() 
     drop(temp);
 }
 
+#[test]
+fn export_claim_uses_the_exact_capability_and_releases_its_snapshot() {
+    let (_temp, session, _target, _session_id) = fixture();
+    fs::write(session.workspace_root().join("src/input.txt"), b"A\n").unwrap();
+    let snapshot_a = session.sync_snapshot().unwrap();
+    fs::write(session.workspace_root().join("src/input.txt"), b"B\n").unwrap();
+    let snapshot_b = session.sync_snapshot().unwrap();
+
+    let claim_a = session.claim_snapshot_for_export(snapshot_a).unwrap();
+    let entry_a = claim_a.entries().iter().find(|entry| entry.path().as_str() == "src/input.txt").unwrap();
+    assert_eq!(claim_a.handle().session_id(), session.session_id());
+    assert_eq!(claim_a.read_file(entry_a).unwrap(), b"A\n");
+    assert!(claim_a.read_file_bounded(entry_a, 1).is_err());
+    assert_eq!(claim_a.total_file_bytes(), 2);
+    assert!(session.snapshot_capabilities.lock().unwrap().capabilities.contains_key(&snapshot_a));
+    assert!(session.snapshot_capabilities.lock().unwrap().capabilities.contains_key(&snapshot_b));
+    assert_eq!(published_snapshot_count(&session), 2);
+
+    drop(claim_a);
+    session.abort_snapshot_capability(snapshot_a).unwrap();
+    assert_eq!(published_snapshot_count(&session), 1);
+
+    let claim_b = session.claim_snapshot_for_export(snapshot_b).unwrap();
+    let entry_b = claim_b.entries().iter().find(|entry| entry.path().as_str() == "src/input.txt").unwrap();
+    assert_eq!(claim_b.read_file(entry_b).unwrap(), b"B\n");
+    drop(claim_b);
+    session.abort_snapshot_capability(snapshot_b).unwrap();
+    assert_eq!(published_snapshot_count(&session), 0);
+}
+
+#[test]
+fn export_claim_rejects_missing_replay_and_cross_session_capabilities() {
+    let (_temp_a, session_a, _target_a, _session_id_a) = fixture();
+    let snapshot_id = session_a.sync_snapshot().unwrap();
+    let (_temp_b, session_b, _target_b, _session_id_b) = fixture();
+
+    assert!(session_a.claim_snapshot_for_export(RemoteSnapshotId::from_bytes([9; 16])).is_err());
+    assert!(session_b.claim_snapshot_for_export(snapshot_id).is_err());
+    assert!(session_a.snapshot_capabilities.lock().unwrap().capabilities.contains_key(&snapshot_id));
+
+    let claim = session_a.claim_snapshot_for_export(snapshot_id).unwrap();
+    assert!(session_a.snapshot_capabilities.lock().unwrap().capabilities.contains_key(&snapshot_id));
+    drop(claim);
+    session_a.abort_snapshot_capability(snapshot_id).unwrap();
+    assert_eq!(published_snapshot_count(&session_a), 0);
+}
+
+#[test]
+fn aborting_an_unclaimed_capability_releases_snapshot_storage() {
+    let (_temp, session, _target, _session_id) = fixture();
+    let snapshot_id = session.sync_snapshot().unwrap();
+
+    assert_eq!(published_snapshot_count(&session), 1);
+    session.abort_snapshot_capability(snapshot_id).unwrap();
+    assert_eq!(published_snapshot_count(&session), 0);
+    assert!(session.claim_snapshot_for_export(snapshot_id).is_err());
+    assert!(session.abort_snapshot_capability(snapshot_id).is_err());
+}
+
+#[test]
+fn export_claim_keeps_session_cleanup_scoped_until_drop() {
+    let (_temp, session, _target, _session_id) = fixture();
+    let snapshot_id = session.sync_snapshot().unwrap();
+    let snapshot_root = session.snapshot_store_root();
+    let claim = session.claim_snapshot_for_export(snapshot_id).unwrap();
+
+    drop(session);
+    assert!(snapshot_root.exists());
+    drop(claim);
+    assert!(!snapshot_root.exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interleaved_syncs_build_their_own_snapshot_capabilities() {
     let (_temp, session, target, session_id) = fixture();

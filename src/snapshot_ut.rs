@@ -341,3 +341,31 @@ fn materialization_rejects_destination_symlink() {
     assert!(SnapshotStore::new(store_dir.path()).materialize(snapshot.handle(), &destination).is_err());
     assert!(outside.path().read_dir().unwrap().next().is_none());
 }
+
+#[test]
+fn export_reads_validated_manifest_files_with_bounded_no_follow_access() {
+    let source = TempDir::new().unwrap();
+    let store_dir = TempDir::new().unwrap();
+    write_file(source.path(), "nested/file", b"abcdef");
+    let snapshot = build_at(&source, &store_dir, SnapshotLimits::default(), &[]).unwrap();
+    let store = SnapshotStore::new(store_dir.path());
+    let export = store.resolve_export(snapshot.handle()).unwrap();
+    let entry = snapshot.entries().iter().find(|entry| entry.path().as_str() == "nested/file").unwrap();
+
+    assert_eq!(export.entries(), snapshot.entries());
+    assert_eq!(export.read_file(entry).unwrap(), b"abcdef");
+    assert!(export.read_file_bounded(entry, 5).is_err());
+
+    let staged_file = store.snapshot_path(snapshot.handle()).join("files/nested/file");
+    fs::write(&staged_file, b"ghijkl").unwrap();
+    assert!(export.read_file(entry).is_err());
+
+    fs::write(&staged_file, b"abcdef-longer").unwrap();
+    assert!(export.read_file(entry).is_err());
+
+    fs::remove_file(&staged_file).unwrap();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("file"), b"abcdef").unwrap();
+    symlink(outside.path().join("file"), &staged_file).unwrap();
+    assert!(export.read_file(entry).is_err());
+}

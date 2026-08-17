@@ -2,7 +2,7 @@ use crate::remote::{
     AuthorizedRemoteRequest, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteFuture, RemoteOperation, RemoteResourcePolicy,
     RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTargetId, WorkspaceSessionId,
 };
-use crate::snapshot::{SnapshotBuilder, SnapshotHandle, SnapshotStore};
+use crate::snapshot::{SnapshotBuilder, SnapshotEntry, SnapshotExport, SnapshotHandle, SnapshotStore};
 use rand::RngCore;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -80,6 +80,11 @@ impl RunRemoteSession {
         self.snapshot_store.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn snapshot_capability_count(&self) -> usize {
+        self.snapshot_capabilities.lock().map(|registry| registry.capabilities.len()).unwrap_or(0)
+    }
+
     pub fn sync_snapshot(&self) -> Result<RemoteSnapshotId, String> {
         self.sync_snapshot_for_request(true)?.ok_or_else(|| "retained snapshot capability was not created".to_string())
     }
@@ -133,10 +138,42 @@ impl RunRemoteSession {
         }
     }
 
-    fn claim_snapshot(self: &Arc<Self>, snapshot_id: RemoteSnapshotId) -> Result<SnapshotClaim, String> {
+    #[allow(dead_code)]
+    pub(crate) fn abort_snapshot_capability(&self, snapshot_id: RemoteSnapshotId) -> Result<(), String> {
+        let handle = self
+            .snapshot_capabilities
+            .lock()
+            .map_err(|_| "remote snapshot registry lock poisoned".to_string())?
+            .capabilities
+            .remove(&snapshot_id)
+            .ok_or_else(|| "remote snapshot capability is unavailable".to_string())?;
+        self.release_snapshot(&handle);
+        Ok(())
+    }
+
+    pub(crate) fn claim_snapshot(self: &Arc<Self>, snapshot_id: RemoteSnapshotId) -> Result<SnapshotClaim, String> {
         let mut registry = self.snapshot_capabilities.lock().map_err(|_| "remote snapshot registry lock poisoned".to_string())?;
         let handle = registry.capabilities.remove(&snapshot_id).ok_or_else(|| "remote snapshot capability is unavailable".to_string())?;
         Ok(SnapshotClaim { session: self.clone(), handle })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn claim_snapshot_for_export(self: &Arc<Self>, snapshot_id: RemoteSnapshotId) -> Result<SnapshotExportClaim, String> {
+        let handle = {
+            let mut registry = self.snapshot_capabilities.lock().map_err(|_| "remote snapshot registry lock poisoned".to_string())?;
+            let handle = registry.capabilities.get(&snapshot_id).cloned().ok_or_else(|| "remote snapshot capability is unavailable".to_string())?;
+            let references = registry.references.entry(handle.clone()).or_insert(0);
+            *references = references.checked_add(1).ok_or_else(|| "remote snapshot capability reference count overflow".to_string())?;
+            handle
+        };
+        let snapshot = match self.snapshot_store.resolve_export(&handle) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.release_snapshot(&handle);
+                return Err(error);
+            }
+        };
+        Ok(SnapshotExportClaim { session: self.clone(), handle, snapshot })
     }
 
     fn release_snapshot(&self, handle: &SnapshotHandle) {
@@ -182,7 +219,7 @@ struct SnapshotCapabilityRegistry {
     references: HashMap<SnapshotHandle, usize>,
 }
 
-struct SnapshotClaim {
+pub(crate) struct SnapshotClaim {
     session: Arc<RunRemoteSession>,
     handle: SnapshotHandle,
 }
@@ -202,6 +239,42 @@ impl SnapshotClaim {
 }
 
 impl Drop for SnapshotClaim {
+    fn drop(&mut self) {
+        self.session.release_snapshot(&self.handle);
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct SnapshotExportClaim {
+    session: Arc<RunRemoteSession>,
+    handle: SnapshotHandle,
+    snapshot: SnapshotExport,
+}
+
+#[allow(dead_code)]
+impl SnapshotExportClaim {
+    pub(crate) fn handle(&self) -> &SnapshotHandle {
+        &self.handle
+    }
+
+    pub(crate) fn entries(&self) -> &[SnapshotEntry] {
+        self.snapshot.entries()
+    }
+
+    pub(crate) fn total_file_bytes(&self) -> u64 {
+        self.snapshot.total_file_bytes()
+    }
+
+    pub(crate) fn read_file(&self, entry: &SnapshotEntry) -> Result<Vec<u8>, String> {
+        self.snapshot.read_file(entry)
+    }
+
+    pub(crate) fn read_file_bounded(&self, entry: &SnapshotEntry, max_bytes: u64) -> Result<Vec<u8>, String> {
+        self.snapshot.read_file_bounded(entry, max_bytes)
+    }
+}
+
+impl Drop for SnapshotExportClaim {
     fn drop(&mut self) {
         self.session.release_snapshot(&self.handle);
     }

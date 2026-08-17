@@ -266,8 +266,10 @@ impl Drop for LocalArtifactSpool {
 }
 
 pub struct ArtifactPublication {
-    staging: PathBuf,
-    final_path: PathBuf,
+    artifacts: File,
+    staging_root: File,
+    staging: File,
+    request: String,
     manifest: ArtifactManifest,
     written: BTreeSet<usize>,
     published: bool,
@@ -275,17 +277,16 @@ pub struct ArtifactPublication {
 
 impl ArtifactPublication {
     pub fn new(workspace_root: &Path, request_id: [u8; 16], manifest: ArtifactManifest) -> Result<Self, String> {
-        let artifacts = ensure_directory_path(workspace_root, &[ARTIFACT_ROOT, ARTIFACT_DIRECTORY])?;
-        let staging_root = ensure_directory_path(&artifacts, &[STAGING_DIRECTORY])?;
+        let workspace = open_directory(workspace_root).map_err(|error| format!("open artifact workspace: {error}"))?;
+        let bunkerbox = ensure_directory_at(&workspace, ARTIFACT_ROOT)?;
+        let artifacts = ensure_directory_at(&bunkerbox, ARTIFACT_DIRECTORY)?;
+        let staging_root = ensure_directory_at(&artifacts, STAGING_DIRECTORY)?;
         let request = hex_id(request_id);
-        let staging = staging_root.join(&request);
-        let final_path = artifacts.join(&request);
-        if fs::symlink_metadata(&staging).is_ok() || fs::symlink_metadata(&final_path).is_ok() {
+        if entry_exists_at(&artifacts, &request).map_err(|error| format!("inspect artifact destination: {error}"))? {
             return Err(format!("artifact destination already exists for request {request}"));
         }
-        fs::create_dir(&staging).map_err(|error| format!("create artifact staging directory: {error}"))?;
-        set_private_mode(&staging)?;
-        Ok(Self { staging, final_path, manifest, written: BTreeSet::new(), published: false })
+        let staging = create_directory_at(&staging_root, &request, 0o700).map_err(|error| format!("create artifact staging directory: {error}"))?;
+        Ok(Self { artifacts, staging_root, staging, request, manifest, written: BTreeSet::new(), published: false })
     }
 
     pub fn begin(&self, index: usize) -> Result<ArtifactWriter, String> {
@@ -293,16 +294,7 @@ impl ArtifactPublication {
             return Err(format!("artifact entry was already written: {index}"));
         }
         let entry = self.manifest.entry(index).ok_or_else(|| "artifact index is out of range".to_string())?.clone();
-        let components = artifact_components(&entry.path)?;
-        let (name, parents) = components.split_last().ok_or_else(|| "artifact path is empty".to_string())?;
-        let parent = ensure_directory_components(&self.staging, parents)?;
-        let path = parent.join(name);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
+        let file = create_relative_file(&self.staging, &entry.path, 0o600)
             .map_err(|error| format!("create artifact staging file {}: {error}", entry.path))?;
         Ok(ArtifactWriter { index, entry, file, written: 0, hasher: Sha256::new() })
     }
@@ -333,12 +325,8 @@ impl ArtifactPublication {
         if self.written.len() != self.manifest.entries.len() {
             return Err("artifact publication is missing entries".to_string());
         }
-        if fs::symlink_metadata(&self.final_path).is_ok() {
-            return Err("artifact destination appeared before publication".to_string());
-        }
-        fs::rename(&self.staging, &self.final_path).map_err(|error| format!("publish artifacts: {error}"))?;
-        let parent = self.final_path.parent().ok_or_else(|| "artifact destination has no parent".to_string())?;
-        File::open(parent).and_then(|file| file.sync_all()).map_err(|error| format!("flush artifact destination: {error}"))?;
+        rename_noreplace(&self.staging_root, &self.request, &self.artifacts, &self.request).map_err(|error| format!("publish artifacts: {error}"))?;
+        self.artifacts.sync_all().map_err(|error| format!("flush artifact destination: {error}"))?;
         self.published = true;
         Ok(())
     }
@@ -347,7 +335,7 @@ impl ArtifactPublication {
 impl Drop for ArtifactPublication {
     fn drop(&mut self) {
         if !self.published {
-            let _ = fs::remove_dir_all(&self.staging);
+            cleanup_publication(&self.staging_root, &self.staging, &self.request, &self.manifest);
         }
     }
 }
@@ -434,44 +422,122 @@ fn create_unique_directory(parent: &Path, label: &str) -> Result<PathBuf, String
     Err(format!("could not reserve a private {label}"))
 }
 
-fn ensure_directory_path(root: &Path, components: &[&str]) -> Result<PathBuf, String> {
-    let mut current = root.to_path_buf();
-    for component in components {
-        if component.is_empty() || *component == "." || *component == ".." || component.contains('/') {
-            return Err("artifact destination contains an invalid component".to_string());
-        }
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => return Err(format!("artifact destination component is not a directory: {}", current.display())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&current).map_err(|create_error| format!("create artifact destination directory: {create_error}"))?;
-                set_private_mode(&current)?;
-            }
-            Err(error) => return Err(format!("inspect artifact destination: {error}")),
+fn ensure_directory_at(parent: &File, name: &str) -> Result<File, String> {
+    let name = component_name(name).map_err(|error| format!("invalid artifact directory component: {error}"))?;
+    let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0;
+    if !created {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(format!("create artifact directory: {error}"));
         }
     }
-    Ok(current)
+    let name = name.to_str().map_err(|_| "artifact directory component is not UTF-8".to_string())?;
+    let directory = open_directory_at(parent, name).map_err(|error| format!("open artifact directory: {error}"))?;
+    if created {
+        set_private_mode_fd(&directory)?;
+    }
+    Ok(directory)
 }
 
-fn ensure_directory_components(root: &Path, components: &[&str]) -> Result<PathBuf, String> {
-    let mut current = root.to_path_buf();
-    for component in components {
-        if component.is_empty() || *component == "." || *component == ".." || component.contains('/') {
-            return Err("artifact path contains an invalid component".to_string());
+fn create_directory_at(parent: &File, name: &str, mode: u32) -> io::Result<File> {
+    let name = component_name(name)?;
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let name = name.to_str().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "artifact directory component is not UTF-8"))?;
+    let directory = match open_directory_at(parent, name) {
+        Ok(directory) => directory,
+        Err(error) => {
+            let _ = unlink_at(parent, name, libc::AT_REMOVEDIR);
+            return Err(error);
         }
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => return Err(format!("artifact parent is not a directory: {}", current.display())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&current).map_err(|create_error| format!("create artifact parent: {create_error}"))?;
-                set_private_mode(&current)?;
-            }
-            Err(error) => return Err(format!("inspect artifact parent: {error}")),
+    };
+    if let Err(error) = set_private_mode_fd_io(&directory, mode) {
+        let _ = unlink_at(parent, name, libc::AT_REMOVEDIR);
+        return Err(error);
+    }
+    Ok(directory)
+}
+
+fn entry_exists_at(parent: &File, name: &str) -> io::Result<bool> {
+    let name = component_name(name)?;
+    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    let result = unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), &mut metadata, libc::AT_SYMLINK_NOFOLLOW) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+fn rename_noreplace(from_parent: &File, from_name: &str, to_parent: &File, to_name: &str) -> io::Result<()> {
+    let from_name = component_name(from_name)?;
+    let to_name = component_name(to_name)?;
+    #[cfg(target_os = "linux")]
+    {
+        let result =
+            unsafe { libc::renameat2(from_parent.as_raw_fd(), from_name.as_ptr(), to_parent.as_raw_fd(), to_name.as_ptr(), libc::RENAME_NOREPLACE) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
-    Ok(current)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (from_parent, from_name, to_parent, to_name);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "artifact publication requires renameat2"))
+    }
+}
+
+fn cleanup_publication(staging_root: &File, staging: &File, request: &str, manifest: &ArtifactManifest) {
+    let mut directories = Vec::new();
+    for entry in &manifest.entries {
+        let Ok(components) = artifact_components(&entry.path) else { continue };
+        let _ = unlink_relative(staging, &components, 0);
+        for count in 1..components.len() {
+            directories.push(components[..count].join("/"));
+        }
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.split('/').count()));
+    directories.dedup();
+    for directory in directories {
+        if let Ok(components) = artifact_components(&directory) {
+            let _ = unlink_relative(staging, &components, libc::AT_REMOVEDIR);
+        }
+    }
+    let _ = unlink_at(staging_root, request, libc::AT_REMOVEDIR);
+}
+
+fn unlink_relative(root: &File, components: &[&str], flags: i32) -> io::Result<()> {
+    let (name, parents) = components.split_last().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "artifact path is empty"))?;
+    let mut parent = root.try_clone()?;
+    for component in parents {
+        parent = open_directory_at(&parent, component)?;
+    }
+    unlink_at(&parent, name, flags)
+}
+
+fn unlink_at(parent: &File, name: &str, flags: i32) -> io::Result<()> {
+    let name = component_name(name)?;
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn component_name(name: &str) -> io::Result<CString> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path component"));
+    }
+    CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path component"))
 }
 
 fn open_directory(path: &Path) -> io::Result<File> {
@@ -592,6 +658,18 @@ fn copy_and_hash(source: &File, destination: &File, expected_size: u64, path: &s
 
 fn set_private_mode(path: &Path) -> Result<(), String> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| format!("set private artifact mode: {error}"))
+}
+
+fn set_private_mode_fd(file: &File) -> Result<(), String> {
+    set_private_mode_fd_io(file, 0o700).map_err(|error| format!("set private artifact mode: {error}"))
+}
+
+fn set_private_mode_fd_io(file: &File, mode: u32) -> io::Result<()> {
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn hex_id(bytes: [u8; 16]) -> String {

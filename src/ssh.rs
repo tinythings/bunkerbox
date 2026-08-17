@@ -690,7 +690,7 @@ async fn build_and_finish(connection: &mut WorkerConnection, plan: BuildPlan<'_>
                 check_correlation(received_request, received_session, request_id, session_id, "worker artifact manifest")?;
                 (artifact_set_id, artifact_manifest_from_worker(entries, total_bytes, &artifact_policy, artifact_limits)?)
             }
-            WorkerMessage::Error { kind, message, .. } => return Err(worker_error(WorkerOperation::Artifact, kind, message)),
+            WorkerMessage::Error { kind, message, .. } => return Err(worker_artifact_manifest_error(kind, message)),
             _ => return Err(worker_protocol("unexpected worker artifact manifest response")),
         };
         let retrieval = timeout(
@@ -730,12 +730,13 @@ async fn fetch_and_publish_artifacts(
                     message: "artifact index does not fit worker protocol".to_string(),
                 })?,
             })
-            .await?;
+            .await
+            .map_err(artifact_transfer_error)?;
         let mut writer = publication
             .begin(index)
             .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })?;
         loop {
-            match connection.read().await? {
+            match connection.read().await.map_err(artifact_transfer_error)? {
                 WorkerMessage::ArtifactChunk {
                     request_id: received_request,
                     session_id: received_session,
@@ -744,7 +745,8 @@ async fn fetch_and_publish_artifacts(
                     offset,
                     data,
                 } => {
-                    check_correlation(received_request, received_session, request_id, session_id, "worker artifact chunk")?;
+                    check_correlation(received_request, received_session, request_id, session_id, "worker artifact chunk")
+                        .map_err(artifact_transfer_error)?;
                     if received_set != artifact_set_id || entry_index != index as u32 {
                         return Err(RemoteBackendError::Transport {
                             class: RemoteFailureClass::ArtifactTransfer,
@@ -770,7 +772,8 @@ async fn fetch_and_publish_artifacts(
                     artifact_set_id: received_set,
                     entry_index,
                 } => {
-                    check_correlation(received_request, received_session, request_id, session_id, "worker artifact completion")?;
+                    check_correlation(received_request, received_session, request_id, session_id, "worker artifact completion")
+                        .map_err(artifact_transfer_error)?;
                     if received_set != artifact_set_id || entry_index != index as u32 {
                         return Err(RemoteBackendError::Transport {
                             class: RemoteFailureClass::ArtifactTransfer,
@@ -782,8 +785,10 @@ async fn fetch_and_publish_artifacts(
                         .map_err(|error| RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message: error })?;
                     break;
                 }
-                WorkerMessage::Error { kind, message, .. } => return Err(worker_error(WorkerOperation::Artifact, kind, message)),
-                _ => return Err(worker_protocol("unexpected worker artifact transfer response")),
+                WorkerMessage::Error { kind, message, .. } => {
+                    return Err(artifact_transfer_error(worker_error(WorkerOperation::Artifact, kind, message)));
+                }
+                _ => return Err(artifact_transfer_error(worker_protocol("unexpected worker artifact transfer response"))),
             }
         }
     }
@@ -891,6 +896,21 @@ fn worker_error(operation: WorkerOperation, kind: WorkerErrorKind, message: Stri
         WorkerErrorKind::Build => return RemoteBackendError::Failed(format!("remote worker build failure ({operation:?}): {message}")),
     };
     RemoteBackendError::Transport { class, message }
+}
+
+fn worker_artifact_manifest_error(kind: WorkerErrorKind, message: String) -> RemoteBackendError {
+    if matches!(kind, WorkerErrorKind::Artifact) {
+        RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactManifest, message }
+    } else {
+        worker_error(WorkerOperation::Artifact, kind, message)
+    }
+}
+
+fn artifact_transfer_error(error: RemoteBackendError) -> RemoteBackendError {
+    match error {
+        RemoteBackendError::Transport { message, .. } => RemoteBackendError::Transport { class: RemoteFailureClass::ArtifactTransfer, message },
+        other => other,
+    }
 }
 
 fn worker_protocol(message: impl Into<String>) -> RemoteBackendError {

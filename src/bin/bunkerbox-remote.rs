@@ -1,15 +1,15 @@
-use bunkerbox::guest_install::{install_remote_cargo_link, install_remote_make_link};
+use bunkerbox::guest_install::{is_managed_remote_wrapper, synchronize_remote_wrappers};
+use bunkerbox::remote::validate_remote_wrapper_name;
 #[cfg(test)]
 use bunkerbox::remote::RemoteSnapshotId;
 use bunkerbox::remote_client::{
-    execute_remote_request_to, logical_workspace_cwd, new_request_id, remote_build_request, remote_diagnostic_sync_request, remote_environment_names,
-    remote_session_from_env, remote_sync_request, remote_tool_enabled, selected_remote_environment_for_tool, RemoteCompletion,
+    configured_remote_tools, execute_remote_request_to, logical_workspace_cwd, new_request_id, remote_build_request, remote_diagnostic_sync_request,
+    remote_environment_names, remote_session_from_env, remote_sync_request, selected_remote_environment_for_tool, RemoteCompletion,
 };
 #[cfg(test)]
 use bunkerbox::vscomm::RequestId;
 use bunkerbox::vscomm::{RemoteRequest, WorkspaceSessionId, TOOLCHAIN_PORT, VSCOMM_BIN_DIR};
 use std::env;
-use std::fs;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::path::Path;
@@ -37,11 +37,8 @@ fn run() -> Result<i32, String> {
         env::args_os().next().and_then(|value| Path::new(&value).file_name().and_then(|name| name.to_str()).map(str::to_owned)).unwrap_or_default();
     let args = env::args().skip(1).collect::<Vec<_>>();
 
-    if matches!(invoked_as.as_str(), "make" | "cargo") {
-        return run_transparent_tool(&invoked_as, &args);
-    }
     if invoked_as != "bunkerbox-remote" {
-        return Err("bunkerbox-remote must be invoked directly or through a managed make or cargo symlink".to_string());
+        return run_transparent_tool(&invoked_as, &args);
     }
     if args.len() == 1 && args[0] == "install" {
         install_remote_links()?;
@@ -70,9 +67,16 @@ fn run_explicit(args: &[String]) -> Result<i32, String> {
 }
 
 fn run_transparent_tool(tool: &str, args: &[String]) -> Result<i32, String> {
+    let tool = validate_remote_wrapper_name(tool.to_string())?;
+    if !configured_remote_tools()?.contains(&tool) {
+        return Err(format!("remote tool is not configured: {tool}"));
+    }
+    if !is_managed_remote_wrapper(Path::new(VSCOMM_BIN_DIR), &tool)? {
+        return Err(format!("remote wrapper is not managed: {tool}"));
+    }
     let cwd = logical_workspace_cwd(&env::current_dir().map_err(|error| format!("current directory: {error}"))?)?;
     let session = remote_session_from_env()?;
-    run_build_with_sync(cwd, tool.to_string(), args.to_vec(), session)
+    run_build_with_sync(cwd, tool, args.to_vec(), session)
 }
 
 fn run_build_with_sync(cwd: String, tool: String, args: Vec<String>, session: WorkspaceSessionId) -> Result<i32, String> {
@@ -138,11 +142,10 @@ fn build_request(
 }
 
 fn install_remote_links() -> Result<(), String> {
-    fs::create_dir_all(VSCOMM_BIN_DIR).map_err(|error| format!("mkdir {VSCOMM_BIN_DIR}: {error}"))?;
     let executable = env::current_exe().map_err(|error| format!("failed to locate remote binary: {error}"))?;
     let bin_dir = Path::new(VSCOMM_BIN_DIR);
-    install_remote_make_link(bin_dir, &executable, remote_tool_enabled("make"))?;
-    install_remote_cargo_link(bin_dir, &executable, remote_tool_enabled("cargo"))
+    let vscomm_path = bin_dir.join("bunkerbox-vscomm");
+    synchronize_remote_wrappers(configured_remote_tools()?, bin_dir, &executable, &vscomm_path)
 }
 
 fn connect_toolchain() -> Result<VsockStream, String> {

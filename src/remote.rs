@@ -19,6 +19,7 @@ pub const MAX_REMOTE_ENV_VALUE_BYTES: usize = 4 * 1024;
 pub const DEFAULT_REMOTE_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_REMOTE_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_REMOTE_ENVIRONMENT: &[&str] = &["CC", "CXX", "AR", "RUSTFLAGS", "CFLAGS", "CXXFLAGS", "MAKEFLAGS"];
+pub const REMOTE_WRAPPER_STATE_FILE: &str = ".bunkerbox-remote-tools";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestId(pub [u8; 16]);
@@ -95,6 +96,15 @@ impl RemoteTool {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+pub fn validate_remote_wrapper_name(name: impl Into<String>) -> Result<String, String> {
+    let name = name.into();
+    RemoteTool::new(name.clone())?;
+    if name == "bunkerbox" || name.starts_with("bunkerbox-") || name.starts_with(REMOTE_WRAPPER_STATE_FILE) {
+        return Err(format!("remote wrapper name is reserved: {name}"));
+    }
+    Ok(name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

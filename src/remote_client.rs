@@ -1,6 +1,7 @@
-use crate::remote::RemoteSnapshotId;
+use crate::remote::{validate_remote_wrapper_name, RemoteSnapshotId};
 use crate::vscomm::{RemoteBuild, RemoteEvent, RemoteEventKind, RemoteRequest, RemoteTool, RequestId, WorkspaceRelativePath, WorkspaceSessionId};
 use rand::RngCore;
+use std::collections::BTreeSet;
 use std::env;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -33,7 +34,23 @@ pub fn new_request_id() -> RequestId {
 }
 
 pub fn remote_tool_enabled(tool: &str) -> bool {
-    env::var("BUNKERBOX_REMOTE_TOOLS").ok().is_some_and(|tools| tools.split(',').any(|candidate| candidate == tool))
+    configured_remote_tools().ok().is_some_and(|tools| tools.iter().any(|candidate| candidate == tool))
+}
+
+pub fn configured_remote_tools() -> Result<Vec<String>, String> {
+    let Some(raw) = env::var_os("BUNKERBOX_REMOTE_TOOLS") else { return Ok(Vec::new()) };
+    let raw = raw.into_string().map_err(|_| "BUNKERBOX_REMOTE_TOOLS is not valid UTF-8".to_string())?;
+    let mut tools = BTreeSet::new();
+    for candidate in raw.split(',') {
+        if candidate.is_empty() {
+            return Err("BUNKERBOX_REMOTE_TOOLS contains an empty tool name".to_string());
+        }
+        let candidate = validate_remote_wrapper_name(candidate.to_string())?;
+        if !tools.insert(candidate.clone()) {
+            return Err(format!("BUNKERBOX_REMOTE_TOOLS contains duplicate tool: {candidate}"));
+        }
+    }
+    Ok(tools.into_iter().collect())
 }
 
 pub fn remote_environment_names() -> Vec<String> {

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::remote::{RemoteEnvironmentPolicy, RemoteTool};
+use crate::remote::{validate_remote_wrapper_name, RemoteEnvironmentPolicy};
 use crate::snapshot::SnapshotExclusionPolicy;
 use crate::vscomm::buildsys::{self, PassthroughMode};
 
@@ -295,7 +295,7 @@ impl ProjectConfig {
         SnapshotExclusionPolicy::from_patterns(self.project.remote.exclude.clone())?;
         let mut tools = std::collections::BTreeSet::new();
         for tool in &self.project.remote.tools {
-            RemoteTool::new(tool.name.clone())?;
+            validate_remote_wrapper_name(tool.name.clone())?;
             if !tools.insert(tool.name.clone()) {
                 return Err(format!("duplicate remote tool: {}", tool.name));
             }

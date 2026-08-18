@@ -451,7 +451,7 @@ fn new_target_id() -> bunkerbox::remote::RemoteTargetId {
 }
 
 fn remote_tool_names(entries: &[RemoteToolSpec]) -> Vec<String> {
-    entries.iter().filter(|tool| matches!(tool.name.as_str(), "make" | "cargo")).map(|tool| tool.name.clone()).collect()
+    entries.iter().map(|tool| tool.name.clone()).collect()
 }
 
 fn write_run_handoff(file: &mut File, path: &Path, session_id: vscomm::WorkspaceSessionId) -> Result<(), String> {

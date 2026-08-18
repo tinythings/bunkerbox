@@ -47,6 +47,7 @@ fn policy_rejects_unapproved_tool() {
     let policy = policy(vec!["cargo".into()]);
 
     assert_eq!(policy.authorize(&context(), request("make")), Err(RemoteAuthorizationError::ToolNotAllowed("make".into())));
+    assert_eq!(policy.authorize(&context(), request("build-my-car")), Err(RemoteAuthorizationError::ToolNotAllowed("build-my-car".into())));
 }
 
 #[test]

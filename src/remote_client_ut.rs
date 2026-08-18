@@ -25,6 +25,17 @@ fn cargo_environment_is_empty_even_when_names_are_requested() {
 }
 
 #[test]
+fn configured_remote_tools_are_generic_validated_and_deduplicated() {
+    std::env::set_var("BUNKERBOX_REMOTE_TOOLS", "make,build-my-car,cargo");
+    assert_eq!(configured_remote_tools().unwrap(), vec!["build-my-car", "cargo", "make"]);
+    std::env::set_var("BUNKERBOX_REMOTE_TOOLS", "make,make");
+    assert!(configured_remote_tools().is_err());
+    std::env::set_var("BUNKERBOX_REMOTE_TOOLS", "bunkerbox-status");
+    assert!(configured_remote_tools().is_err());
+    std::env::remove_var("BUNKERBOX_REMOTE_TOOLS");
+}
+
+#[test]
 fn cancel_request_uses_a_distinct_request_and_target_identity() {
     let request = remote_cancel_request(RequestId([8; 16]), WorkspaceSessionId([2; 16]), RequestId([7; 16]));
     assert_eq!(request.request_id, RequestId([8; 16]));

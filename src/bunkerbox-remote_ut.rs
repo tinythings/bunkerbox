@@ -59,6 +59,14 @@ fn parses_cargo_toolchain_and_arguments_without_joining() {
 }
 
 #[test]
+fn parses_arbitrary_tool_and_arguments_without_build_system_logic() {
+    assert_eq!(
+        parse_command(&["build".into(), "build-my-car".into(), "--variant".into(), "pink unicorn".into()]),
+        Ok(RemoteCommand::Build { tool: "build-my-car".into(), args: vec!["--variant".into(), "pink unicorn".into()] })
+    );
+}
+
+#[test]
 fn build_request_preserves_logical_cwd_and_arguments() {
     let request = build_request(
         RemoteCommand::Build { tool: "make".into(), args: vec!["release mode".into(), "$(literal)".into()] },
@@ -200,46 +208,30 @@ fn logical_cwd_is_workspace_relative_only() {
 }
 
 #[test]
-fn configured_remote_make_installation_precedes_native_path_resolution() {
+fn generic_remote_installation_preserves_unmanaged_entries() {
     let root = tempfile::tempdir().unwrap();
     let executable = root.path().join("bunkerbox-remote");
     std::fs::write(&executable, b"remote").unwrap();
-    install_remote_make_link(root.path(), &executable, true).unwrap();
-    assert_eq!(std::fs::read_link(root.path().join("make")).unwrap(), executable);
+    std::fs::write(root.path().join("build-my-car"), b"native").unwrap();
+    let vscomm = root.path().join("bunkerbox-vscomm");
+    std::fs::write(&vscomm, b"vscomm").unwrap();
+
+    assert!(synchronize_remote_wrappers(vec!["build-my-car".into()], root.path(), &executable, &vscomm).is_err());
+    assert_eq!(std::fs::read(root.path().join("build-my-car")).unwrap(), b"native");
 }
 
 #[test]
-fn disabled_remote_make_removes_only_its_managed_link() {
+fn generic_remote_installation_removes_only_managed_wrappers() {
     let root = tempfile::tempdir().unwrap();
     let executable = root.path().join("bunkerbox-remote");
     std::fs::write(&executable, b"remote").unwrap();
-    install_remote_make_link(root.path(), &executable, true).unwrap();
-    install_remote_make_link(root.path(), &executable, false).unwrap();
+    let vscomm = root.path().join("bunkerbox-vscomm");
+    std::fs::write(&vscomm, b"vscomm").unwrap();
+
+    synchronize_remote_wrappers(vec!["make".into(), "cargo".into()], root.path(), &executable, &vscomm).unwrap();
+    synchronize_remote_wrappers(vec!["cargo".into()], root.path(), &executable, &vscomm).unwrap();
     assert!(!root.path().join("make").exists());
-
-    std::fs::write(root.path().join("make"), b"native").unwrap();
-    install_remote_make_link(root.path(), &executable, false).unwrap();
-    assert_eq!(std::fs::read(root.path().join("make")).unwrap(), b"native");
-}
-
-#[test]
-fn configured_remote_make_does_not_overwrite_unmanaged_entry() {
-    let root = tempfile::tempdir().unwrap();
-    let executable = root.path().join("bunkerbox-remote");
-    std::fs::write(&executable, b"remote").unwrap();
-    std::fs::write(root.path().join("make"), b"native").unwrap();
-    assert!(install_remote_make_link(root.path(), &executable, true).is_err());
-    assert_eq!(std::fs::read(root.path().join("make")).unwrap(), b"native");
-}
-
-#[test]
-fn configured_remote_cargo_does_not_overwrite_unmanaged_entry() {
-    let root = tempfile::tempdir().unwrap();
-    let executable = root.path().join("bunkerbox-remote");
-    std::fs::write(&executable, b"remote").unwrap();
-    std::fs::write(root.path().join("cargo"), b"native").unwrap();
-    assert!(install_remote_cargo_link(root.path(), &executable, true).is_err());
-    assert_eq!(std::fs::read(root.path().join("cargo")).unwrap(), b"native");
+    assert!(is_managed_remote_wrapper(root.path(), "cargo").unwrap());
 }
 
 #[test]

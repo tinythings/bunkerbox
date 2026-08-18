@@ -547,6 +547,22 @@ fn load_or_create_validates_remote_policy_configuration() {
 }
 
 #[test]
+fn load_or_create_accepts_arbitrary_remote_tool_names_but_rejects_control_names() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(
+        root.path(),
+        "project:\n  remote:\n    tools:\n      - name: build-my-car\n        allow-args: true\n      - name: ninja+debug\n        allow-args: false\n",
+    );
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+    assert_eq!(cfg.project.remote.tools.len(), 2);
+
+    for name in ["bunkerbox", "bunkerbox-remote", ".bunkerbox-remote-tools"] {
+        write_project_conf(root.path(), &format!("project:\n  remote:\n    tools:\n      - name: {name}\n        allow-args: true\n"));
+        assert!(ProjectConfig::load_or_create(root.path()).is_err(), "accepted reserved remote tool: {name}");
+    }
+}
+
+#[test]
 fn load_or_create_rejects_forbidden_remote_environment() {
     let root = TempDir::new().unwrap();
     write_project_conf(root.path(), "project:\n  remote:\n    environment:\n      - SSH_AUTH_SOCK\n");

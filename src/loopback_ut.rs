@@ -117,6 +117,22 @@ async fn sync_and_build_materialize_a_bound_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arbitrary_logical_tool_uses_its_trusted_target_mapping() {
+    let (_temp, session, target, session_id) = fixture();
+    let mut tools = resolve_fixed_tools(["printf".to_string()]);
+    let Some(printf) = tools.remove("printf") else { return };
+    tools.insert("build-my-car".into(), printf);
+    let backend = LoopbackBackend::new(session, tools);
+    let snapshot_id = sync_capability(&backend, target, session_id).await;
+    let (events, receiver) = mpsc::channel(8);
+    let request = authorized_build(target, session_id, "build-my-car", vec!["custom $(argument)".into()], Vec::new(), snapshot_id);
+    assert_eq!(backend.execute(request, events).await, Ok(()));
+    let events = collect_events(receiver).await;
+    assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Stdout(bytes) if bytes == b"custom $(argument)")));
+    assert!(events.iter().any(|event| matches!(event, RemoteBackendEvent::Completed { exit_code: 0 })));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diagnostic_sync_releases_capability_and_snapshot_storage() {
     let (_temp, session, target, session_id) = fixture();
     let backend = LoopbackBackend::new(session.clone(), BTreeMap::new());

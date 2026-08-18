@@ -1,5 +1,6 @@
-use bunkerbox::cfg::{ProjectConfig, RemoteToolSpec, WorkspaceMode};
-use bunkerbox::remote::{RemoteAdmissionLimits, RemoteEnvironmentPolicy, RemoteToolPolicy};
+#[cfg(test)]
+use bunkerbox::cfg::RemoteToolSpec;
+use bunkerbox::cfg::{ProjectConfig, WorkspaceMode};
 use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, logging, loopback, overlay, remote_target, snapshot, tui, vscomm, workspace};
 use rand::RngCore;
 use std::ffi::OsString;
@@ -13,6 +14,9 @@ use std::sync::{Arc, Mutex};
 const WORKSPACE_HANDOFF_MAGIC: &[u8; 4] = b"WS01";
 const STARTUP_READY_MAGIC: &[u8; 4] = b"RDY1";
 const MAX_WORKSPACE_HANDOFF_BYTES: usize = 64 * 1024;
+
+type RemoteSessions = std::collections::BTreeMap<String, Arc<loopback::RunRemoteSession>>;
+type SetupState = (workspace::WorkspaceHandle, RemoteSessions, daemon::VsockDaemon);
 
 fn main() {
     if let Err(err) = run() {
@@ -190,30 +194,23 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
     let repo_root = workspace::project_root()?;
     let env = ProjectConfig::load_or_create(&repo_root)?;
-    let remote_backend = remote_target::RemoteTargetConfig::load_default()?.resolve_for_project(&repo_root)?;
-    let artifact_policy = remote_backend.artifacts().clone();
-    let artifact_limits = remote_backend.target().map(|target| target.resources().artifact_limits()).unwrap_or_default();
-    artifact_policy.validate_limits(artifact_limits)?;
-    if let remote_target::BackendMode::Ssh = remote_backend.backend() {
-        let target = remote_backend.target().ok_or_else(|| "SSH backend selection has no target".to_string())?;
-        for tool in &env.project.remote.tools {
-            if !target.tools().contains_key(&tool.name) {
-                return Err(format!("SSH target '{}' does not configure remote tool '{}'", target.name(), tool.name));
-            }
+    let (target_catalog, remote_config_error) = match remote_target::BuildTargetCatalog::load_optional(&repo_root, &env) {
+        Ok(Some(catalog)) => (catalog, None),
+        Ok(None) => (remote_target::BuildTargetCatalog::localhost_only(repo_root.clone(), env.clone())?, None),
+        Err(error) => {
+            logging::diagnostic(&format!("remote.conf disabled for this run: {error}"));
+            (remote_target::BuildTargetCatalog::localhost_only(repo_root.clone(), env.clone())?, Some(error))
         }
-    }
+    };
+    let active_target = remote_target::ActiveBuildTarget::new();
 
     let merged_allow: Vec<String> = config.allow.clone().unwrap_or_default().into_iter().chain(env.image.allow.clone().unwrap_or_default()).collect();
 
     let passthrough = env.project.passthrough.clone();
     let env_mode = env.project.env;
     let profiles = env.profiles.clone();
-    let remote_environment = RemoteEnvironmentPolicy::from_names(env.project.remote.environment.clone())?;
-    let remote_environment_names = remote_environment.allowed_names().map(str::to_string).collect::<Vec<_>>();
-    let remote_tool_policies =
-        env.project.remote.tools.iter().map(|tool| (tool.name.clone(), RemoteToolPolicy::new(tool.allow_args))).collect::<Vec<_>>();
-    let configured_remote_tool_names = env.project.remote.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
-    let remote_tool_names = remote_tool_names(&env.project.remote.tools);
+    let remote_environment_names = target_catalog.environment_names();
+    let remote_tool_names = target_catalog.wrapper_names();
     let share_dir_owned = share_dir.to_path_buf();
 
     let mut sock_fds = [-1i32, -1];
@@ -230,7 +227,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
     let (cols, rows) = crossterm::terminal::size().map_err(|e| format!("terminal size: {e}"))?;
 
-    let winsize = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let winsize = libc::winsize { ws_row: tui::guest_rows(rows), ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
 
     let mut master: RawFd = -1;
     let pid = unsafe { libc::forkpty(&mut master, std::ptr::null_mut(), std::ptr::null(), &winsize) };
@@ -305,6 +302,9 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     let (startup_status_read, startup_status_write) = (startup_fds[0], startup_fds[1]);
 
     let overlay: Arc<Mutex<tui::OverlayState>> = Arc::new(Mutex::new(tui::OverlayState::new()));
+    if let Some(error) = &remote_config_error {
+        tui::show_host_error(&overlay, "remote.conf", error);
+    }
     let status_listener = match start_status_listener(overlay.clone()) {
         Ok(listener) => listener,
         Err(error) => {
@@ -320,75 +320,76 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     };
 
     let setup_handle = tokio::runtime::Handle::current().clone();
-    let setup_thread =
-        std::thread::spawn(move || -> Result<(workspace::WorkspaceHandle, Arc<loopback::RunRemoteSession>, daemon::VsockDaemon), String> {
-            let mut setup_parent = unsafe { File::from_raw_fd(setup_parent_fd) };
-            let startup_status = unsafe { File::from_raw_fd(startup_status_write) };
-            logging::set_status_fd(startup_status.as_raw_fd());
-            let _runtime_guard = setup_handle.enter();
+    let target_catalog_for_setup = target_catalog.clone();
+    let active_target_for_setup = active_target.clone();
+    let setup_thread = std::thread::spawn(move || -> Result<SetupState, String> {
+        let mut setup_parent = unsafe { File::from_raw_fd(setup_parent_fd) };
+        let startup_status = unsafe { File::from_raw_fd(startup_status_write) };
+        logging::set_status_fd(startup_status.as_raw_fd());
+        let _runtime_guard = setup_handle.enter();
 
-            if let Err(error) = read_startup_ready(&mut setup_parent) {
-                logging::log(&format!("Startup failed: {error}"));
-                return Err(error);
-            }
+        if let Err(error) = read_startup_ready(&mut setup_parent) {
+            logging::log(&format!("Startup failed: {error}"));
+            return Err(error);
+        }
 
-            let setup_result = (|| -> Result<(workspace::WorkspaceHandle, Arc<loopback::RunRemoteSession>, daemon::VsockDaemon), String> {
-                logging::log("Preparing workspace...");
-                let workspace = workspace::resolve(workspace_mode, quota, exclude.as_deref(), &name)?;
-                let remote_session = new_session_id();
-                let target = new_target_id();
-                logging::log("Preparing remote session...");
-                loopback::cleanup_stale_roots(&std::env::temp_dir())?;
-                let snapshot_root = std::env::temp_dir().join(format!("bunkerbox-snapshots-{}-{}", std::process::id(), remote_session.to_hex()));
-                let jobs_root = std::env::temp_dir().join(format!("bunkerbox-loopback-{}-{}", std::process::id(), remote_session.to_hex()));
+        let setup_result = (|| -> Result<SetupState, String> {
+            logging::log("Preparing workspace...");
+            let workspace = workspace::resolve(workspace_mode, quota, exclude.as_deref(), &name)?;
+            let remote_session = new_session_id();
+            logging::log("Preparing remote session...");
+            loopback::cleanup_stale_roots(&std::env::temp_dir())?;
+            let mut sessions = RemoteSessions::new();
+            for remote_target in target_catalog_for_setup.remote_targets() {
+                let target_label = remote_target.summary().label();
+                let snapshot_root =
+                    std::env::temp_dir().join(format!("bunkerbox-snapshots-{}-{}-{target_label}", std::process::id(), remote_session.to_hex()));
+                let jobs_root =
+                    std::env::temp_dir().join(format!("bunkerbox-remote-{}-{}-{target_label}", std::process::id(), remote_session.to_hex()));
                 let snapshot_store = snapshot::SnapshotStore::new(&snapshot_root);
-                let exclusion_policy = snapshot::SnapshotExclusionPolicy::from_remote_config(&env, exclude.as_deref())?;
+                let mut target_project = target_catalog_for_setup.base_project().clone();
+                target_project.project.remote = remote_target.project().clone();
+                let exclusion_policy = snapshot::SnapshotExclusionPolicy::from_remote_config(&target_project, exclude.as_deref())?;
                 let snapshot_builder = snapshot::SnapshotBuilder::new(snapshot_store.clone(), snapshot::SnapshotLimits::default(), exclusion_policy);
                 let session = Arc::new(loopback::RunRemoteSession::new(
                     bunkerbox::remote::WorkspaceSessionId(remote_session.0),
-                    target,
+                    new_target_id(),
                     workspace.path().to_path_buf(),
                     snapshot_store,
                     snapshot_builder,
                     jobs_root,
                 )?);
-                let tools = loopback::resolve_fixed_tools(configured_remote_tool_names.clone());
-                logging::log("Starting remote daemon...");
-                let global_active = config.remote_max_active_builds()?;
-                let target_active = remote_backend.target().map(|target| target.resources().max_active_builds()).unwrap_or(1);
-                let remote_config = match remote_backend.backend() {
-                    remote_target::BackendMode::Loopback => daemon::RemoteDaemonConfig::loopback(session.clone(), Vec::new(), tools),
-                    remote_target::BackendMode::Ssh => {
-                        let target = remote_backend.target().cloned().ok_or_else(|| "SSH backend selection has no target".to_string())?;
-                        daemon::RemoteDaemonConfig::ssh(session.clone(), target)?
-                    }
-                };
-                let daemon = daemon::VsockDaemon::start_with_remote(
-                    passthrough,
-                    env_mode,
-                    workspace.path().to_path_buf(),
-                    profiles,
-                    share_dir_owned,
-                    merged_allow,
-                    remote_config
-                        .with_artifacts(artifact_policy, artifact_limits)
-                        .with_policy(remote_tool_policies, remote_environment)
-                        .with_admission_limits(RemoteAdmissionLimits::new(global_active, target_active)?),
-                )?;
-                if let Err(error) = write_run_handoff(&mut setup_parent, workspace.path(), remote_session) {
-                    tokio::runtime::Handle::current().block_on(daemon.shutdown());
-                    return Err(error);
-                }
-                Ok((workspace, session, daemon))
-            })();
-
-            if let Err(error) = &setup_result {
-                logging::log(&format!("Startup failed: {error}"));
+                sessions.insert(target_label.to_string(), session);
             }
-            setup_result
-        });
+            logging::log("Starting remote daemon...");
+            let global_active = config.remote_max_active_builds()?;
+            let daemon = daemon::VsockDaemon::start_with_target_catalog(
+                passthrough,
+                env_mode,
+                workspace.path().to_path_buf(),
+                profiles,
+                share_dir_owned,
+                merged_allow,
+                target_catalog_for_setup,
+                active_target_for_setup,
+                sessions.clone(),
+                bunkerbox::remote::WorkspaceSessionId(remote_session.0),
+                global_active,
+            )?;
+            if let Err(error) = write_run_handoff(&mut setup_parent, workspace.path(), remote_session) {
+                tokio::runtime::Handle::current().block_on(daemon.shutdown());
+                return Err(error);
+            }
+            Ok((workspace, sessions, daemon))
+        })();
 
-    let tui_result = tui::event_loop(master, rows, cols, parent_fd, startup_status_read, overlay);
+        if let Err(error) = &setup_result {
+            logging::log(&format!("Startup failed: {error}"));
+        }
+        setup_result
+    });
+
+    let tui_result = tui::event_loop(master, rows, cols, parent_fd, startup_status_read, overlay, target_catalog, active_target);
     let tui_error = tui_result.err();
     if tui_error.is_some() {
         unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -405,9 +406,9 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     unsafe { libc::close(startup_status_read) };
 
     let (setup_state, setup_error) = match setup_result {
-        Ok((workspace, remote_session, daemon)) => {
+        Ok((workspace, sessions, daemon)) => {
             tokio::runtime::Handle::current().block_on(daemon.shutdown());
-            drop(remote_session);
+            drop(sessions);
             drop(workspace);
             (true, None)
         }
@@ -450,6 +451,7 @@ fn new_target_id() -> bunkerbox::remote::RemoteTargetId {
     }
 }
 
+#[cfg(test)]
 fn remote_tool_names(entries: &[RemoteToolSpec]) -> Vec<String> {
     entries.iter().map(|tool| tool.name.clone()).collect()
 }

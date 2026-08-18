@@ -1,5 +1,7 @@
+use std::ffi::CString;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,10 +15,12 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Widget, Wrap};
 
 use ratatui::Terminal;
 
+use crate::remote_target::{ActiveBuildTarget, BuildTargetCatalog};
 use crate::vscomm::{self, parse_triggers, Trigger};
 
 mod palette;
@@ -85,6 +89,99 @@ pub struct OverlayState {
     pub hide_on_ascii: bool,
     pub hide_on_content: Option<String>,
     pub last_content_scan: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostPopup {
+    None,
+    Targets,
+    Help,
+}
+
+struct HostUiState {
+    popup: HostPopup,
+    target_index: usize,
+    confirmation: Option<(String, Instant)>,
+    free_bytes: Option<u64>,
+    last_free_refresh: Instant,
+}
+
+impl HostUiState {
+    fn new(catalog: &BuildTargetCatalog) -> Self {
+        Self {
+            popup: HostPopup::None,
+            target_index: catalog.summaries().iter().position(|target| target.label() == "localhost").unwrap_or(0),
+            confirmation: None,
+            free_bytes: None,
+            last_free_refresh: Instant::now() - Duration::from_secs(10),
+        }
+    }
+
+    fn refresh_free_space(&mut self, catalog: &BuildTargetCatalog) {
+        if self.last_free_refresh.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_free_refresh = Instant::now();
+        self.free_bytes = local_free_space(catalog.project_root());
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, catalog: &BuildTargetCatalog, active: &ActiveBuildTarget) -> bool {
+        match self.popup {
+            HostPopup::Targets => {
+                match key.code {
+                    KeyCode::Up => {
+                        self.target_index = self.target_index.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        self.target_index = (self.target_index + 1).min(catalog.summaries().len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => {
+                        if let Some(target) = catalog.summaries().get(self.target_index) {
+                            if active.select(catalog, target.label()).is_ok() {
+                                self.confirmation = Some((format!("Build target: {}", target.label()), Instant::now()));
+                            }
+                        }
+                        self.popup = HostPopup::None;
+                    }
+                    KeyCode::Esc => {
+                        self.popup = HostPopup::None;
+                    }
+                    _ => {}
+                }
+                return true;
+            }
+            HostPopup::Help => {
+                if key.code == KeyCode::Esc {
+                    self.popup = HostPopup::None;
+                }
+                return true;
+            }
+            HostPopup::None => {}
+        }
+
+        if key.code == KeyCode::Char('b') && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            let current = active.current();
+            self.target_index = catalog.summaries().iter().position(|target| target.label() == current).unwrap_or(0);
+            self.popup = HostPopup::Targets;
+            return true;
+        }
+        if key.code == KeyCode::Char('h') && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            self.popup = HostPopup::Help;
+            return true;
+        }
+        false
+    }
+}
+
+pub fn show_host_error(overlay: &Arc<Mutex<OverlayState>>, title: &str, message: &str) {
+    if let Ok(mut state) = overlay.lock() {
+        state.error_toast =
+            Some(ErrorToast { title: title.chars().take(80).collect(), message: message.chars().take(512).collect(), shown_at: Instant::now() });
+    }
+}
+
+pub fn guest_rows(physical_rows: u16) -> u16 {
+    physical_rows.saturating_sub(1).max(1)
 }
 
 impl Default for OverlayState {
@@ -490,7 +587,10 @@ fn push_dec_special_graphic(out: &mut Vec<u8>, byte: u8) {
     out.extend_from_slice(mapped.encode_utf8(&mut buf).as_bytes());
 }
 
-fn hold_error_popup(overlay: &Arc<Mutex<OverlayState>>, term: &mut Terminal<CrosstermBackend<io::Stdout>>, screen: &vt100::Screen) {
+fn hold_error_popup(
+    overlay: &Arc<Mutex<OverlayState>>, term: &mut Terminal<CrosstermBackend<io::Stdout>>, screen: &vt100::Screen, host: &HostUiState,
+    catalog: &BuildTargetCatalog, active: &ActiveBuildTarget,
+) {
     let is_error = overlay.lock().unwrap().has_error;
     if !is_error {
         return;
@@ -500,7 +600,7 @@ fn hold_error_popup(overlay: &Arc<Mutex<OverlayState>>, term: &mut Terminal<Cros
         let mut state = overlay.lock().unwrap();
         state.popup.show_info(Some("Error".to_string()), "Press any key to exit", Some(palette::FG), Some(palette::ACCENT));
     }
-    term.draw(|f| render_frame(f, screen, &overlay.lock().unwrap())).ok();
+    term.draw(|f| render_frame(f, screen, &overlay.lock().unwrap(), host, catalog, active)).ok();
     let _ = event::read();
 }
 
@@ -550,8 +650,10 @@ fn screen_has_ascii_alphanumeric(screen: &vt100::Screen) -> bool {
 ///
 /// `overlay` is shared with the VSOCK status listener so VM-originated
 /// UI commands can update popups, progress bars, and status text.
+#[allow(clippy::too_many_arguments)]
 pub fn event_loop(
     master_fd: RawFd, rows: u16, cols: u16, status_fd: RawFd, startup_status_fd: RawFd, overlay: Arc<Mutex<OverlayState>>,
+    catalog: BuildTargetCatalog, active: ActiveBuildTarget,
 ) -> Result<(), String> {
     let stdin_fd = io::stdin().as_raw_fd();
 
@@ -560,7 +662,7 @@ pub fn event_loop(
     stdout.execute(EnterAlternateScreen).map_err(|e| format!("alt screen: {e}"))?;
     stdout.execute(cursor::Show).map_err(|e| format!("cursor: {e}"))?;
 
-    let mut term = Term::new(rows, cols);
+    let mut term = Term::new(guest_rows(rows), cols);
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| format!("terminal: {e}"))?;
@@ -569,6 +671,7 @@ pub fn event_loop(
 
     let mut last_rows = rows;
     let mut last_cols = cols;
+    let mut host = HostUiState::new(&catalog);
 
     let mut status_buf = Vec::new();
     let mut startup_status_buf = Vec::new();
@@ -585,8 +688,8 @@ pub fn event_loop(
                 if new_cols != last_cols || new_rows != last_rows {
                     last_cols = new_cols;
                     last_rows = new_rows;
-                    term.set_size(new_rows, new_cols);
-                    let ws = libc::winsize { ws_row: new_rows, ws_col: new_cols, ws_xpixel: 0, ws_ypixel: 0 };
+                    term.set_size(guest_rows(new_rows), new_cols);
+                    let ws = libc::winsize { ws_row: guest_rows(new_rows), ws_col: new_cols, ws_xpixel: 0, ws_ypixel: 0 };
                     unsafe {
                         libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
                     }
@@ -638,7 +741,7 @@ pub fn event_loop(
                 }
                 pty_output = true;
             } else {
-                hold_error_popup(&overlay, &mut terminal, term.screen());
+                hold_error_popup(&overlay, &mut terminal, term.screen(), &host, &catalog, &active);
                 break;
             }
         }
@@ -664,6 +767,8 @@ pub fn event_loop(
                         let is_password = overlay.lock().is_ok_and(|s| matches!(s.popup.content, popup::PopupContent::Password { .. }));
                         if is_password {
                             handle_password_key(&overlay, status_fd, key);
+                        } else if host.handle_key(key, &catalog, &active) {
+                            continue;
                         } else if let Some(bytes) = key_to_bytes(&key, term.application_cursor_keys()) {
                             unsafe {
                                 libc::write(master_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
@@ -671,6 +776,9 @@ pub fn event_loop(
                         }
                     }
                     Event::Mouse(mouse) => {
+                        if mouse.row >= guest_rows(last_rows) {
+                            continue;
+                        }
                         if let Some(bytes) = mouse_to_bytes(mouse, term.mouse_tracking(), term.mouse_encoding()) {
                             unsafe {
                                 libc::write(master_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
@@ -685,6 +793,7 @@ pub fn event_loop(
         {
             let mut state = overlay.lock().unwrap();
             let now = Instant::now();
+            host.refresh_free_space(&catalog);
 
             if pty_output {
                 for action in &mut state.pending {
@@ -737,7 +846,7 @@ pub fn event_loop(
                 }
             }
 
-            if let Err(err) = terminal.draw(|f| render_frame(f, term.screen(), &state)) {
+            if let Err(err) = terminal.draw(|f| render_frame(f, term.screen(), &state, &host, &catalog, &active)) {
                 cleanup_terminal(&mut terminal, mouse_capture_enabled);
                 return Err(format!("draw: {err}"));
             }
@@ -935,21 +1044,124 @@ fn to_ratatui_color(c: vt100::Color) -> Color {
     }
 }
 
-/// Renders one frame: writes every vt100 screen cell to the ratatui buffer
-/// with full color and attributes, then draws overlay widgets (popup,
-/// progress bar, status box) on top.
-fn render_frame(f: &mut Frame, screen: &vt100::Screen, overlay: &OverlayState) {
+fn local_free_space(path: &std::path::Path) -> Option<u64> {
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    let result = unsafe { libc::statvfs(path.as_ptr(), &mut stats) };
+    if result != 0 {
+        return None;
+    }
+    stats.f_bavail.checked_mul(stats.f_frsize)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2));
+    let height = height.min(area.height.saturating_sub(2));
+    Rect { x: area.x + area.width.saturating_sub(width) / 2, y: area.y + area.height.saturating_sub(height) / 2, width, height }
+}
+
+fn render_status_bar(area: Rect, buf: &mut Buffer, host: &HostUiState, active: &ActiveBuildTarget) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let target = active.current();
+    let free = host.free_bytes.map(format_bytes).unwrap_or_else(|| "unknown".to_string());
+    let target_segment = host
+        .confirmation
+        .as_ref()
+        .filter(|(_, shown_at)| shown_at.elapsed() < Duration::from_secs(3))
+        .map_or_else(|| format!("Target: {target}"), |(message, _)| format!("Target: {target} ({message})"));
+    let mut segments = vec![target_segment, "Ctrl+Alt+B Targets".to_string(), "Ctrl+Alt+H Help".to_string(), format!("Local workspace free: {free}")];
+    while segments.len() > 1 {
+        let text = format!(" {}", segments.join(" | "));
+        if text.chars().count() <= usize::from(area.width) {
+            break;
+        }
+        segments.pop();
+    }
+    let mut text = format!(" {}", segments.join(" | "));
+    if text.chars().count() > usize::from(area.width) {
+        text = text.chars().take(usize::from(area.width)).collect();
+    }
+    Paragraph::new(text).style(Style::default().fg(palette::FG).bg(palette::BG_1)).render(area, buf);
+}
+
+fn render_host_popup(area: Rect, buf: &mut Buffer, host: &HostUiState, catalog: &BuildTargetCatalog) {
+    let (title, lines, height) = match host.popup {
+        HostPopup::None => return,
+        HostPopup::Help => (
+            "Bunkerbox Help",
+            vec![
+                Line::from(Span::styled("Ctrl-Alt-B", Style::default().fg(palette::ACCENT))),
+                Line::from("Select Build Target"),
+                Line::from(Span::styled("Ctrl-Alt-H", Style::default().fg(palette::ACCENT))),
+                Line::from("Show this help"),
+                Line::from(Span::styled("Esc", Style::default().fg(palette::ACCENT))),
+                Line::from("Close host popup"),
+            ],
+            10,
+        ),
+        HostPopup::Targets => {
+            let mut lines = Vec::new();
+            for (index, target) in catalog.summaries().iter().enumerate() {
+                let marker = if index == host.target_index { "> " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(palette::ACCENT)),
+                    Span::styled(target.label(), Style::default().fg(palette::FG)),
+                    Span::styled(format!(": {}", target.workspace()), Style::default().fg(palette::MUTED)),
+                ]));
+            }
+            let height = (lines.len() as u16 + 4).max(5);
+            ("Build Targets", lines, height)
+        }
+    };
+    let popup_area = centered_rect(area, 64, height);
+    if popup_area.width < 4 || popup_area.height < 3 {
+        return;
+    }
+    Clear.render(popup_area, buf);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::ACCENT))
+        .style(Style::default().fg(palette::FG).bg(palette::POPUP_BG))
+        .padding(Padding::horizontal(1));
+    Paragraph::new(lines).block(block).render(popup_area, buf);
+}
+
+/// Renders one frame: writes the guest vt100 screen into the reduced guest
+/// viewport, then draws host-owned status and popup controls.
+fn render_frame(
+    f: &mut Frame, screen: &vt100::Screen, overlay: &OverlayState, host: &HostUiState, catalog: &BuildTargetCatalog, active: &ActiveBuildTarget,
+) {
     let area = f.area();
+    let guest_area = Rect { height: area.height.saturating_sub(1), ..area };
     let (rows, cols) = screen.size();
-    let max_rows = area.height.min(rows);
-    let max_cols = area.width.min(cols);
+    let max_rows = guest_area.height.min(rows);
+    let max_cols = guest_area.width.min(cols);
     let buf = f.buffer_mut();
 
     for row in 0..max_rows {
         let mut col: u16 = 0;
         while col < max_cols {
-            let x = area.x + col;
-            let y = area.y + row;
+            let x = guest_area.x + col;
+            let y = guest_area.y + row;
 
             if let Some(cell) = screen.cell(row, col) {
                 if cell.is_wide_continuation() {
@@ -1006,13 +1218,15 @@ fn render_frame(f: &mut Frame, screen: &vt100::Screen, overlay: &OverlayState) {
 
     {
         let buf = f.buffer_mut();
-        overlay.popup.render(area, buf);
-        render_error_toast(area, buf, overlay.error_toast.as_ref());
+        overlay.popup.render(guest_area, buf);
+        render_error_toast(guest_area, buf, overlay.error_toast.as_ref());
+        render_status_bar(Rect { y: area.bottom().saturating_sub(1), height: area.height.min(1), ..area }, buf, host, active);
+        render_host_popup(area, buf, host, catalog);
     }
 
     let (cursor_row, cursor_col) = screen.cursor_position();
     if cursor_row < max_rows && cursor_col < max_cols {
-        f.set_cursor_position((area.x + cursor_col, area.y + cursor_row));
+        f.set_cursor_position((guest_area.x + cursor_col, guest_area.y + cursor_row));
     }
 }
 

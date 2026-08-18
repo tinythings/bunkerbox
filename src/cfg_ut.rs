@@ -539,11 +539,20 @@ fn load_or_create_validates_remote_policy_configuration() {
     );
     let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
     assert_eq!(cfg.project.remote.environment, vec!["PROJECT_MODE"]);
-    assert_eq!(cfg.project.remote.tools, vec![RemoteToolSpec { name: "make".into(), allow_args: false }]);
+    assert_eq!(cfg.project.remote.tools, vec![RemoteToolSpec { name: "make".into(), command: None, allow_args: false }]);
 
     write_project_conf(root.path(), "project:\n  remote:\n    tools:\n      - name: cargo\n        allow-args: true\n");
     let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
-    assert_eq!(cfg.project.remote.tools, vec![RemoteToolSpec { name: "cargo".into(), allow_args: true }]);
+    assert_eq!(cfg.project.remote.tools, vec![RemoteToolSpec { name: "cargo".into(), command: None, allow_args: true }]);
+
+    write_project_conf(root.path(), "project:\n  remote:\n    tools:\n      - name: make\n        command: gmake\n        allow-args: true\n");
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+    assert_eq!(cfg.project.remote.tools[0].command.as_deref(), Some("gmake"));
+    write_project_conf(
+        root.path(),
+        "project:\n  remote:\n    tools:\n      - name: make\n        command: /usr/bin/make\n        allow-args: true\n",
+    );
+    assert!(ProjectConfig::load_or_create(root.path()).is_err());
 }
 
 #[test]

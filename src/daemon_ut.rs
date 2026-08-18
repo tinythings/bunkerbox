@@ -1,4 +1,4 @@
-use super::{dispatch_remote_frame, is_allowed, RemoteBroker, RemoteDispatchError};
+use super::{dispatch_remote_frame, is_allowed, RemoteBroker, RemoteDispatchError, RemoteRouter};
 use super::{monitor_bwrap_status, ChildEvent};
 use crate::cfg::EnvMode;
 use crate::remote::{
@@ -6,10 +6,12 @@ use crate::remote::{
     RemoteExecutionContext, RemoteExecutionControl, RemoteFuture, RemoteRequest, RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTargetId,
     RequestId, WorkspaceRelativePath, WorkspaceSessionId,
 };
+use crate::remote_target::ActiveBuildTarget;
 use crate::vscomm::{
     Frame, RemoteBuild as WireRemoteBuild, RemoteRequest as WireRemoteRequest, RemoteTool as WireRemoteTool, RequestId as WireRequestId,
     WorkspaceRelativePath as WireWorkspaceRelativePath, WorkspaceSessionId as WireWorkspaceSessionId,
 };
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -448,7 +450,15 @@ fn local_exec_request_still_builds_on_the_local_path() {
         workspace: workspace.path().to_path_buf(),
         merged_profile: None,
         proxy_config: None,
-        remote_broker: Arc::new(remote_broker(Arc::new(RecordingBackend { calls: Mutex::new(Vec::new()), emit: Vec::new(), result: None }))),
+        remote_router: Arc::new(RemoteRouter::new(
+            ActiveBuildTarget::new(),
+            BTreeMap::from([(
+                "localhost".to_string(),
+                Arc::new(remote_broker(Arc::new(RecordingBackend { calls: Mutex::new(Vec::new()), emit: Vec::new(), result: None }))),
+            )]),
+        )),
+        local_session_id: WorkspaceSessionId([2; 16]),
+        local_capabilities: Mutex::new(BTreeMap::new()),
     };
     let request = crate::vscomm::ExecRequest { cwd: "/workspace".into(), command: "true".into(), args: Vec::new(), env: Vec::new() };
 

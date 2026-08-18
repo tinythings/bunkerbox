@@ -8,11 +8,12 @@ use crate::remote::{
     RemoteEnvironmentPolicy, RemoteExecutionContext, RemoteRequest, RemoteResourcePolicy, RemoteTargetId, RemoteToolPolicy,
 };
 use crate::remote_target::SshTarget;
+use crate::remote_target::{ActiveBuildTarget, BuildTargetCatalog};
 use crate::sandbox::{resolve_profile, MergedProfile, NetworkMode};
 use crate::ssh::SshBackend;
 use crate::vscomm::{validate_exec_request, validate_process_path, ExecRequest, Frame, FrameType, TOOLCHAIN_PORT};
 use crate::workspace::WorkspaceCwd;
-use rand::Rng;
+use rand::{Rng, RngCore};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -212,7 +213,7 @@ impl RemoteExecutionRegistry {
             for entry in entries.values() {
                 let _ = entry.request_cancel();
             }
-        }
+        };
     }
 }
 
@@ -438,7 +439,9 @@ struct VsockSession {
     workspace: PathBuf,
     merged_profile: Option<Arc<MergedProfile>>,
     proxy_config: Option<Arc<SandboxProxyConfig>>,
-    remote_broker: Arc<RemoteBroker>,
+    remote_router: Arc<RemoteRouter>,
+    local_session_id: crate::remote::WorkspaceSessionId,
+    local_capabilities: Mutex<BTreeMap<crate::remote::RemoteSnapshotId, ()>>,
 }
 
 pub struct VsockDaemon {
@@ -446,6 +449,106 @@ pub struct VsockDaemon {
     shutdown: tokio::sync::oneshot::Sender<()>,
     sandbox_proxy: Option<UnixProxyHandle>,
     sandbox_proxy_dir: Option<PathBuf>,
+}
+
+struct RemoteRouter {
+    active_target: ActiveBuildTarget,
+    brokers: BTreeMap<String, Arc<RemoteBroker>>,
+    snapshots: Mutex<BTreeMap<crate::remote::RemoteSnapshotId, String>>,
+    requests: Mutex<BTreeMap<crate::remote::RequestId, Arc<RemoteBroker>>>,
+}
+
+impl RemoteRouter {
+    fn new(active_target: ActiveBuildTarget, brokers: BTreeMap<String, Arc<RemoteBroker>>) -> Self {
+        Self { active_target, brokers, snapshots: Mutex::new(BTreeMap::new()), requests: Mutex::new(BTreeMap::new()) }
+    }
+
+    fn active_remote_broker(&self) -> Result<(String, Arc<RemoteBroker>), RemoteDispatchError> {
+        let label = self.active_target.current();
+        let broker = self.brokers.get(&label).cloned().ok_or(RemoteDispatchError::Unauthorized(RemoteAuthorizationError::TargetNotAllowed))?;
+        Ok((label, broker))
+    }
+
+    async fn dispatch<W: AsyncWriteExt + Unpin>(&self, request: RemoteRequest, writer: &mut W) -> Result<(), String> {
+        let (broker, label) = match request.operation() {
+            crate::remote::RemoteOperation::Sync(_) => {
+                let (label, broker) = self.active_remote_broker().map_err(|error| format!("remote dispatch failed: {error:?}"))?;
+                (broker, Some(label))
+            }
+            crate::remote::RemoteOperation::Build(build) => {
+                let label = self
+                    .snapshots
+                    .lock()
+                    .map_err(|_| "remote target snapshot lock poisoned".to_string())?
+                    .get(&build.snapshot_id())
+                    .cloned()
+                    .ok_or_else(|| "remote snapshot target binding is unavailable".to_string())?;
+                let broker = self.brokers.get(&label).cloned().ok_or_else(|| "remote target binding is unavailable".to_string())?;
+                (broker, Some(label))
+            }
+            crate::remote::RemoteOperation::Cancel { target_request_id } => {
+                let broker = self
+                    .requests
+                    .lock()
+                    .map_err(|_| "remote target request lock poisoned".to_string())?
+                    .get(target_request_id)
+                    .cloned()
+                    .ok_or_else(|| "remote cancellation target is unavailable".to_string())?;
+                (broker, None)
+            }
+        };
+
+        let request_id = request.request_id();
+        if !matches!(request.operation(), crate::remote::RemoteOperation::Cancel { .. }) {
+            self.requests.lock().map_err(|_| "remote target request lock poisoned".to_string())?.insert(request_id, broker.clone());
+        }
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut dispatch = Box::pin(broker.dispatch(request.clone(), event_tx));
+        let result = loop {
+            tokio::select! {
+                dispatch_result = &mut dispatch => {
+                    while let Ok(event) = event_rx.try_recv() {
+                        self.forward_event(request_id, label.as_deref(), &request, event, writer).await?;
+                    }
+                    break dispatch_result;
+                }
+                event = event_rx.recv() => {
+                    let Some(event) = event else { break Err(RemoteDispatchError::EventSinkClosed) };
+                    self.forward_event(request_id, label.as_deref(), &request, event, writer).await?;
+                }
+            }
+        };
+        if matches!(request.operation(), crate::remote::RemoteOperation::Build(_)) {
+            if let crate::remote::RemoteOperation::Build(build) = request.operation() {
+                self.snapshots.lock().map_err(|_| "remote target snapshot lock poisoned".to_string())?.remove(&build.snapshot_id());
+            }
+        }
+        self.requests.lock().map_err(|_| "remote target request lock poisoned".to_string())?.remove(&request_id);
+        result.map_err(|error| format!("remote dispatch failed: {error:?}"))
+    }
+
+    async fn forward_event<W: AsyncWriteExt + Unpin>(
+        &self, request_id: crate::remote::RequestId, label: Option<&str>, request: &RemoteRequest, event: RemoteBackendEvent, writer: &mut W,
+    ) -> Result<(), String> {
+        if let (Some(label), crate::remote::RemoteOperation::Sync(_), RemoteBackendEvent::SyncCompleted { snapshot_id }) =
+            (label, request.operation(), &event)
+        {
+            self.snapshots.lock().map_err(|_| "remote target snapshot lock poisoned".to_string())?.insert(*snapshot_id, label.to_string());
+        }
+        let response =
+            crate::vscomm::RemoteEvent::from_backend_event(request_id, event).to_frame().map_err(|error| format!("encode remote event: {error}"))?;
+        write_frame(writer, &response).await
+    }
+
+    fn cancel_all(&self) {
+        for broker in self.brokers.values() {
+            broker.cancel_all();
+        }
+    }
+
+    fn cleanup_timeout(&self) -> std::time::Duration {
+        self.brokers.values().map(|broker| broker.cleanup_timeout()).max().unwrap_or_else(|| RemoteResourcePolicy::default().cleanup_timeout)
+    }
 }
 
 pub struct RemoteDaemonConfig {
@@ -533,11 +636,14 @@ impl RemoteDaemonConfig {
 }
 
 struct RemoteComponents {
-    context: RemoteExecutionContext,
-    policy: RemoteAuthorizationPolicy,
-    backend: Arc<dyn RemoteBackend>,
+    context: Option<RemoteExecutionContext>,
+    policy: Option<RemoteAuthorizationPolicy>,
+    backend: Option<Arc<dyn RemoteBackend>>,
     admission_limits: RemoteAdmissionLimits,
     cleanup_timeout: std::time::Duration,
+    router: Option<Arc<RemoteRouter>>,
+    local_session_id: crate::remote::WorkspaceSessionId,
+    legacy_remote: bool,
 }
 
 impl VsockDaemon {
@@ -565,6 +671,7 @@ impl VsockDaemon {
         }
         .with_snapshot_authority(session.clone());
         let remote_context = RemoteExecutionContext { target: session.target(), workspace_session_id: session.session_id() };
+        let local_session_id = session.session_id();
         let backend: Arc<dyn RemoteBackend> = match backend {
             RemoteBackendSelection::Loopback { tools, target_environment } => Arc::new(
                 LoopbackBackend::new(session, tools)
@@ -577,19 +684,74 @@ impl VsockDaemon {
             }
         };
         let remote_components = RemoteComponents {
-            context: remote_context,
-            policy: remote_policy,
-            backend,
+            context: Some(remote_context),
+            policy: Some(remote_policy),
+            backend: Some(backend),
             admission_limits,
             cleanup_timeout: resources.cleanup_timeout,
+            router: None,
+            local_session_id,
+            legacy_remote: true,
         };
         Self::start_inner(passthrough, env_mode, workspace, profiles, share_dir, allow, remote_components)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_target_catalog(
+        passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, profiles: Vec<String>, share_dir: PathBuf, allow: Vec<String>,
+        catalog: BuildTargetCatalog, active_target: ActiveBuildTarget, sessions: BTreeMap<String, Arc<RunRemoteSession>>,
+        local_session_id: crate::remote::WorkspaceSessionId, global_active: usize,
+    ) -> Result<Self, String> {
+        let mut brokers = BTreeMap::new();
+        let mut cleanup_timeout = RemoteResourcePolicy::default().cleanup_timeout;
+        for target in catalog.remote_targets() {
+            let label = target.summary().label().to_string();
+            let session = sessions.get(&label).cloned().ok_or_else(|| format!("missing remote session for target {label}"))?;
+            let environment = RemoteEnvironmentPolicy::from_names(target.project().environment.clone())?;
+            let policy = RemoteAuthorizationPolicy::from_policies(session.target(), session.session_id(), target.tool_policies(), environment)?
+                .with_snapshot_authority(session.clone());
+            let resources = target.target().resources();
+            cleanup_timeout = cleanup_timeout.max(resources.cleanup_timeout());
+            let backend: Arc<dyn RemoteBackend> = Arc::new(
+                SshBackend::new(session.clone(), target.target().clone())?
+                    .with_artifacts(target.artifact_policy().clone(), resources.artifact_limits()),
+            );
+            let target_active = resources.max_active_builds();
+            let admission = RemoteAdmissionLimits::new(global_active, target_active)?;
+            let context = RemoteExecutionContext { target: session.target(), workspace_session_id: session.session_id() };
+            let broker = Arc::new(
+                RemoteBroker::new(policy, context, backend).with_admission_limits(admission).with_cleanup_timeout(resources.cleanup_timeout()),
+            );
+            brokers.insert(label, broker);
+        }
+        let router = Arc::new(RemoteRouter::new(active_target, brokers));
+        let components = RemoteComponents {
+            context: None,
+            policy: None,
+            backend: None,
+            admission_limits: RemoteAdmissionLimits::default(),
+            cleanup_timeout,
+            router: Some(router),
+            local_session_id,
+            legacy_remote: false,
+        };
+        Self::start_inner(passthrough, env_mode, workspace, profiles, share_dir, allow, components)
     }
 
     fn start_inner(
         passthrough: Vec<String>, env_mode: EnvMode, workspace: PathBuf, profiles: Vec<String>, share_dir: PathBuf, allow: Vec<String>,
         remote: RemoteComponents,
     ) -> Result<Self, String> {
+        let RemoteComponents {
+            context,
+            policy,
+            backend,
+            admission_limits,
+            cleanup_timeout,
+            router: router_override,
+            local_session_id,
+            legacy_remote,
+        } = remote;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         let merged_profile = if profiles.is_empty() {
@@ -628,18 +790,27 @@ impl VsockDaemon {
         }
 
         let connections = Arc::new(Mutex::new(Vec::new()));
-        let remote_broker = Arc::new(
-            RemoteBroker::new(remote.policy, remote.context, remote.backend)
-                .with_admission_limits(remote.admission_limits)
-                .with_cleanup_timeout(remote.cleanup_timeout),
-        );
+        let remote_router = router_override.unwrap_or_else(|| {
+            let context = context.expect("single remote context is present");
+            let policy = policy.expect("single remote policy is present");
+            let backend = backend.expect("single remote backend is present");
+            let remote_broker =
+                Arc::new(RemoteBroker::new(policy, context, backend).with_admission_limits(admission_limits).with_cleanup_timeout(cleanup_timeout));
+            let label = if legacy_remote { "legacy-remote" } else { "localhost" };
+            let mut brokers = BTreeMap::new();
+            brokers.insert(label.to_string(), remote_broker);
+            let active = if legacy_remote { ActiveBuildTarget::with_label(label) } else { ActiveBuildTarget::new() };
+            Arc::new(RemoteRouter::new(active, brokers))
+        });
         let session = Arc::new(VsockSession {
             passthrough: Arc::new(passthrough),
             env_mode,
             workspace,
             merged_profile,
             proxy_config: proxy_config.map(Arc::new),
-            remote_broker,
+            remote_router,
+            local_session_id,
+            local_capabilities: Mutex::new(BTreeMap::new()),
         });
 
         let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, TOOLCHAIN_PORT)).map_err(|error| {
@@ -704,9 +875,9 @@ async fn daemon_loop(
         }
     }
 
-    session.remote_broker.cancel_all();
+    session.remote_router.cancel_all();
     let tasks = connections.lock().map_err(|_| "connection task lock poisoned".to_string())?.drain(..).collect::<Vec<_>>();
-    let cleanup_deadline = session.remote_broker.cleanup_timeout();
+    let cleanup_deadline = session.remote_router.cleanup_timeout();
     let mut tasks = tasks;
     if tokio::time::timeout(cleanup_deadline, async {
         for task in &mut tasks {
@@ -730,7 +901,7 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
 
     let frame = Frame::read_async(&mut reader).await.map_err(|e| format!("read frame: {e}"))?;
     if matches!(frame.frame_type, FrameType::RemoteRequest) {
-        return dispatch_remote_frame(frame, &session.remote_broker, &mut writer).await;
+        return dispatch_remote_frame_for_session(frame, session, &mut writer).await;
     }
     if !matches!(frame.frame_type, FrameType::ExecReq) {
         return Err(format!("expected ExecReq or RemoteRequest, got {:?}", frame.frame_type as u16));
@@ -757,6 +928,134 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     }
 
     Ok(())
+}
+
+async fn dispatch_remote_frame_for_session<W: AsyncWriteExt + Unpin>(frame: Frame, session: &VsockSession, writer: &mut W) -> Result<(), String> {
+    let request = crate::vscomm::RemoteRequest::from_frame(frame).map_err(|err| format!("decode remote request: {err}"))?.into_domain()?;
+    let local_snapshot = match request.operation() {
+        crate::remote::RemoteOperation::Build(build) => {
+            session.local_capabilities.lock().map_err(|_| "local target capability lock poisoned".to_string())?.contains_key(&build.snapshot_id())
+        }
+        _ => false,
+    };
+    match request.operation() {
+        crate::remote::RemoteOperation::Sync(_) if session.remote_router.active_target.current() == "localhost" => {
+            dispatch_local_remote_request(request, session, writer).await
+        }
+        crate::remote::RemoteOperation::Build(_) if local_snapshot => dispatch_local_remote_request(request, session, writer).await,
+        _ => session.remote_router.dispatch(request, writer).await,
+    }
+}
+
+async fn dispatch_local_remote_request<W: AsyncWriteExt + Unpin>(
+    request: RemoteRequest, session: &VsockSession, writer: &mut W,
+) -> Result<(), String> {
+    let request_id = request.request_id();
+    if request.workspace_session_id() != session.local_session_id {
+        return write_local_remote_event(
+            writer,
+            request_id,
+            RemoteBackendEvent::Error { message: "local remote session does not match this sandbox".to_string() },
+        )
+        .await;
+    }
+    match request.operation() {
+        crate::remote::RemoteOperation::Sync(sync) => {
+            if sync.retain_capability() {
+                let snapshot_id = loop {
+                    let mut bytes = [0u8; 16];
+                    rand::thread_rng().fill_bytes(&mut bytes);
+                    let candidate = crate::remote::RemoteSnapshotId::from_bytes(bytes);
+                    if !candidate.is_zero()
+                        && !session
+                            .local_capabilities
+                            .lock()
+                            .map_err(|_| "local target capability lock poisoned".to_string())?
+                            .contains_key(&candidate)
+                    {
+                        break candidate;
+                    }
+                };
+                session.local_capabilities.lock().map_err(|_| "local target capability lock poisoned".to_string())?.insert(snapshot_id, ());
+                write_local_remote_event(writer, request_id, RemoteBackendEvent::SyncCompleted { snapshot_id }).await
+            } else {
+                write_local_remote_event(writer, request_id, RemoteBackendEvent::Completed { exit_code: 0 }).await
+            }
+        }
+        crate::remote::RemoteOperation::Build(build) => {
+            let snapshot_id = build.snapshot_id();
+            let available =
+                session.local_capabilities.lock().map_err(|_| "local target capability lock poisoned".to_string())?.remove(&snapshot_id).is_some();
+            if !available {
+                return write_local_remote_event(
+                    writer,
+                    request_id,
+                    RemoteBackendEvent::Error { message: "remote snapshot capability is unavailable".to_string() },
+                )
+                .await;
+            }
+            if !is_allowed(&session.passthrough, build.tool().as_str(), build.argv()) {
+                return write_local_remote_event(
+                    writer,
+                    request_id,
+                    RemoteBackendEvent::Error { message: "local passthrough authorization rejected".to_string() },
+                )
+                .await;
+            }
+            let exec_request = ExecRequest {
+                cwd: build.cwd().as_str().to_string(),
+                command: build.tool().as_str().to_string(),
+                args: build.argv().to_vec(),
+                env: build.env().to_vec(),
+            };
+            let (mut frame_reader, mut frame_writer) = tokio::io::duplex(64 * 1024);
+            let mut execute = Box::pin(execute_request(&mut frame_writer, session, &exec_request));
+            loop {
+                tokio::select! {
+                    result = &mut execute => {
+                        if let Err(error) = result {
+                            write_local_remote_event(writer, request_id, RemoteBackendEvent::Error { message: error }).await?;
+                        }
+                        break;
+                    }
+                    frame = Frame::read_async(&mut frame_reader) => {
+                        let frame = frame.map_err(|error| format!("read local execution frame: {error}"))?;
+                        match frame.frame_type {
+                            FrameType::Stdout => write_local_remote_event(writer, request_id, RemoteBackendEvent::Stdout(frame.payload)).await?,
+                            FrameType::Stderr => write_local_remote_event(writer, request_id, RemoteBackendEvent::Stderr(frame.payload)).await?,
+                            FrameType::Exit => {
+                                if frame.payload.len() != 4 {
+                                    return Err("local execution returned malformed exit frame".to_string());
+                                }
+                                let exit_code = i32::from_le_bytes([frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3]]);
+                                write_local_remote_event(writer, request_id, RemoteBackendEvent::Completed { exit_code }).await?;
+                                break;
+                            }
+                            _ => return Err("local execution returned an unexpected frame".to_string()),
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        crate::remote::RemoteOperation::Cancel { .. } => {
+            write_local_remote_event(
+                writer,
+                request_id,
+                RemoteBackendEvent::Error { message: "local target cancellation is unavailable".to_string() },
+            )
+            .await
+        }
+    }
+}
+
+async fn write_local_remote_event<W: AsyncWriteExt + Unpin>(
+    writer: &mut W, request_id: crate::remote::RequestId, event: RemoteBackendEvent,
+) -> Result<(), String> {
+    let response = crate::vscomm::RemoteEvent::from_backend_event(request_id, event)
+        .to_frame()
+        .map_err(|error| format!("encode local remote event: {error}"))?;
+    write_frame(writer, &response).await
 }
 
 pub async fn dispatch_remote_frame<W: AsyncWriteExt + Unpin>(frame: Frame, broker: &RemoteBroker, writer: &mut W) -> Result<(), String> {

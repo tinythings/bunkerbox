@@ -1,10 +1,11 @@
 use super::*;
 use crate::artifact::{ArtifactLimits, ArtifactPolicy};
+use crate::cfg::ProjectConfig;
 use crate::remote::{
     RemoteAuthorizationPolicy, RemoteBuild, RemoteExecutionContext, RemoteRequest, RemoteSnapshotId, RemoteTool, RequestId, WorkspaceRelativePath,
     WorkspaceSessionId,
 };
-use crate::remote_target::RemoteTargetConfig;
+use crate::remote_target::{BuildTargetCatalog, RemoteTargetConfig};
 use crate::snapshot::{SnapshotBuilder, SnapshotExclusionPolicy, SnapshotLimits, SnapshotStore};
 use crate::worker_protocol::{
     self, WorkerArtifactEntry, WorkerArtifactSetId, WorkerErrorKind, WorkerMessage, WorkerOperation, WorkerSessionId, WorkerUploadEntry,
@@ -21,6 +22,29 @@ use tokio::sync::oneshot;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+#[test]
+fn compact_target_launch_uses_host_ssh_defaults_and_fixed_worker() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let bunkerbox = project.join(".bunkerbox");
+    fs::create_dir(&bunkerbox).unwrap();
+    fs::write(
+        bunkerbox.join(crate::remote_target::REMOTE_PROJECT_CONFIG_FILE_NAME),
+        "targets:\n  build:\n    ssh: builder@build.example.test:2200\n    workspace: /var/tmp/bunkerbox\n",
+    )
+    .unwrap();
+    let catalog = BuildTargetCatalog::load_optional(&project, &ProjectConfig::default()).unwrap().unwrap();
+    let target = catalog.remote("build").unwrap().target();
+    let spec = SshLaunchSpec::from_target(target).unwrap();
+    assert_eq!(spec.program(), Path::new("/usr/bin/ssh"));
+    assert!(spec.args().windows(2).all(|pair| pair != ["-F", "/dev/null"]));
+    assert!(!spec.args().iter().any(|arg| arg == "-i" || arg == "UserKnownHostsFile=/dev/null"));
+    assert!(spec.args().windows(2).any(|pair| pair == ["-p", "2200"]));
+    assert!(spec.remote_command().contains("/usr/local/libexec/bunkerbox-worker"));
+    assert!(spec.remote_command().contains("--stdio"));
+}
 
 #[derive(Clone, Copy)]
 enum ScriptMode {

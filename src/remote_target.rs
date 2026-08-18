@@ -1,4 +1,6 @@
 use crate::artifact::{ArtifactLimits, ArtifactPolicy};
+use crate::cfg::{ProjectConfig, RemoteSection};
+use crate::remote::{RemoteEnvironmentPolicy, RemoteToolPolicy};
 use serde::de::{self, MapAccess, Visitor};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -9,6 +11,7 @@ use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -17,6 +20,8 @@ use std::os::unix::fs::PermissionsExt;
 pub const CONFIG_VERSION: u64 = 1;
 pub const CONFIG_FILE_NAME: &str = "remote-targets.yaml";
 pub const CONFIG_DIRECTORY_NAME: &str = "bunkerbox";
+pub const REMOTE_PROJECT_CONFIG_FILE_NAME: &str = "remote.conf";
+pub const FIXED_WORKER_PATH: &str = "/usr/local/libexec/bunkerbox-worker";
 
 const MAX_CONFIG_PATH_BYTES: usize = 4096;
 const MAX_REMOTE_PATH_BYTES: usize = 4096;
@@ -163,6 +168,8 @@ pub struct SshTarget {
     tools: BTreeMap<String, String>,
     environment: BTreeMap<String, String>,
     resources: ResourceLimits,
+    compact: bool,
+    port_explicit: bool,
 }
 
 /// Alias emphasizing that an `SshTarget` can only be obtained after validation.
@@ -230,6 +237,34 @@ impl SshTarget {
 
     pub fn resources(&self) -> ResourceLimits {
         self.resources
+    }
+
+    pub fn compact_destination(&self) -> bool {
+        self.compact
+    }
+
+    pub fn port_explicit(&self) -> bool {
+        self.port_explicit
+    }
+
+    pub fn from_compact(name: String, destination: &str, workspace: String, resources: ResourceLimits) -> Result<Self, String> {
+        let (user, host, port, port_explicit) = parse_ssh_destination(destination)?;
+        validate_remote_path("workspace", &workspace, true)?;
+        Ok(Self {
+            name,
+            host,
+            port,
+            user,
+            identity_file: PathBuf::new(),
+            known_hosts_file: PathBuf::new(),
+            worker_path: FIXED_WORKER_PATH.to_string(),
+            workspace_root: workspace,
+            tools: BTreeMap::new(),
+            environment: BTreeMap::new(),
+            resources,
+            compact: true,
+            port_explicit,
+        })
     }
 }
 
@@ -482,6 +517,7 @@ pub fn default_config_path_with(xdg_config_home: Option<&Path>, home: Option<&Pa
     ConfigPathHelper::from_paths(xdg_config_home, home).config_path()
 }
 
+#[derive(Debug)]
 struct UniqueMap<K, V>(BTreeMap<K, V>);
 
 impl<K, V> Default for UniqueMap<K, V> {
@@ -634,6 +670,7 @@ struct RawResources {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[derive(Debug)]
 enum RawQuantity {
     Integer(u64),
     Text(String),
@@ -691,6 +728,8 @@ fn validate_target(name: String, raw: RawTarget) -> Result<SshTarget, String> {
         tools,
         environment,
         resources,
+        compact: false,
+        port_explicit: true,
     })
 }
 
@@ -1009,6 +1048,452 @@ fn validate_config_base(path: &Path) -> Result<(), String> {
 
 fn nonempty_path(path: Option<PathBuf>) -> Option<PathBuf> {
     path.filter(|path| !path.as_os_str().is_empty())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildTargetSummary {
+    label: String,
+    workspace: String,
+    local: bool,
+}
+
+impl BuildTargetSummary {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.local
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteBuildTarget {
+    summary: BuildTargetSummary,
+    target: SshTarget,
+    project: RemoteSection,
+    artifact_policy: ArtifactPolicy,
+}
+
+impl RemoteBuildTarget {
+    pub fn summary(&self) -> &BuildTargetSummary {
+        &self.summary
+    }
+
+    pub fn target(&self) -> &SshTarget {
+        &self.target
+    }
+
+    pub fn project(&self) -> &RemoteSection {
+        &self.project
+    }
+
+    pub fn artifact_policy(&self) -> &ArtifactPolicy {
+        &self.artifact_policy
+    }
+
+    pub fn tool_policies(&self) -> Vec<(String, RemoteToolPolicy)> {
+        self.project
+            .tools
+            .iter()
+            .map(|tool| {
+                let command = tool.command.clone().unwrap_or_else(|| tool.name.clone());
+                (tool.name.clone(), RemoteToolPolicy::new(tool.allow_args).with_command(command))
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BuildTargetCatalog {
+    project_root: PathBuf,
+    base_project: ProjectConfig,
+    summaries: Vec<BuildTargetSummary>,
+    remotes: BTreeMap<String, RemoteBuildTarget>,
+}
+
+impl BuildTargetCatalog {
+    pub fn localhost_only(project_root: PathBuf, base_project: ProjectConfig) -> Result<Self, String> {
+        validate_remote_section(&base_project.project.remote)?;
+        Ok(Self {
+            summaries: vec![BuildTargetSummary { label: "localhost".to_string(), workspace: project_root.display().to_string(), local: true }],
+            project_root,
+            base_project,
+            remotes: BTreeMap::new(),
+        })
+    }
+
+    pub fn load_optional(project_root: &Path, base_project: &ProjectConfig) -> Result<Option<Self>, String> {
+        let path = project_root.join(".bunkerbox").join(REMOTE_PROJECT_CONFIG_FILE_NAME);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let raw: RawRemoteProjectConfig = serde_yaml::from_str(&contents).map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        Self::from_raw(project_root.to_path_buf(), base_project.clone(), raw).map(Some)
+    }
+
+    fn from_raw(project_root: PathBuf, base_project: ProjectConfig, raw: RawRemoteProjectConfig) -> Result<Self, String> {
+        validate_remote_section(&base_project.project.remote)?;
+        let mut remotes = BTreeMap::new();
+        let mut summaries = vec![BuildTargetSummary { label: "localhost".to_string(), workspace: project_root.display().to_string(), local: true }];
+        for (label, target) in raw.targets.0 {
+            validate_name("target label", &label)?;
+            if label == "localhost" {
+                return Err("remote target label 'localhost' is reserved".to_string());
+            }
+            let project = merge_remote_overlay(&base_project.project.remote, target.project.as_ref())?;
+            validate_remote_section(&project)?;
+            let resources = validate_compact_resources(target.resources)?;
+            let ssh_target = SshTarget::from_compact(label.clone(), &target.ssh, target.workspace, resources)?;
+            let artifact_policy = ArtifactPolicy::new(project.artifacts.clone())?;
+            artifact_policy.validate_limits(resources.artifact_limits())?;
+            let summary = BuildTargetSummary { label: label.clone(), workspace: ssh_target.workspace_root().to_string(), local: false };
+            let remote = RemoteBuildTarget { summary: summary.clone(), target: ssh_target, project, artifact_policy };
+            if remotes.insert(label.clone(), remote).is_some() {
+                return Err(format!("duplicate target label: {label}"));
+            }
+            summaries.push(summary);
+        }
+        Ok(Self { project_root, base_project, summaries, remotes })
+    }
+
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    pub fn base_project(&self) -> &ProjectConfig {
+        &self.base_project
+    }
+
+    pub fn summaries(&self) -> &[BuildTargetSummary] {
+        &self.summaries
+    }
+
+    pub fn remote(&self, label: &str) -> Option<&RemoteBuildTarget> {
+        self.remotes.get(label)
+    }
+
+    pub fn remote_targets(&self) -> impl Iterator<Item = &RemoteBuildTarget> {
+        self.remotes.values()
+    }
+
+    pub fn wrapper_names(&self) -> Vec<String> {
+        let mut names = BTreeMap::new();
+        for tool in &self.base_project.project.remote.tools {
+            names.insert(tool.name.clone(), ());
+        }
+        for target in self.remotes.values() {
+            for tool in &target.project.tools {
+                names.insert(tool.name.clone(), ());
+            }
+        }
+        names.into_keys().collect()
+    }
+
+    pub fn environment_names(&self) -> Vec<String> {
+        let mut names = BTreeMap::new();
+        for name in &self.base_project.project.remote.environment {
+            names.insert(name.clone(), ());
+        }
+        for target in self.remotes.values() {
+            for name in &target.project.environment {
+                names.insert(name.clone(), ());
+            }
+        }
+        names.into_keys().collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct ActiveBuildTarget {
+    selected: Arc<Mutex<String>>,
+}
+
+impl ActiveBuildTarget {
+    pub fn new() -> Self {
+        Self::with_label("localhost")
+    }
+
+    pub(crate) fn with_label(label: impl Into<String>) -> Self {
+        Self { selected: Arc::new(Mutex::new(label.into())) }
+    }
+
+    pub fn current(&self) -> String {
+        self.selected.lock().map(|value| value.clone()).unwrap_or_else(|_| "localhost".to_string())
+    }
+
+    pub fn select(&self, catalog: &BuildTargetCatalog, label: &str) -> Result<(), String> {
+        if !catalog.summaries.iter().any(|summary| summary.label == label) {
+            return Err(format!("unknown build target: {label}"));
+        }
+        let mut selected = self.selected.lock().map_err(|_| "active build target lock poisoned".to_string())?;
+        *selected = label.to_string();
+        Ok(())
+    }
+}
+
+impl Default for ActiveBuildTarget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRemoteProjectConfig {
+    #[serde(default)]
+    targets: UniqueMap<String, RawCompactTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCompactTarget {
+    ssh: String,
+    workspace: String,
+    #[serde(default)]
+    project: Option<RawTargetProject>,
+    #[serde(default)]
+    resources: Option<RawTargetResources>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTargetProject {
+    #[serde(default)]
+    remote: Option<RawRemoteOverlay>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRemoteOverlay {
+    #[serde(default)]
+    exclude: Option<Vec<String>>,
+    #[serde(default)]
+    environment: Option<Vec<String>>,
+    #[serde(default)]
+    tools: Option<Vec<crate::cfg::RemoteToolSpec>>,
+    #[serde(default)]
+    artifacts: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTargetResources {
+    #[serde(
+        default,
+        rename = "connect-timeout-seconds",
+        alias = "connect-timeout",
+        alias = "connect_timeout_seconds",
+        alias = "connect_timeout",
+        alias = "connect"
+    )]
+    connect_timeout: Option<RawQuantity>,
+    #[serde(
+        default,
+        rename = "sync-timeout-seconds",
+        alias = "sync-timeout",
+        alias = "sync_timeout_seconds",
+        alias = "sync_timeout",
+        alias = "sync"
+    )]
+    sync_timeout: Option<RawQuantity>,
+    #[serde(
+        default,
+        rename = "build-timeout-seconds",
+        alias = "build-timeout",
+        alias = "build_timeout_seconds",
+        alias = "build_timeout",
+        alias = "build"
+    )]
+    build_timeout: Option<RawQuantity>,
+    #[serde(default, rename = "max-output-bytes", alias = "max-output", alias = "max_output_bytes", alias = "max_output")]
+    max_output: Option<RawQuantity>,
+    #[serde(default, rename = "idle-output-timeout-seconds", alias = "idle-output-timeout", alias = "idle_output_timeout")]
+    idle_output_timeout: Option<RawQuantity>,
+    #[serde(default, rename = "cleanup-timeout-seconds", alias = "cleanup-timeout", alias = "cleanup_timeout")]
+    cleanup_timeout: Option<RawQuantity>,
+    #[serde(default, rename = "artifact-timeout-seconds", alias = "artifact-timeout", alias = "artifact_timeout")]
+    artifact_timeout: Option<RawQuantity>,
+    #[serde(default, rename = "max-artifact-bytes", alias = "max-artifact-bytes-per-file", alias = "max_artifact_bytes")]
+    max_artifact_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-artifact-total-bytes", alias = "max_artifact_total_bytes")]
+    max_artifact_total_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-artifact-entries", alias = "max_artifact_entries")]
+    max_artifact_entries: Option<u64>,
+    #[serde(default, rename = "max-worker-uploads", alias = "max_worker_uploads")]
+    max_worker_uploads: Option<u64>,
+    #[serde(default, rename = "max-worker-upload-bytes", alias = "max_worker_upload_bytes")]
+    max_worker_upload_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-worker-jobs", alias = "max_worker_jobs")]
+    max_worker_jobs: Option<u64>,
+    #[serde(default, rename = "max-worker-job-bytes", alias = "max_worker_job_bytes")]
+    max_worker_job_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-worker-artifact-spools", alias = "max_worker_artifact_spools")]
+    max_worker_artifact_spools: Option<u64>,
+    #[serde(default, rename = "max-worker-artifact-spool-bytes", alias = "max_worker_artifact_spool_bytes")]
+    max_worker_artifact_spool_bytes: Option<RawQuantity>,
+    #[serde(default, rename = "max-worker-state-entries", alias = "max_worker_state_entries")]
+    max_worker_state_entries: Option<u64>,
+    #[serde(default, rename = "max-active-builds", alias = "max_active_builds")]
+    max_active_builds: Option<u64>,
+}
+
+fn merge_remote_overlay(base: &RemoteSection, target: Option<&RawTargetProject>) -> Result<RemoteSection, String> {
+    let Some(target) = target.and_then(|project| project.remote.as_ref()) else { return Ok(base.clone()) };
+    let mut merged = base.clone();
+    if let Some(exclude) = &target.exclude {
+        merged.exclude = exclude.clone();
+    }
+    if let Some(environment) = &target.environment {
+        merged.environment = environment.clone();
+    }
+    if let Some(tools) = &target.tools {
+        merged.tools = tools.clone();
+    }
+    if let Some(artifacts) = &target.artifacts {
+        merged.artifacts = artifacts.clone();
+    }
+    Ok(merged)
+}
+
+fn validate_remote_section(section: &RemoteSection) -> Result<(), String> {
+    RemoteEnvironmentPolicy::from_names(section.environment.clone())?;
+    crate::snapshot::SnapshotExclusionPolicy::from_patterns(section.exclude.clone())?;
+    ArtifactPolicy::new(section.artifacts.clone())?;
+    let mut names = BTreeMap::new();
+    for tool in &section.tools {
+        crate::remote::validate_remote_wrapper_name(tool.name.clone())?;
+        if let Some(command) = &tool.command {
+            crate::remote::validate_remote_wrapper_name(command.clone())?;
+        }
+        if names.insert(tool.name.clone(), ()).is_some() {
+            return Err(format!("duplicate remote tool: {}", tool.name));
+        }
+    }
+    Ok(())
+}
+
+fn validate_compact_resources(raw: Option<RawTargetResources>) -> Result<ResourceLimits, String> {
+    let defaults = crate::remote::RemoteResourcePolicy::default();
+    let artifact_defaults = ArtifactLimits::default();
+    let worker_defaults = WorkerStateLimits::default();
+    let raw = raw.unwrap_or_default();
+    let connect_timeout = raw.connect_timeout.map_or(Ok(defaults.sync_timeout), |value| parse_duration("connect-timeout", value))?;
+    let sync_timeout = raw.sync_timeout.map_or(Ok(defaults.sync_timeout), |value| parse_duration("sync-timeout", value))?;
+    let build_timeout = raw.build_timeout.map_or(Ok(defaults.build_timeout), |value| parse_duration("build-timeout", value))?;
+    let idle_output_timeout =
+        raw.idle_output_timeout.map_or(Ok(defaults.idle_output_timeout), |value| parse_duration("idle-output-timeout", value))?;
+    let cleanup_timeout = raw.cleanup_timeout.map_or(Ok(defaults.cleanup_timeout), |value| parse_duration("cleanup-timeout", value))?;
+    validate_lifecycle_duration("connect-timeout", connect_timeout)?;
+    validate_lifecycle_duration("sync-timeout", sync_timeout)?;
+    validate_lifecycle_duration("build-timeout", build_timeout)?;
+    validate_lifecycle_duration("idle-output-timeout", idle_output_timeout)?;
+    validate_lifecycle_duration("cleanup-timeout", cleanup_timeout)?;
+    let max_output_bytes = raw.max_output.map_or(Ok(defaults.max_output_bytes), |value| parse_size("max-output", value))?;
+    let max_active_builds = parse_count("max-active-builds", raw.max_active_builds, 1)?;
+    if max_active_builds == 0 || max_active_builds > 64 {
+        return Err("max-active-builds must be between 1 and 64".to_string());
+    }
+    let artifact_timeout = raw.artifact_timeout.map_or(Ok(artifact_defaults.timeout), |value| parse_duration("artifact-timeout", value))?;
+    let max_artifact_bytes = raw.max_artifact_bytes.map_or(Ok(artifact_defaults.max_file_bytes), |value| parse_size("max-artifact-bytes", value))?;
+    let max_artifact_total_bytes =
+        raw.max_artifact_total_bytes.map_or(Ok(artifact_defaults.max_total_bytes), |value| parse_size("max-artifact-total-bytes", value))?;
+    let max_artifact_entries = raw
+        .max_artifact_entries
+        .map_or(Ok(artifact_defaults.max_entries), |value| usize::try_from(value).map_err(|_| "max-artifact-entries is too large".to_string()))?;
+    let artifact = ArtifactLimits::new(artifact_timeout, max_artifact_entries, max_artifact_bytes, max_artifact_total_bytes)?;
+    let worker = WorkerStateLimits::new(
+        parse_count("max-worker-uploads", raw.max_worker_uploads, worker_defaults.max_uploads)?,
+        raw.max_worker_upload_bytes.map_or(Ok(worker_defaults.max_upload_bytes), |value| parse_size("max-worker-upload-bytes", value))?,
+        parse_count("max-worker-jobs", raw.max_worker_jobs, worker_defaults.max_jobs)?,
+        raw.max_worker_job_bytes.map_or(Ok(worker_defaults.max_job_bytes), |value| parse_size("max-worker-job-bytes", value))?,
+        parse_count("max-worker-artifact-spools", raw.max_worker_artifact_spools, worker_defaults.max_artifact_spools)?,
+        raw.max_worker_artifact_spool_bytes
+            .map_or(Ok(worker_defaults.max_artifact_spool_bytes), |value| parse_size("max-worker-artifact-spool-bytes", value))?,
+        parse_count("max-worker-state-entries", raw.max_worker_state_entries, worker_defaults.max_state_entries)?,
+    )?;
+    Ok(ResourceLimits {
+        connect_timeout,
+        sync_timeout,
+        build_timeout,
+        idle_output_timeout,
+        cleanup_timeout,
+        max_output_bytes,
+        max_active_builds,
+        artifact,
+        worker,
+    })
+}
+
+fn parse_ssh_destination(value: &str) -> Result<(String, String, u16, bool), String> {
+    if value.is_empty()
+        || value.len() > MAX_HOST_BYTES
+        || !value.is_ascii()
+        || value.chars().any(char::is_control)
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err("SSH destination has invalid syntax".to_string());
+    }
+    if value.starts_with('-') || value.contains('/') || value.matches('@').count() > 1 {
+        return Err("SSH destination has invalid syntax".to_string());
+    }
+    let (user, authority) = value.split_once('@').map_or((String::new(), value), |(user, authority)| (user.to_string(), authority));
+    if !user.is_empty() {
+        validate_username(&user)?;
+    }
+    let (host, port, port_explicit) = if let Some(rest) = authority.strip_prefix('[') {
+        let close = rest.find(']').ok_or_else(|| "SSH destination has invalid bracketed host".to_string())?;
+        let host = &rest[..close];
+        let suffix = &rest[close + 1..];
+        if suffix.is_empty() {
+            (host.to_string(), 22, false)
+        } else {
+            let port = suffix
+                .strip_prefix(':')
+                .ok_or_else(|| "SSH destination has invalid port".to_string())?
+                .parse::<u16>()
+                .map_err(|_| "SSH destination has invalid port".to_string())?;
+            if port == 0 {
+                return Err("SSH destination port must be positive".to_string());
+            }
+            (host.to_string(), port, true)
+        }
+    } else if authority.matches(':').count() == 1 {
+        let (host, port) = authority.split_once(':').unwrap();
+        let port = port.parse::<u16>().map_err(|_| "SSH destination has invalid port".to_string())?;
+        if port == 0 {
+            return Err("SSH destination port must be positive".to_string());
+        }
+        (host.to_string(), port, true)
+    } else if authority.contains(':') {
+        return Err("SSH destination must use a bracketed IPv6 host".to_string());
+    } else {
+        (authority.to_string(), 22, false)
+    };
+    validate_destination_host(&host)?;
+    Ok((user, host, port, port_explicit))
+}
+
+fn validate_destination_host(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.len() > MAX_HOST_BYTES || host.starts_with('-') || host.ends_with('-') || host.chars().any(char::is_control) {
+        return Err("SSH destination host has invalid syntax".to_string());
+    }
+    if IpAddr::from_str(host).is_ok() {
+        return Ok(());
+    }
+    let bytes = host.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric()
+        || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        || !bytes.iter().all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_' | b'+'))
+    {
+        return Err("SSH destination host has invalid syntax".to_string());
+    }
+    Ok(())
 }
 
 struct RedactedEnvironment(usize);

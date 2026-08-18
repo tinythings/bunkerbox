@@ -169,6 +169,22 @@ fn command_policy_rejects_unapproved_arguments() {
 }
 
 #[test]
+fn command_policy_rewrites_only_the_trusted_target_command() {
+    let policy = RemoteAuthorizationPolicy::from_policies(
+        RemoteTargetId([3; 16]),
+        WorkspaceSessionId([2; 16]),
+        [("make".into(), RemoteToolPolicy::new(true).with_command("gmake"))],
+        RemoteEnvironmentPolicy::default(),
+    )
+    .unwrap()
+    .with_snapshot_authority(std::sync::Arc::new(TestSnapshotAuthority));
+    let authorized = policy.authorize(&context(), request("make")).unwrap();
+    let RemoteOperation::Build(build) = authorized.request().operation() else { panic!("expected build") };
+    assert_eq!(build.tool().as_str(), "make");
+    assert_eq!(authorized.target_command(), Some("gmake"));
+}
+
+#[test]
 fn request_and_cancel_ids_must_be_nonzero() {
     let policy = policy(vec!["make".into()]);
     assert_eq!(

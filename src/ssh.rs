@@ -9,7 +9,7 @@ use crate::snapshot::SnapshotEntryKind;
 use crate::worker_protocol::{
     self, WorkerArtifactEntry, WorkerArtifactPath, WorkerArtifactSetId, WorkerBuild, WorkerErrorKind, WorkerMessage, WorkerOperation,
     WorkerRelativePath, WorkerRequestId, WorkerSessionId, WorkerUploadEntry, WorkerUploadId, MAX_WORKER_CHUNK_BYTES, MAX_WORKER_FILE_BYTES,
-    WORKER_ARTIFACT_PROTOCOL_VERSION, WORKER_PROTOCOL_VERSION,
+    WORKER_ARTIFACT_PROTOCOL_VERSION, WORKER_COMMAND_PROTOCOL_VERSION, WORKER_PROTOCOL_VERSION,
 };
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -27,6 +27,16 @@ const SSH_PROGRAM: &str = "/usr/bin/ssh";
 const MAX_SSH_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn build_protocol_version(target: &SshTarget, artifacts: bool) -> u16 {
+    if target.compact_destination() {
+        WORKER_COMMAND_PROTOCOL_VERSION
+    } else if artifacts {
+        WORKER_ARTIFACT_PROTOCOL_VERSION
+    } else {
+        WORKER_PROTOCOL_VERSION
+    }
+}
+
 type WorkerReader = Box<dyn AsyncRead + Send + Unpin>;
 type WorkerWriter = Box<dyn AsyncWrite + Send + Unpin>;
 
@@ -39,7 +49,7 @@ pub struct SshLaunchSpec {
 
 impl SshLaunchSpec {
     pub fn from_target(target: &SshTarget) -> Result<Self, String> {
-        if target.host().is_empty() || target.user().is_empty() || target.port() == 0 {
+        if target.host().is_empty() || target.port() == 0 || (!target.compact_destination() && target.user().is_empty()) {
             return Err("SSH target is not fully validated".to_string());
         }
 
@@ -59,21 +69,11 @@ impl SshLaunchSpec {
             worker.max_state_entries,
         );
         let connect_timeout = target.resources().connect_timeout().as_secs().max(1).to_string();
-        let args = vec![
-            "-F".to_string(),
-            "/dev/null".to_string(),
+        let mut args = vec![
             "-o".to_string(),
             "BatchMode=yes".to_string(),
             "-o".to_string(),
             "StrictHostKeyChecking=yes".to_string(),
-            "-o".to_string(),
-            format!("UserKnownHostsFile={}", target.known_hosts_file().display()),
-            "-o".to_string(),
-            "GlobalKnownHostsFile=/dev/null".to_string(),
-            "-o".to_string(),
-            "IdentitiesOnly=yes".to_string(),
-            "-o".to_string(),
-            "IdentityAgent=none".to_string(),
             "-o".to_string(),
             "ForwardAgent=no".to_string(),
             "-o".to_string(),
@@ -90,16 +90,31 @@ impl SshLaunchSpec {
             "EscapeChar=none".to_string(),
             "-o".to_string(),
             format!("ConnectTimeout={connect_timeout}"),
-            "-p".to_string(),
-            target.port().to_string(),
-            "-i".to_string(),
-            target.identity_file().display().to_string(),
-            "-l".to_string(),
-            target.user().to_string(),
-            "--".to_string(),
-            target.host().to_string(),
-            remote_command.clone(),
         ];
+
+        if !target.compact_destination() {
+            args.splice(0..0, ["-F".to_string(), "/dev/null".to_string()]);
+            args.splice(
+                4..4,
+                [
+                    "-o".to_string(),
+                    format!("UserKnownHostsFile={}", target.known_hosts_file().display()),
+                    "-o".to_string(),
+                    "GlobalKnownHostsFile=/dev/null".to_string(),
+                    "-o".to_string(),
+                    "IdentitiesOnly=yes".to_string(),
+                    "-o".to_string(),
+                    "IdentityAgent=none".to_string(),
+                ],
+            );
+            args.extend(["-p".to_string(), target.port().to_string(), "-i".to_string(), target.identity_file().display().to_string()]);
+        } else if target.port_explicit() {
+            args.extend(["-p".to_string(), target.port().to_string()]);
+        }
+        if !target.user().is_empty() {
+            args.extend(["-l".to_string(), target.user().to_string()]);
+        }
+        args.extend(["--".to_string(), target.host().to_string(), remote_command.clone()]);
 
         Ok(Self { program: PathBuf::from(SSH_PROGRAM), args, remote_command })
     }
@@ -263,6 +278,7 @@ impl RemoteBackend for SshBackend {
         &'a self, request: AuthorizedRemoteRequest, control: RemoteExecutionControl, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>,
     ) -> RemoteFuture<'a, Result<(), RemoteBackendError>> {
         let operation = request.request().operation().clone();
+        let target_command = request.target_command().map(str::to_string);
         let request_id = request.request_id();
         let session = self.session.clone();
         let target = self.target.clone();
@@ -271,7 +287,8 @@ impl RemoteBackend for SshBackend {
         let artifact_policy = self.artifact_policy.clone();
         let artifact_limits = self.artifact_limits;
         Box::pin(async move {
-            let backend = SshExecution { session, target, factory, uploads, artifact_policy, artifact_limits, control: control.clone() };
+            let backend =
+                SshExecution { session, target, factory, uploads, artifact_policy, artifact_limits, target_command, control: control.clone() };
             match operation {
                 RemoteOperation::Sync(sync) => backend.execute_sync(request_id.0, sync.retain_capability(), events).await,
                 RemoteOperation::Build(build) => backend.execute_build(request_id.0, &build, events).await,
@@ -296,6 +313,7 @@ struct SshExecution {
     uploads: Arc<Mutex<BTreeMap<RemoteSnapshotId, WorkerUploadId>>>,
     artifact_policy: ArtifactPolicy,
     artifact_limits: ArtifactLimits,
+    target_command: Option<String>,
     control: RemoteExecutionControl,
 }
 
@@ -448,28 +466,32 @@ impl SshExecution {
                 return Err(RemoteBackendError::Failed(error));
             }
         };
-        let executable = match self.target.tools().get(build.tool().as_str()) {
-            Some(executable) => executable.clone(),
-            None => {
-                drop(claim);
-                self.cleanup_upload(request_id, upload_id).await;
-                return Err(RemoteBackendError::Transport {
-                    class: RemoteFailureClass::WorkerUnavailable,
-                    message: format!("remote tool is not configured: {}", build.tool().as_str()),
-                });
-            }
-        };
         let guest_env = build.env().to_vec();
         let target_env = self.target.environment().iter().map(|(key, value)| (key.clone(), value.clone())).collect::<Vec<_>>();
-        let worker_build = match WorkerBuild::new(
-            build.tool().as_str(),
-            executable,
-            build.argv().to_vec(),
-            build.cwd().as_str(),
-            guest_env,
-            target_env,
-            upload_id,
-        ) {
+        let worker_build = match if self.target.compact_destination() {
+            WorkerBuild::new_command(
+                build.tool().as_str(),
+                self.target_command.as_deref().unwrap_or(build.tool().as_str()),
+                build.argv().to_vec(),
+                build.cwd().as_str(),
+                guest_env,
+                target_env,
+                upload_id,
+            )
+        } else {
+            let executable = match self.target.tools().get(build.tool().as_str()) {
+                Some(executable) => executable.clone(),
+                None => {
+                    drop(claim);
+                    self.cleanup_upload(request_id, upload_id).await;
+                    return Err(RemoteBackendError::Transport {
+                        class: RemoteFailureClass::WorkerUnavailable,
+                        message: format!("remote tool is not configured: {}", build.tool().as_str()),
+                    });
+                }
+            };
+            WorkerBuild::new(build.tool().as_str(), executable, build.argv().to_vec(), build.cwd().as_str(), guest_env, target_env, upload_id)
+        } {
             Ok(worker_build) => worker_build,
             Err(error) => {
                 drop(claim);
@@ -506,7 +528,7 @@ impl SshExecution {
                     .handshake(
                         WorkerRequestId(request_id),
                         WorkerSessionId(self.session.session_id().0),
-                        if self.artifact_policy.is_enabled() { WORKER_ARTIFACT_PROTOCOL_VERSION } else { WORKER_PROTOCOL_VERSION },
+                        build_protocol_version(&self.target, self.artifact_policy.is_enabled()),
                     )
                     .await?;
                 Ok(connection)
@@ -537,7 +559,7 @@ impl SshExecution {
                 artifact_policy: self.artifact_policy.clone(),
                 artifact_limits: self.artifact_limits,
                 workspace_root: self.session.workspace_root().to_path_buf(),
-                protocol_version: if self.artifact_policy.is_enabled() { WORKER_ARTIFACT_PROTOCOL_VERSION } else { WORKER_PROTOCOL_VERSION },
+                protocol_version: build_protocol_version(&self.target, self.artifact_policy.is_enabled()),
                 control: &self.control,
                 handshake: false,
             },

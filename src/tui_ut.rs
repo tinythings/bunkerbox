@@ -1,6 +1,28 @@
-use super::{dispatch_ui_command, mouse_to_bytes, process_status_bytes, MouseEncoding, MouseTracking, OverlayState, Term};
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use super::{
+    dispatch_ui_command, guest_rows, mouse_to_bytes, process_status_bytes, HostPopup, HostUiState, MouseEncoding, MouseTracking, OverlayState, Term,
+};
+use crate::cfg::ProjectConfig;
+use crate::remote_target::{ActiveBuildTarget, BuildTargetCatalog};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+#[test]
+fn guest_viewport_reserves_exactly_one_physical_row() {
+    assert_eq!(guest_rows(24), 23);
+    assert_eq!(guest_rows(1), 1);
+    assert_eq!(guest_rows(0), 1);
+}
+
+#[test]
+fn host_target_shortcut_is_consumed_before_guest_bytes() {
+    let catalog = BuildTargetCatalog::localhost_only(PathBuf::from("/tmp/project"), ProjectConfig::default()).unwrap();
+    let active = ActiveBuildTarget::new();
+    let mut host = HostUiState::new(&catalog);
+    let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    assert!(host.handle_key(key, &catalog, &active));
+    assert_eq!(host.popup, HostPopup::Targets);
+}
 
 #[test]
 fn internal_error_creates_a_non_modal_toast() {

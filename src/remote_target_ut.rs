@@ -1,4 +1,5 @@
 use super::*;
+use crate::cfg::{ProjectConfig, RemoteToolSpec};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,6 +84,66 @@ projects:
 
 fn write_config(fixture: &Fixture, yaml: &str) {
     fs::write(&fixture.config, yaml).unwrap();
+}
+
+#[test]
+fn compact_project_catalog_is_localhost_first_and_freezes_target_overlay() {
+    let fixture = Fixture::new();
+    let bunkerbox = fixture.project.join(".bunkerbox");
+    fs::create_dir(&bunkerbox).unwrap();
+    fs::write(
+        bunkerbox.join(REMOTE_PROJECT_CONFIG_FILE_NAME),
+        r#"targets:
+  netbsd:
+    ssh: builder@build.example.test:2222
+    workspace: /var/tmp/bunkerbox
+    project:
+      remote:
+        environment: [CC]
+        tools:
+          - name: make
+            command: gmake
+            allow-args: true
+        artifacts: [build/output]
+"#,
+    )
+    .unwrap();
+
+    let mut base = ProjectConfig::default();
+    base.project.remote.tools = vec![RemoteToolSpec { name: "cargo".into(), command: None, allow_args: false }];
+    let catalog = BuildTargetCatalog::load_optional(&fixture.project, &base).unwrap().unwrap();
+    assert_eq!(catalog.summaries().iter().map(BuildTargetSummary::label).collect::<Vec<_>>(), vec!["localhost", "netbsd"]);
+    let target = catalog.remote("netbsd").unwrap();
+    assert!(target.target().compact_destination());
+    assert_eq!(target.target().worker_path(), FIXED_WORKER_PATH);
+    assert_eq!(target.project().tools.len(), 1);
+    assert_eq!(target.project().tools[0].name, "make");
+    assert_eq!(target.project().tools[0].command.as_deref(), Some("gmake"));
+    assert_eq!(target.tool_policies()[0].1.command(), Some("gmake"));
+    assert_eq!(target.artifact_policy().paths(), &["build/output".to_string()]);
+    assert_eq!(catalog.wrapper_names(), vec!["cargo", "make"]);
+    assert_eq!(catalog.environment_names(), vec!["CC"]);
+}
+
+#[test]
+fn compact_target_overlay_rejects_non_remote_project_fields() {
+    let fixture = Fixture::new();
+    let bunkerbox = fixture.project.join(".bunkerbox");
+    fs::create_dir(&bunkerbox).unwrap();
+    fs::write(
+        bunkerbox.join(REMOTE_PROJECT_CONFIG_FILE_NAME),
+        "targets:\n  netbsd:\n    ssh: build.example.test\n    workspace: /var/tmp/bunkerbox\n    project:\n      image:\n        session-mb: 1\n",
+    )
+    .unwrap();
+    assert!(BuildTargetCatalog::load_optional(&fixture.project, &ProjectConfig::default()).is_err());
+}
+
+#[test]
+fn compact_ssh_destination_accepts_aliases_users_ports_and_ipv6() {
+    assert_eq!(parse_ssh_destination("builder@build.example.test:2200").unwrap(), ("builder".into(), "build.example.test".into(), 2200, true));
+    assert_eq!(parse_ssh_destination("[2001:db8::1]").unwrap(), ("".into(), "2001:db8::1".into(), 22, false));
+    assert!(parse_ssh_destination("-oProxyCommand=bad").is_err());
+    assert!(parse_ssh_destination("build.example.test/path").is_err());
 }
 
 #[test]

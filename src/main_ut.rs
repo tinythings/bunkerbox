@@ -62,9 +62,9 @@ fn run_handoff_rejects_zero_session() {
 fn remote_tool_names_propagates_the_complete_configured_set() {
     assert_eq!(
         remote_tool_names(&[
-            RemoteToolSpec { name: "make".into(), allow_args: true },
-            RemoteToolSpec { name: "cargo".into(), allow_args: false },
-            RemoteToolSpec { name: "cmake".into(), allow_args: true },
+            RemoteToolSpec { name: "make".into(), command: None, allow_args: true },
+            RemoteToolSpec { name: "cargo".into(), command: None, allow_args: false },
+            RemoteToolSpec { name: "cmake".into(), command: None, allow_args: true },
         ]),
         vec!["make", "cargo", "cmake"]
     );

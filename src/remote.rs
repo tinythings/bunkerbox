@@ -232,18 +232,28 @@ impl RemoteEnvironmentPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteToolPolicy {
     allow_arbitrary_argv: bool,
+    command: Option<String>,
 }
 
 impl RemoteToolPolicy {
     pub fn new(allow_arbitrary_argv: bool) -> Self {
-        Self { allow_arbitrary_argv }
+        Self { allow_arbitrary_argv, command: None }
     }
 
-    pub fn allows_arbitrary_argv(self) -> bool {
+    pub fn with_command(mut self, command: impl Into<String>) -> Self {
+        self.command = Some(command.into());
+        self
+    }
+
+    pub fn allows_arbitrary_argv(&self) -> bool {
         self.allow_arbitrary_argv
+    }
+
+    pub fn command(&self) -> Option<&str> {
+        self.command.as_deref()
     }
 }
 
@@ -473,6 +483,7 @@ pub struct RemoteExecutionContext {
 pub struct AuthorizedRemoteRequest {
     request: RemoteRequest,
     target: RemoteTargetId,
+    target_command: Option<String>,
 }
 
 impl AuthorizedRemoteRequest {
@@ -486,6 +497,10 @@ impl AuthorizedRemoteRequest {
 
     pub fn request(&self) -> &RemoteRequest {
         &self.request
+    }
+
+    pub fn target_command(&self) -> Option<&str> {
+        self.target_command.as_deref()
     }
 }
 
@@ -538,6 +553,9 @@ impl RemoteAuthorizationPolicy {
         let mut allowed_tools = BTreeMap::new();
         for (tool, policy) in tools {
             RemoteTool::new(tool.clone())?;
+            if let Some(command) = policy.command() {
+                RemoteTool::new(command.to_string())?;
+            }
             if allowed_tools.insert(tool.clone(), policy).is_some() {
                 return Err(format!("duplicate remote tool policy: {tool}"));
             }
@@ -565,6 +583,7 @@ impl RemoteAuthorizationPolicy {
             return Err(RemoteAuthorizationError::TargetNotAllowed);
         }
 
+        let mut target_command = None;
         let request = match request.operation() {
             RemoteOperation::Sync(_) => request,
             RemoteOperation::Cancel { target_request_id } => {
@@ -577,7 +596,7 @@ impl RemoteAuthorizationPolicy {
                 if self.snapshot_authority.as_ref().is_none_or(|authority| !authority.snapshot_available(self.allowed_session, build.snapshot_id())) {
                     return Err(RemoteAuthorizationError::SnapshotNotAllowed);
                 }
-                let Some(tool_policy) = self.allowed_tools.get(build.tool().as_str()).copied() else {
+                let Some(tool_policy) = self.allowed_tools.get(build.tool().as_str()).cloned() else {
                     return Err(RemoteAuthorizationError::ToolNotAllowed(build.tool().as_str().to_string()));
                 };
                 if !tool_policy.allows_arbitrary_argv() && !build.argv().is_empty() {
@@ -591,13 +610,14 @@ impl RemoteAuthorizationPolicy {
                 } else {
                     self.environment.filter(build.env())?
                 };
+                target_command = tool_policy.command().map(str::to_string);
                 let filtered = RemoteBuild::new(build.cwd.clone(), build.tool.clone(), build.argv.clone(), environment, build.snapshot_id())
                     .map_err(RemoteAuthorizationError::InvalidEnvironment)?;
                 RemoteRequest::build(request.request_id, request.workspace_session_id, filtered)
             }
         };
 
-        Ok(AuthorizedRemoteRequest { request, target: context.target })
+        Ok(AuthorizedRemoteRequest { request, target: context.target, target_command })
     }
 }
 

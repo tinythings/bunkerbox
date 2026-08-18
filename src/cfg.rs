@@ -189,7 +189,7 @@ pub struct AppliedRuntime {
     pub encrypt: Option<Vec<String>>,
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectConfig {
     #[serde(default)]
     pub project: ProjectSection,
@@ -199,7 +199,7 @@ pub struct ProjectConfig {
     pub profiles: Vec<String>,
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectSection {
     #[serde(default)]
     pub env: EnvMode,
@@ -213,7 +213,8 @@ pub struct ProjectSection {
     pub remote: RemoteSection,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteSection {
     #[serde(default)]
     pub exclude: Vec<String>,
@@ -221,16 +222,21 @@ pub struct RemoteSection {
     pub environment: Vec<String>,
     #[serde(default)]
     pub tools: Vec<RemoteToolSpec>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteToolSpec {
     pub name: String,
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default, rename = "allow-args")]
     pub allow_args: bool,
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImageOverrides {
     #[serde(default)]
     pub workspace: Option<WorkspaceMode>,
@@ -296,10 +302,14 @@ impl ProjectConfig {
         let mut tools = std::collections::BTreeSet::new();
         for tool in &self.project.remote.tools {
             validate_remote_wrapper_name(tool.name.clone())?;
+            if let Some(command) = &tool.command {
+                validate_remote_wrapper_name(command.clone())?;
+            }
             if !tools.insert(tool.name.clone()) {
                 return Err(format!("duplicate remote tool: {}", tool.name));
             }
         }
+        crate::artifact::ArtifactPolicy::new(self.project.remote.artifacts.clone())?;
         Ok(())
     }
 
@@ -396,7 +406,11 @@ impl ProjectConfig {
             }
         }
 
-        if !self.project.remote.exclude.is_empty() || !self.project.remote.environment.is_empty() || !self.project.remote.tools.is_empty() {
+        if !self.project.remote.exclude.is_empty()
+            || !self.project.remote.environment.is_empty()
+            || !self.project.remote.tools.is_empty()
+            || !self.project.remote.artifacts.is_empty()
+        {
             y.push_str("  remote:\n");
             y.push_str("    exclude:\n");
             if self.project.remote.exclude.is_empty() {
@@ -419,7 +433,19 @@ impl ProjectConfig {
                 y.push_str("      []\n");
             } else {
                 for tool in &self.project.remote.tools {
-                    y.push_str(&format!("      - name: \"{}\"\n        allow-args: {}\n", tool.name, tool.allow_args));
+                    y.push_str(&format!("      - name: \"{}\"\n", tool.name));
+                    if let Some(command) = &tool.command {
+                        y.push_str(&format!("        command: \"{command}\"\n"));
+                    }
+                    y.push_str(&format!("        allow-args: {}\n", tool.allow_args));
+                }
+            }
+            y.push_str("    artifacts:\n");
+            if self.project.remote.artifacts.is_empty() {
+                y.push_str("      []\n");
+            } else {
+                for artifact in &self.project.remote.artifacts {
+                    y.push_str(&format!("      - \"{artifact}\"\n"));
                 }
             }
         }

@@ -135,8 +135,16 @@ targets:
 `ssh` accepts `[user@]host[:port]` or a host-side OpenSSH alias. `workspace`
 must be an absolute normalized target path. `localhost` is implicit, always
 listed first, and selected at startup. Press `Ctrl+Alt+B` in the host TUI to
-choose another target; `Ctrl+Alt+H` shows the host controls. Target selection
-is frozen per transaction, and remote failures do not retry locally.
+choose another target; `Ctrl+Alt+S` opens Remote Setup; and `Ctrl+Alt+H` shows
+the host controls. Remote Setup edits only the compact target fields and the
+`project.remote` overlay: tool allowlists, environment names, snapshot
+exclusions, artifact paths, and optional resource limits. Blank resource fields
+remain unset, and omitted overlay fields continue inheriting `project.conf`.
+Save validates the complete draft and atomically writes the file for the next
+Bunkerbox run; it does not change the current catalog, target, or backend and
+does not perform SSH probing. Existing malformed or unsafe configurations are
+reported rather than replaced. Target selection is frozen per transaction, and
+remote failures do not retry locally.
 
 ## Sandbox profile
 

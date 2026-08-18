@@ -209,7 +209,13 @@ request. `command` is an optional basename-only target override, such as
 
 Remote targets are declared separately in `.bunkerbox/remote.conf`. If that
 file is absent, Bunkerbox starts with the implicit `localhost` target only.
-The host TUI starts on `localhost`; use `Ctrl+Alt+B` to select a remote target.
+The host TUI starts on `localhost`; use `Ctrl+Alt+B` to select a remote target
+or `Ctrl+Alt+S` to open the host-owned Remote Setup forms. Setup can edit the
+target label, compact SSH destination, workspace, remote tools, environment
+names, snapshot exclusions, artifact paths, and resource limits. Save writes
+`.bunkerbox/remote.conf` atomically and applies changes on the next Bunkerbox
+run only. It does not probe SSH or test a connection. A malformed existing
+configuration is shown as an error and is never silently overwritten.
 The guest and AI have no target-selection command, and a remote failure never
 falls back to local execution.
 

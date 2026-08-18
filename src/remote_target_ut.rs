@@ -463,3 +463,114 @@ fn lifecycle_and_admission_limits_reject_zero_or_excessive_values() {
         assert!(RemoteTargetConfig::load_from(&fixture.config).is_err());
     }
 }
+
+#[test]
+fn remote_project_draft_missing_file_is_empty_and_omits_optional_sections() {
+    let fixture = Fixture::new();
+    let draft = RemoteConfigDraft::load_optional(&fixture.project, &ProjectConfig::default()).unwrap();
+    assert_eq!(draft, None);
+
+    let mut base = ProjectConfig::default();
+    base.project.remote.environment = vec!["CC".to_string()];
+    let mut draft = RemoteConfigDraft::default();
+    draft.targets.insert(
+        "netbsd".to_string(),
+        RemoteTargetDraft {
+            ssh: "builder@build.example.test:2222".to_string(),
+            workspace: "/var/tmp/bunkerbox".to_string(),
+            project: None,
+            resources: None,
+        },
+    );
+    let yaml = draft.to_yaml().unwrap();
+    assert!(yaml.contains("targets:"));
+    assert!(!yaml.contains("project:"));
+    assert!(!yaml.contains("resources:"));
+    draft.validate(&base).unwrap();
+
+    draft.targets.get_mut("netbsd").unwrap().resources = Some(RemoteResourceOverridesDraft::default());
+    assert!(!draft.to_yaml().unwrap().contains("resources:"));
+}
+
+#[test]
+fn remote_project_draft_round_trips_deterministically_and_writes_private_file() {
+    let fixture = Fixture::new();
+    let mut draft = RemoteConfigDraft::default();
+    draft.targets.insert(
+        "zeta".to_string(),
+        RemoteTargetDraft { ssh: "builder@zeta.example.test".to_string(), workspace: "/var/tmp/zeta".to_string(), project: None, resources: None },
+    );
+    draft.targets.insert(
+        "alpha".to_string(),
+        RemoteTargetDraft {
+            ssh: "builder@alpha.example.test:2200".to_string(),
+            workspace: "/var/tmp/alpha".to_string(),
+            project: Some(RemoteProjectOverlayDraft {
+                remote: Some(RemoteOverlayDraft {
+                    tools: Some(vec![RemoteToolSpec { name: "make".to_string(), command: Some("gmake".to_string()), allow_args: true }]),
+                    environment: Some(vec!["CC".to_string()]),
+                    ..RemoteOverlayDraft::default()
+                }),
+            }),
+            resources: Some(RemoteResourceOverridesDraft {
+                build_timeout: Some(RemoteQuantity::Text("10m".to_string())),
+                max_active_builds: Some(2),
+                ..RemoteResourceOverridesDraft::default()
+            }),
+        },
+    );
+
+    draft.write_atomic(&fixture.project, &ProjectConfig::default()).unwrap();
+    let path = fixture.project.join(".bunkerbox").join(REMOTE_PROJECT_CONFIG_FILE_NAME);
+    let first = fs::read_to_string(&path).unwrap();
+    let loaded = RemoteConfigDraft::load_optional(&fixture.project, &ProjectConfig::default()).unwrap().unwrap();
+    assert_eq!(loaded, draft);
+    assert_eq!(first, draft.to_yaml().unwrap());
+    assert!(first.find("alpha:").unwrap() < first.find("zeta:").unwrap());
+    #[cfg(unix)]
+    assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn remote_project_draft_rejects_malformed_or_unsafe_destination_without_replacement() {
+    let fixture = Fixture::new();
+    let bunkerbox = fixture.project.join(".bunkerbox");
+    fs::create_dir(&bunkerbox).unwrap();
+    let path = bunkerbox.join(REMOTE_PROJECT_CONFIG_FILE_NAME);
+    fs::write(&path, "targets: [not-a-map]\n").unwrap();
+    assert!(RemoteConfigDraft::load_optional(&fixture.project, &ProjectConfig::default()).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "targets: [not-a-map]\n");
+
+    let draft = RemoteConfigDraft::default();
+    let replacement = fixture.temp.path().join("replacement");
+    fs::write(&replacement, b"do not replace").unwrap();
+    fs::remove_file(&path).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&replacement, &path).unwrap();
+    #[cfg(unix)]
+    {
+        assert!(draft.write_atomic(&fixture.project, &ProjectConfig::default()).is_err());
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    }
+}
+
+#[test]
+fn remote_project_draft_validates_compact_fields_and_resource_units() {
+    let mut draft = RemoteConfigDraft::default();
+    draft.targets.insert(
+        "builder".to_string(),
+        RemoteTargetDraft {
+            ssh: "builder@build.example.test".to_string(),
+            workspace: "/var/tmp/work".to_string(),
+            project: None,
+            resources: Some(RemoteResourceOverridesDraft {
+                max_output: Some(RemoteQuantity::Text("64M".to_string())),
+                ..RemoteResourceOverridesDraft::default()
+            }),
+        },
+    );
+    draft.validate(&ProjectConfig::default()).unwrap();
+
+    draft.targets.get_mut("builder").unwrap().ssh = "builder@bad host".to_string();
+    assert!(draft.validate(&ProjectConfig::default()).is_err());
+}

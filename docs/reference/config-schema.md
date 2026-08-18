@@ -89,6 +89,17 @@ project:
     - "make *"
     - "cargo *"
 
+  # Optional host-owned transparent remote policy.
+  remote:
+    exclude: [target/]
+    environment: [CC, CXX]
+    tools:
+      - name: make
+        allow-args: true
+      - name: cargo
+        allow-args: true
+    artifacts: [build/app]
+
 # Override shared runtime defaults (optional, uncomment to use):
 # image:
 #   workspace: direct
@@ -98,6 +109,34 @@ project:
 #   allow:
 #     - extra.api.example.com
 ```
+
+## Project-local remote.conf
+
+Remote targets are optional and live at `.bunkerbox/remote.conf`. The file
+contains only compact target definitions. SSH aliases, identities, host-key
+state, and credentials remain in the host OpenSSH configuration.
+
+```yaml
+targets:
+  netbsd:
+    ssh: builder@netbsd-builder:2222
+    workspace: /var/tmp/bunkerbox
+    project:
+      remote:
+        tools:
+          - name: make
+            command: gmake
+            allow-args: true
+    resources:
+      build-timeout-seconds: 3600
+      max-active-builds: 1
+```
+
+`ssh` accepts `[user@]host[:port]` or a host-side OpenSSH alias. `workspace`
+must be an absolute normalized target path. `localhost` is implicit, always
+listed first, and selected at startup. Press `Ctrl+Alt+B` in the host TUI to
+choose another target; `Ctrl+Alt+H` shows the host controls. Target selection
+is frozen per transaction, and remote failures do not retry locally.
 
 ## Sandbox profile
 

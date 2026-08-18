@@ -1,11 +1,13 @@
 use crate::platform;
 use crate::storage;
 use bunkerbox_worker_protocol::{WorkerBuild, WorkerMessage, WorkerRequestId, WorkerSessionId};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
@@ -128,17 +130,38 @@ pub fn execute_build_with_limits<S: OutputSink>(
     job: &JobWorkspace, build: &WorkerBuild, request_id: WorkerRequestId, session_id: WorkerSessionId, sink: &S, disconnected: &dyn Fn() -> bool,
     build_timeout: Duration, max_output_bytes: u64,
 ) -> Result<i32, String> {
-    validate_executable(build.trusted_executable_path())?;
+    let command_path = build.target_command().map(|command| resolve_target_command(command.as_str())).transpose()?;
+    if command_path.is_none() {
+        validate_executable(build.trusted_executable_path())?;
+    }
     let cwd = storage::open_relative_directory(job.root(), build.cwd().as_str())?;
     let cwd_fd = cwd.as_raw_fd();
-    let mut command = std::process::Command::new(build.trusted_executable_path());
+    let mut command = std::process::Command::new(command_path.as_deref().unwrap_or_else(|| std::path::Path::new(build.trusted_executable_path())));
     command.args(build.argv()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    command.env_clear();
-    for (key, value) in build.guest_env() {
-        command.env(key, value);
-    }
-    for (key, value) in build.target_env() {
-        command.env(key, value);
+    if build.target_command().is_some() {
+        let baseline = worker_environment();
+        command.env_clear();
+        for (key, value) in baseline {
+            command.env(key, value);
+        }
+        for (key, value) in build.target_env() {
+            if !protected_environment_name(key) {
+                command.env(key, value);
+            }
+        }
+        for (key, value) in build.guest_env() {
+            if !protected_environment_name(key) {
+                command.env(key, value);
+            }
+        }
+    } else {
+        command.env_clear();
+        for (key, value) in build.guest_env() {
+            command.env(key, value);
+        }
+        for (key, value) in build.target_env() {
+            command.env(key, value);
+        }
     }
     unsafe {
         command.pre_exec(move || {
@@ -338,6 +361,34 @@ fn spawn_pump<R: Read + Send + 'static>(
             }
         }
     })
+}
+
+fn resolve_target_command(command: &str) -> Result<PathBuf, String> {
+    let path = std::env::var_os("PATH").ok_or_else(|| "worker target PATH is unavailable".to_string())?;
+    for directory in std::env::split_paths(&path) {
+        let directory = if directory.as_os_str().is_empty() { PathBuf::from(".") } else { directory };
+        let candidate = if directory.is_absolute() {
+            directory.join(command)
+        } else {
+            std::env::current_dir().map_err(|error| format!("resolve worker target PATH: {error}"))?.join(directory).join(command)
+        };
+        if let Ok(metadata) = fs::metadata(&candidate) {
+            if metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(format!("worker target command is not executable in PATH: {command}"))
+}
+
+fn protected_environment_name(name: &str) -> bool {
+    matches!(name, "PATH" | "HOME" | "TMPDIR" | "LANG") || name.starts_with("LC_")
+}
+
+fn worker_environment() -> Vec<(OsString, OsString)> {
+    std::env::vars_os()
+        .filter(|(key, _)| key.to_str().is_some_and(|key| matches!(key, "PATH" | "HOME" | "TMPDIR" | "LANG") || key.starts_with("LC_")))
+        .collect()
 }
 
 fn validate_executable(path: &str) -> Result<(), String> {

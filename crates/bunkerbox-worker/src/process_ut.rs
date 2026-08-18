@@ -100,3 +100,40 @@ fn configured_build_timeout_overrides_worker_default() {
     .unwrap_err();
     assert!(error.contains("timed out"));
 }
+
+#[test]
+fn command_identity_uses_worker_path_and_protects_baseline_environment() {
+    let temp = tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let jobs = platform::open_root(temp.path()).unwrap();
+    let job = JobWorkspace::create(&jobs).unwrap();
+    let build = WorkerBuild::new_command(
+        "logical-shell",
+        "sh",
+        vec!["-c".to_string(), "printf '%s\\n%s\\n%s' \"$PATH\" \"$HOME\" \"$CHECK\"".to_string()],
+        "",
+        vec![
+            ("PATH".to_string(), "/guest-path".to_string()),
+            ("HOME".to_string(), "/guest-home".to_string()),
+            ("CHECK".to_string(), "guest".to_string()),
+        ],
+        vec![("PATH".to_string(), "/target-path".to_string()), ("CHECK".to_string(), "target".to_string())],
+        WorkerUploadId([11; 16]),
+    )
+    .unwrap();
+    let writer = FrameWriter::new(Vec::new());
+    assert_eq!(execute_build(&job, &build, WorkerRequestId([12; 16]), WorkerSessionId([13; 16]), &writer, &|| false).unwrap(), 0);
+
+    let bytes = writer.into_inner().unwrap();
+    let mut reader = Cursor::new(bytes);
+    let mut output = Vec::new();
+    while let Some(message) = WorkerMessage::read_blocking_optional(&mut reader).unwrap() {
+        if let WorkerMessage::Stdout { data, .. } = message {
+            output.extend_from_slice(&data);
+        }
+    }
+    let output = String::from_utf8(output).unwrap();
+    assert!(!output.contains("/guest-path"));
+    assert!(!output.contains("/target-path"));
+    assert!(output.ends_with("guest"));
+}

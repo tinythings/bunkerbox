@@ -22,6 +22,8 @@ pub const WORKER_MAGIC: [u8; 4] = WORKER_PROTOCOL_MAGIC;
 pub const WORKER_PROTOCOL_VERSION: u16 = 1;
 pub const WORKER_VERSION: u16 = WORKER_PROTOCOL_VERSION;
 pub const WORKER_ARTIFACT_PROTOCOL_VERSION: u16 = 2;
+/// Adds trusted target-PATH command resolution without changing V1/V2 fields.
+pub const WORKER_COMMAND_PROTOCOL_VERSION: u16 = 3;
 pub const WORKER_FRAME_HEADER_LEN: usize = 4 + 2 + 1 + 4;
 pub const WORKER_FRAME_HEADER_SIZE: usize = WORKER_FRAME_HEADER_LEN;
 pub const WORKER_ID_LEN: usize = 16;
@@ -525,6 +527,7 @@ impl WorkerUploadEntry {
 pub struct WorkerBuild {
     pub tool: WorkerTool,
     pub trusted_executable: WorkerExecutablePath,
+    pub target_command: Option<WorkerTool>,
     pub argv: Vec<String>,
     pub cwd: WorkerRelativePath,
     pub guest_env: Vec<(String, String)>,
@@ -543,6 +546,28 @@ impl WorkerBuild {
         let build = Self {
             tool: WorkerTool::new(tool)?,
             trusted_executable: WorkerExecutablePath::new(trusted_executable)?,
+            target_command: None,
+            argv,
+            cwd: WorkerRelativePath::new(cwd)?,
+            guest_env,
+            target_env,
+            upload_token,
+            artifact_paths: Vec::new(),
+            artifact_max_file_bytes: MAX_WORKER_ARTIFACT_FILE_BYTES,
+            artifact_max_total_bytes: MAX_WORKER_ARTIFACT_TOTAL_BYTES,
+        };
+        build.validate()?;
+        Ok(build)
+    }
+
+    pub fn new_command(
+        tool: impl Into<String>, command: impl Into<String>, argv: Vec<String>, cwd: impl Into<String>, guest_env: Vec<(String, String)>,
+        target_env: Vec<(String, String)>, upload_token: WorkerUploadId,
+    ) -> WorkerResult<Self> {
+        let build = Self {
+            tool: WorkerTool::new(tool)?,
+            trusted_executable: WorkerExecutablePath::new("/usr/bin/bunkerbox-command")?,
+            target_command: Some(WorkerTool::new(command)?),
             argv,
             cwd: WorkerRelativePath::new(cwd)?,
             guest_env,
@@ -587,6 +612,10 @@ impl WorkerBuild {
 
     pub fn trusted_executable_path(&self) -> &str {
         self.trusted_executable.as_str()
+    }
+
+    pub fn target_command(&self) -> Option<&WorkerTool> {
+        self.target_command.as_ref()
     }
 
     pub fn argv(&self) -> &[String] {
@@ -915,6 +944,9 @@ impl WorkerMessage {
         validate_version(version)?;
         if version == WORKER_PROTOCOL_VERSION && self.requires_artifact_version() {
             return Err(invalid("worker artifact message requires artifact-capable protocol version"));
+        }
+        if version < WORKER_COMMAND_PROTOCOL_VERSION && matches!(self, Self::Build { build, .. } if build.target_command.is_some()) {
+            return Err(invalid("worker command identity requires command-capable protocol version"));
         }
         self.validate()?;
         let mut payload = WireWriter::new();
@@ -1358,7 +1390,11 @@ fn decode_artifact_entry(reader: &mut WireReader<'_>) -> WorkerResult<WorkerArti
 fn encode_build(writer: &mut WireWriter, build: &WorkerBuild, version: u16) -> WorkerResult<()> {
     build.validate()?;
     writer.string(build.tool.as_str(), MAX_WORKER_TOOL_BYTES, "worker tool")?;
-    writer.string(build.trusted_executable.as_str(), MAX_WORKER_EXECUTABLE_PATH_BYTES, "worker executable path")?;
+    if version >= WORKER_COMMAND_PROTOCOL_VERSION {
+        writer.string(build.target_command.as_ref().map_or(build.tool.as_str(), WorkerTool::as_str), MAX_WORKER_TOOL_BYTES, "worker command")?;
+    } else {
+        writer.string(build.trusted_executable.as_str(), MAX_WORKER_EXECUTABLE_PATH_BYTES, "worker executable path")?;
+    }
     writer.count(build.argv.len(), MAX_WORKER_ARG_COUNT, "worker argv")?;
     for argument in &build.argv {
         writer.string(argument, MAX_WORKER_ARG_BYTES, "worker argument")?;
@@ -1380,7 +1416,12 @@ fn encode_build(writer: &mut WireWriter, build: &WorkerBuild, version: u16) -> W
 
 fn decode_build(reader: &mut WireReader<'_>, version: u16) -> WorkerResult<WorkerBuild> {
     let tool = WorkerTool::new(reader.string(MAX_WORKER_TOOL_BYTES, "worker tool")?)?;
-    let trusted_executable = WorkerExecutablePath::new(reader.string(MAX_WORKER_EXECUTABLE_PATH_BYTES, "worker executable path")?)?;
+    let (trusted_executable, target_command) = if version >= WORKER_COMMAND_PROTOCOL_VERSION {
+        let command = WorkerTool::new(reader.string(MAX_WORKER_TOOL_BYTES, "worker command")?)?;
+        (WorkerExecutablePath::new("/usr/bin/bunkerbox-command")?, Some(command))
+    } else {
+        (WorkerExecutablePath::new(reader.string(MAX_WORKER_EXECUTABLE_PATH_BYTES, "worker executable path")?)?, None)
+    };
     let argument_count = reader.count(MAX_WORKER_ARG_COUNT, "worker argv")?;
     let mut argv = Vec::with_capacity(argument_count);
     for _ in 0..argument_count {
@@ -1403,6 +1444,7 @@ fn decode_build(reader: &mut WireReader<'_>, version: u16) -> WorkerResult<Worke
     let build = WorkerBuild {
         tool,
         trusted_executable,
+        target_command,
         argv,
         cwd,
         guest_env,
@@ -1660,7 +1702,7 @@ fn invalid(message: impl Into<String>) -> WorkerProtocolError {
 }
 
 fn is_supported_version(version: u16) -> bool {
-    matches!(version, WORKER_PROTOCOL_VERSION | WORKER_ARTIFACT_PROTOCOL_VERSION)
+    matches!(version, WORKER_PROTOCOL_VERSION | WORKER_ARTIFACT_PROTOCOL_VERSION | WORKER_COMMAND_PROTOCOL_VERSION)
 }
 
 fn validate_version(version: u16) -> WorkerResult<()> {

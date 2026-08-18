@@ -71,6 +71,19 @@ fn all_message_variants_round_trip() {
 }
 
 #[test]
+fn command_identity_round_trips_only_in_protocol_v3() {
+    let (request_id, session_id, upload_id) = ids();
+    let build = WorkerBuild::new_command("make", "gmake", vec!["all".into()], "", Vec::new(), Vec::new(), upload_id).unwrap();
+    let message = WorkerMessage::Build { request_id, session_id, build: build.clone() };
+    assert!(message.encode_version(WORKER_PROTOCOL_VERSION).is_err());
+
+    let frame = message.encode_version(WORKER_COMMAND_PROTOCOL_VERSION).unwrap();
+    let (version, decoded) = WorkerMessage::decode_versioned(&frame).unwrap();
+    assert_eq!(version, WORKER_COMMAND_PROTOCOL_VERSION);
+    assert_eq!(decoded, message);
+}
+
+#[test]
 fn blocking_helpers_preserve_the_async_wire_encoding() {
     let message = WorkerMessage::Stdout { request_id: ids().0, session_id: ids().1, data: b"blocking parity".to_vec() };
     let mut encoded = Vec::new();
@@ -299,7 +312,7 @@ fn unknown_nested_kinds_and_flags_are_rejected() {
 }
 
 #[test]
-fn artifact_messages_round_trip_only_in_protocol_v2() {
+fn artifact_messages_round_trip_in_artifact_capable_protocols() {
     let (request_id, session_id, _upload_id) = ids();
     let artifact_set_id = WorkerArtifactSetId([4; 16]);
     let artifact = WorkerArtifactEntry::new("dist/result", 0o755, 4, [8; 32]).unwrap();
@@ -319,6 +332,16 @@ fn artifact_messages_round_trip_only_in_protocol_v2() {
         assert_eq!(version, WORKER_ARTIFACT_PROTOCOL_VERSION);
         assert_eq!(decoded, message);
         assert!(message.encode().is_err());
+        let v3 = message.encode_version(WORKER_COMMAND_PROTOCOL_VERSION).unwrap();
+        let decoded_v3 = WorkerMessage::decode_versioned(&v3).unwrap().1;
+        match (message, decoded_v3) {
+            (WorkerMessage::Build { build: original, .. }, WorkerMessage::Build { build: decoded, .. }) => {
+                assert_eq!(decoded.tool(), original.tool());
+                assert_eq!(decoded.target_command(), Some(original.tool()));
+                assert_eq!(decoded.artifact_paths(), original.artifact_paths());
+            }
+            (original, decoded) => assert_eq!(decoded, original),
+        }
     }
 
     let v1_build = WorkerMessage::Build { request_id, session_id, build: build() };

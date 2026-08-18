@@ -572,6 +572,14 @@ impl RemoteAuthorizationPolicy {
         self.allowed_tools.keys().map(String::as_str)
     }
 
+    pub fn selected_environment_for_tool(&self, tool: &str, entries: &[(String, String)]) -> Result<Vec<(String, String)>, RemoteAuthorizationError> {
+        if tool == "cargo" {
+            return Ok(Vec::new());
+        }
+        let selected = entries.iter().filter(|(name, _)| self.environment.allows(name)).cloned().collect::<Vec<_>>();
+        self.environment.filter(&selected)
+    }
+
     pub fn authorize(&self, context: &RemoteExecutionContext, request: RemoteRequest) -> Result<AuthorizedRemoteRequest, RemoteAuthorizationError> {
         if request.request_id.is_zero() {
             return Err(RemoteAuthorizationError::InvalidRequestId);

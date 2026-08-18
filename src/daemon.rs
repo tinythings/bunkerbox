@@ -4,8 +4,9 @@ use crate::logging;
 use crate::loopback::{LoopbackBackend, RunRemoteSession};
 use crate::proxy::{FilterProxy, UnixProxyHandle};
 use crate::remote::{
-    RemoteAdmissionLimits, RemoteAuthorizationError, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent,
-    RemoteEnvironmentPolicy, RemoteExecutionContext, RemoteRequest, RemoteResourcePolicy, RemoteTargetId, RemoteToolPolicy,
+    RemoteAdmissionLimits, RemoteAuthorizationError, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent, RemoteBuild,
+    RemoteEnvironmentPolicy, RemoteExecutionContext, RemoteRequest, RemoteResourcePolicy, RemoteSnapshotId, RemoteTargetId, RemoteTool,
+    RemoteToolPolicy, RequestId, WorkspaceRelativePath, WorkspaceSessionId,
 };
 use crate::remote_target::SshTarget;
 use crate::remote_target::{ActiveBuildTarget, BuildTargetCatalog};
@@ -290,6 +291,14 @@ impl RemoteBroker {
         self.cleanup_timeout
     }
 
+    fn allows_tool(&self, tool: &str) -> bool {
+        self.policy.allowed_tools().any(|allowed| allowed == tool)
+    }
+
+    fn selected_environment_for_tool(&self, tool: &str, entries: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
+        self.policy.selected_environment_for_tool(tool, entries).map_err(|error| format!("remote environment rejected: {error:?}"))
+    }
+
     pub async fn dispatch(&self, request: RemoteRequest, events: tokio::sync::mpsc::Sender<RemoteBackendEvent>) -> Result<(), RemoteDispatchError> {
         let authorized = match self.policy.authorize(&self.context, request) {
             Ok(authorized) => authorized,
@@ -467,6 +476,121 @@ impl RemoteRouter {
         let label = self.active_target.current();
         let broker = self.brokers.get(&label).cloned().ok_or(RemoteDispatchError::Unauthorized(RemoteAuthorizationError::TargetNotAllowed))?;
         Ok((label, broker))
+    }
+
+    fn is_remote_selected(&self) -> bool {
+        self.active_target.current() != "localhost"
+    }
+
+    async fn dispatch_transparent_exec<W: AsyncWriteExt + Unpin>(
+        &self, request: &ExecRequest, session_id: WorkspaceSessionId, writer: &mut W,
+    ) -> Result<(), String> {
+        let (label, broker) = self.active_remote_broker().map_err(|error| format!("remote dispatch failed: {error:?}"))?;
+        if !broker.allows_tool(&request.command) {
+            return Err(format!("remote tool is not configured for target {label}: {}", request.command));
+        }
+        let cwd = Path::new(&request.cwd)
+            .strip_prefix("/workspace")
+            .map_err(|_| "current directory must be under /workspace".to_string())?
+            .to_str()
+            .ok_or_else(|| "current directory is not valid UTF-8".to_string())?;
+        let cwd = WorkspaceRelativePath::new(cwd)?;
+        let environment = broker.selected_environment_for_tool(&request.command, &request.env)?;
+        let sync_request = RemoteRequest::sync(new_remote_request_id(), session_id);
+        let snapshot_id = self
+            .dispatch_transparent_operation(&label, broker.clone(), sync_request, writer, true)
+            .await?
+            .ok_or_else(|| "remote sync did not return a retained capability".to_string())?;
+        let build = RemoteBuild::new(cwd, RemoteTool::new(request.command.clone())?, request.args.clone(), environment, snapshot_id)?;
+        let build_request = RemoteRequest::build(new_remote_request_id(), session_id, build);
+        let result = self.dispatch_transparent_operation(&label, broker, build_request, writer, false).await;
+        self.snapshots.lock().map_err(|_| "remote target snapshot lock poisoned".to_string())?.remove(&snapshot_id);
+        result.map(|_| ())
+    }
+
+    async fn dispatch_transparent_operation<W: AsyncWriteExt + Unpin>(
+        &self, label: &str, broker: Arc<RemoteBroker>, request: RemoteRequest, writer: &mut W, sync: bool,
+    ) -> Result<Option<RemoteSnapshotId>, String> {
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut dispatch = Box::pin(broker.dispatch(request, event_tx));
+        let mut dispatch_result = None;
+        let mut snapshot_id = None;
+        let mut terminal = false;
+
+        loop {
+            if let Some(result) = dispatch_result.take() {
+                while let Ok(event) = event_rx.try_recv() {
+                    self.forward_transparent_event(label, event, sync, writer, &mut snapshot_id, &mut terminal).await?;
+                }
+                dispatch_result = Some(result);
+                break;
+            }
+
+            tokio::select! {
+                result = &mut dispatch => dispatch_result = Some(result),
+                event = event_rx.recv() => {
+                    let Some(event) = event else { return Err("remote event stream closed before completion".to_string()) };
+                    self.forward_transparent_event(label, event, sync, writer, &mut snapshot_id, &mut terminal).await?;
+                }
+            }
+        }
+
+        let result = dispatch_result.expect("transparent dispatch result is present");
+        result.map_err(|error| format!("remote dispatch failed: {error:?}"))?;
+        if sync {
+            snapshot_id.ok_or_else(|| "remote sync completed without a capability".to_string()).map(Some)
+        } else if terminal {
+            Ok(None)
+        } else {
+            Err("remote build completed without an exit status".to_string())
+        }
+    }
+
+    async fn forward_transparent_event<W: AsyncWriteExt + Unpin>(
+        &self, label: &str, event: RemoteBackendEvent, sync: bool, writer: &mut W, snapshot_id: &mut Option<RemoteSnapshotId>, terminal: &mut bool,
+    ) -> Result<(), String> {
+        match event {
+            RemoteBackendEvent::SyncProgress { .. } => {
+                if !sync {
+                    return Err("remote build returned a sync progress event".to_string());
+                }
+            }
+            RemoteBackendEvent::SyncCompleted { snapshot_id: completed } => {
+                if !sync {
+                    return Err("remote build returned a sync completion".to_string());
+                }
+                self.snapshots.lock().map_err(|_| "remote target snapshot lock poisoned".to_string())?.insert(completed, label.to_string());
+                *snapshot_id = Some(completed);
+                *terminal = true;
+            }
+            RemoteBackendEvent::Stdout(data) => {
+                if sync {
+                    return Err("remote sync returned build output".to_string());
+                }
+                write_frame(writer, &Frame::new(FrameType::Stdout, data)).await?;
+            }
+            RemoteBackendEvent::Stderr(data) => {
+                if sync {
+                    return Err("remote sync returned build diagnostics".to_string());
+                }
+                write_frame(writer, &Frame::new(FrameType::Stderr, data)).await?;
+            }
+            RemoteBackendEvent::Error { message } => {
+                if !sync {
+                    write_frame(writer, &Frame::new(FrameType::Stderr, message.as_bytes().to_vec())).await?;
+                }
+                return Err(format!("remote target {label} request failed: {message}"));
+            }
+            RemoteBackendEvent::Cancelled => return Err(format!("remote target {label} request was cancelled")),
+            RemoteBackendEvent::Completed { exit_code } => {
+                if sync {
+                    return Err("remote sync returned a build completion".to_string());
+                }
+                write_frame(writer, &Frame::new(FrameType::Exit, exit_code.to_le_bytes().to_vec())).await?;
+                *terminal = true;
+            }
+        }
+        Ok(())
     }
 
     async fn dispatch<W: AsyncWriteExt + Unpin>(&self, request: RemoteRequest, writer: &mut W) -> Result<(), String> {
@@ -914,14 +1038,8 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
         return Ok(());
     }
 
-    if !is_allowed(&session.passthrough, &req.command, &req.args) {
-        logging::diagnostic(&format!("bunkerbox-vscomm: command '{}' not whitelisted", req.command));
-        write_frame(&mut writer, &Frame::new(FrameType::Exit, 1i32.to_le_bytes().to_vec())).await?;
-        return Ok(());
-    }
-
     let command = req.command.clone();
-    if let Err(err) = execute_request(&mut writer, session, &req).await {
+    if let Err(err) = dispatch_exec_request_for_session(&req, session, &mut writer).await {
         logging::diagnostic(&format!("bunkerbox: toolchain command '{command}' failed: {err}"));
         let _ = write_frame(&mut writer, &Frame::new(FrameType::Exit, 1i32.to_le_bytes().to_vec())).await;
         return Ok(());
@@ -930,10 +1048,36 @@ async fn handle_connection(stream: tokio_vsock::VsockStream, session: &VsockSess
     Ok(())
 }
 
+async fn dispatch_exec_request_for_session<W: AsyncWriteExt + Unpin>(
+    req: &ExecRequest, session: &VsockSession, writer: &mut W,
+) -> Result<(), String> {
+    if session.remote_router.is_remote_selected() {
+        return session.remote_router.dispatch_transparent_exec(req, session.local_session_id, writer).await;
+    }
+
+    if !is_allowed(&session.passthrough, &req.command, &req.args) {
+        logging::diagnostic(&format!("bunkerbox-vscomm: command '{}' not whitelisted", req.command));
+        write_frame(writer, &Frame::new(FrameType::Exit, 1i32.to_le_bytes().to_vec())).await?;
+        return Ok(());
+    }
+
+    execute_request(writer, session, req).await
+}
+
+fn new_remote_request_id() -> RequestId {
+    let mut bytes = [0u8; 16];
+    loop {
+        rand::thread_rng().fill_bytes(&mut bytes);
+        if bytes != [0; 16] {
+            return RequestId(bytes);
+        }
+    }
+}
+
 async fn dispatch_remote_frame_for_session<W: AsyncWriteExt + Unpin>(frame: Frame, session: &VsockSession, writer: &mut W) -> Result<(), String> {
     let request = crate::vscomm::RemoteRequest::from_frame(frame).map_err(|err| format!("decode remote request: {err}"))?.into_domain()?;
     let local_snapshot = match request.operation() {
-        crate::remote::RemoteOperation::Build(build) => {
+        crate::remote::RemoteOperation::Build(build) if session.remote_router.active_target.current() == "localhost" => {
             session.local_capabilities.lock().map_err(|_| "local target capability lock poisoned".to_string())?.contains_key(&build.snapshot_id())
         }
         _ => false,

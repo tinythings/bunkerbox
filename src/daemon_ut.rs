@@ -1,17 +1,21 @@
-use super::{dispatch_remote_frame, is_allowed, RemoteBroker, RemoteDispatchError, RemoteRouter};
+use super::{
+    dispatch_exec_request_for_session, dispatch_remote_frame, dispatch_remote_frame_for_session, is_allowed, RemoteBroker, RemoteDispatchError,
+    RemoteRouter,
+};
 use super::{monitor_bwrap_status, ChildEvent};
-use crate::cfg::EnvMode;
+use crate::cfg::{EnvMode, ProjectConfig};
 use crate::remote::{
     AuthorizedRemoteRequest, RemoteAdmissionLimits, RemoteAuthorizationPolicy, RemoteBackend, RemoteBackendError, RemoteBackendEvent,
-    RemoteExecutionContext, RemoteExecutionControl, RemoteFuture, RemoteRequest, RemoteSnapshotAuthority, RemoteSnapshotId, RemoteTargetId,
-    RequestId, WorkspaceRelativePath, WorkspaceSessionId,
+    RemoteEnvironmentPolicy, RemoteExecutionContext, RemoteExecutionControl, RemoteFuture, RemoteRequest, RemoteSnapshotAuthority, RemoteSnapshotId,
+    RemoteTargetId, RequestId, WorkspaceRelativePath, WorkspaceSessionId,
 };
-use crate::remote_target::ActiveBuildTarget;
+use crate::remote_target::{ActiveBuildTarget, BuildTargetCatalog};
 use crate::vscomm::{
-    Frame, RemoteBuild as WireRemoteBuild, RemoteRequest as WireRemoteRequest, RemoteTool as WireRemoteTool, RequestId as WireRequestId,
+    Frame, FrameType, RemoteBuild as WireRemoteBuild, RemoteRequest as WireRemoteRequest, RemoteTool as WireRemoteTool, RequestId as WireRequestId,
     WorkspaceRelativePath as WireWorkspaceRelativePath, WorkspaceSessionId as WireWorkspaceSessionId,
 };
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -48,6 +52,27 @@ struct RecordingBackend {
     calls: Mutex<Vec<AuthorizedRemoteRequest>>,
     emit: Vec<RemoteBackendEvent>,
     result: Option<RemoteBackendError>,
+}
+
+struct TargetRecordingBackend {
+    calls: Mutex<Vec<AuthorizedRemoteRequest>>,
+}
+
+impl RemoteBackend for TargetRecordingBackend {
+    fn execute<'a>(
+        &'a self, request: AuthorizedRemoteRequest, _control: RemoteExecutionControl, events: mpsc::Sender<RemoteBackendEvent>,
+    ) -> RemoteFuture<'a, Result<(), RemoteBackendError>> {
+        let sync = matches!(request.request().operation(), crate::remote::RemoteOperation::Sync(_));
+        self.calls.lock().unwrap().push(request);
+        Box::pin(async move {
+            let event = if sync {
+                RemoteBackendEvent::SyncCompleted { snapshot_id: RemoteSnapshotId::from_bytes([9; 16]) }
+            } else {
+                RemoteBackendEvent::Completed { exit_code: 0 }
+            };
+            events.send(event).await.map_err(|_| RemoteBackendError::Cancelled)
+        })
+    }
 }
 
 struct TestSnapshotAuthority;
@@ -181,6 +206,44 @@ fn remote_broker(backend: Arc<dyn RemoteBackend>) -> RemoteBroker {
         RemoteExecutionContext { target, workspace_session_id: session },
         backend,
     )
+}
+
+fn target_catalog_fixture() -> (tempfile::TempDir, BuildTargetCatalog) {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".bunkerbox")).unwrap();
+    fs::write(
+        root.path().join(".bunkerbox").join(crate::remote_target::REMOTE_PROJECT_CONFIG_FILE_NAME),
+        "targets:\n  bsdbox:\n    ssh: builder@bsdbox\n    workspace: /var/tmp/bunkerbox\n    project:\n      remote:\n        tools:\n          - name: cargo\n            allow-args: true\n",
+    )
+    .unwrap();
+    let catalog = BuildTargetCatalog::load_optional(root.path(), &ProjectConfig::default()).unwrap().unwrap();
+    (root, catalog)
+}
+
+fn target_session(
+    workspace: std::path::PathBuf, active: ActiveBuildTarget, backend: Arc<TargetRecordingBackend>, target: RemoteTargetId,
+    session_id: WorkspaceSessionId,
+) -> super::VsockSession {
+    let policy = RemoteAuthorizationPolicy::from_policies(
+        target,
+        session_id,
+        vec![("cargo".to_string(), crate::remote::RemoteToolPolicy::new(true).with_command("cargo"))],
+        RemoteEnvironmentPolicy::default(),
+    )
+    .unwrap()
+    .with_snapshot_authority(Arc::new(TestSnapshotAuthority));
+    let context = RemoteExecutionContext { target, workspace_session_id: session_id };
+    let broker = Arc::new(RemoteBroker::new(policy, context, backend));
+    super::VsockSession {
+        passthrough: Arc::new(vec!["cargo *".to_string()]),
+        env_mode: EnvMode::Relaxed,
+        workspace,
+        merged_profile: None,
+        proxy_config: None,
+        remote_router: Arc::new(RemoteRouter::new(active, BTreeMap::from([("bsdbox".to_string(), broker)]))),
+        local_session_id: session_id,
+        local_capabilities: Mutex::new(BTreeMap::new()),
+    }
 }
 
 #[tokio::test]
@@ -463,4 +526,128 @@ fn local_exec_request_still_builds_on_the_local_path() {
     let request = crate::vscomm::ExecRequest { cwd: "/workspace".into(), command: "true".into(), args: Vec::new(), env: Vec::new() };
 
     assert!(super::build_command(&session, &request, &cwd).is_ok());
+}
+
+#[tokio::test]
+async fn transparent_exec_request_routes_fresh_managed_cargo_to_selected_remote_target() {
+    let (root, catalog) = target_catalog_fixture();
+    let active = ActiveBuildTarget::new();
+    active.select(&catalog, "bsdbox").unwrap();
+    let backend = Arc::new(TargetRecordingBackend { calls: Mutex::new(Vec::new()) });
+    let session_id = WorkspaceSessionId([2; 16]);
+    let target = RemoteTargetId([3; 16]);
+    let session = target_session(root.path().to_path_buf(), active, backend.clone(), target, session_id);
+    let request =
+        crate::vscomm::ExecRequest { cwd: "/workspace".to_string(), command: "cargo".to_string(), args: vec!["build".to_string()], env: Vec::new() };
+    let (mut guest, mut host) = tokio::io::duplex(4096);
+
+    dispatch_exec_request_for_session(&request, &session, &mut host).await.unwrap();
+    let exit = Frame::read_async(&mut guest).await.unwrap();
+    assert!(matches!(exit.frame_type, FrameType::Exit));
+    assert_eq!(i32::from_le_bytes(exit.payload.try_into().unwrap()), 0);
+
+    let calls = backend.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2, "fresh remote transaction must sync before building");
+    assert!(matches!(calls[0].request().operation(), crate::remote::RemoteOperation::Sync(_)));
+    assert!(matches!(calls[1].request().operation(), crate::remote::RemoteOperation::Build(_)));
+    assert_eq!(calls[0].target(), target);
+    assert_eq!(calls[1].target(), target);
+}
+
+#[tokio::test]
+async fn transparent_exec_request_keeps_selected_localhost_on_secured_local_executor() {
+    let workspace = tempfile::tempdir().unwrap();
+    let active = ActiveBuildTarget::new();
+    let session = super::VsockSession {
+        passthrough: Arc::new(vec!["/bin/touch *".to_string()]),
+        env_mode: EnvMode::Relaxed,
+        workspace: workspace.path().to_path_buf(),
+        merged_profile: None,
+        proxy_config: None,
+        remote_router: Arc::new(RemoteRouter::new(active, BTreeMap::new())),
+        local_session_id: WorkspaceSessionId([2; 16]),
+        local_capabilities: Mutex::new(BTreeMap::new()),
+    };
+    let marker = workspace.path().join("local-executor-called");
+    let request = crate::vscomm::ExecRequest {
+        cwd: "/workspace".to_string(),
+        command: "/bin/touch".to_string(),
+        args: vec![marker.to_string_lossy().into_owned()],
+        env: Vec::new(),
+    };
+    let (mut guest, mut host) = tokio::io::duplex(4096);
+
+    dispatch_exec_request_for_session(&request, &session, &mut host).await.unwrap();
+    let exit = Frame::read_async(&mut guest).await.unwrap();
+    assert!(matches!(exit.frame_type, FrameType::Exit));
+    assert_eq!(i32::from_le_bytes(exit.payload.try_into().unwrap()), 0);
+    assert!(marker.is_file());
+}
+
+#[tokio::test]
+async fn retained_remote_capability_remains_bound_after_switching_to_localhost() {
+    let (root, catalog) = target_catalog_fixture();
+    let active = ActiveBuildTarget::new();
+    active.select(&catalog, "bsdbox").unwrap();
+    let backend = Arc::new(TargetRecordingBackend { calls: Mutex::new(Vec::new()) });
+    let session_id = WorkspaceSessionId([2; 16]);
+    let target = RemoteTargetId([3; 16]);
+    let session = target_session(root.path().to_path_buf(), active.clone(), backend.clone(), target, session_id);
+    let (mut guest, mut host) = tokio::io::duplex(4096);
+    let sync = WireRemoteRequest::sync(WireRequestId([6; 16]), WireWorkspaceSessionId([2; 16]));
+
+    dispatch_remote_frame_for_session(sync.to_frame().unwrap(), &session, &mut host).await.unwrap();
+    let sync_event = crate::vscomm::RemoteEvent::from_frame(Frame::read_async(&mut guest).await.unwrap()).unwrap();
+    let crate::vscomm::RemoteEventKind::SyncCompleted { snapshot_id } = sync_event.kind else { panic!("expected sync completion") };
+
+    active.select(&catalog, "localhost").unwrap();
+    let build = WireRemoteRequest::build(
+        WireRequestId([7; 16]),
+        WireWorkspaceSessionId([2; 16]),
+        WireRemoteBuild::new(
+            WireWorkspaceRelativePath::new("src").unwrap(),
+            WireRemoteTool::new("cargo").unwrap(),
+            vec!["build".to_string()],
+            Vec::new(),
+            snapshot_id,
+        )
+        .unwrap(),
+    );
+    dispatch_remote_frame_for_session(build.to_frame().unwrap(), &session, &mut host).await.unwrap();
+    let build_event = crate::vscomm::RemoteEvent::from_frame(Frame::read_async(&mut guest).await.unwrap()).unwrap();
+    assert_eq!(build_event.kind, crate::vscomm::RemoteEventKind::Completed { exit_code: 0 });
+    let calls = backend.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].target(), target);
+    assert_eq!(calls[1].target(), target);
+}
+
+#[tokio::test]
+async fn local_capability_cannot_bypass_a_new_remote_target_selection() {
+    let (root, catalog) = target_catalog_fixture();
+    let active = ActiveBuildTarget::new();
+    let backend = Arc::new(TargetRecordingBackend { calls: Mutex::new(Vec::new()) });
+    let session_id = WorkspaceSessionId([2; 16]);
+    let target = RemoteTargetId([3; 16]);
+    let session = target_session(root.path().to_path_buf(), active.clone(), backend.clone(), target, session_id);
+    let local_snapshot = RemoteSnapshotId::from_bytes([8; 16]);
+    session.local_capabilities.lock().unwrap().insert(local_snapshot, ());
+    active.select(&catalog, "bsdbox").unwrap();
+    let build = WireRemoteRequest::build(
+        WireRequestId([8; 16]),
+        WireWorkspaceSessionId([2; 16]),
+        WireRemoteBuild::new(
+            WireWorkspaceRelativePath::new("src").unwrap(),
+            WireRemoteTool::new("cargo").unwrap(),
+            vec!["build".to_string()],
+            Vec::new(),
+            crate::vscomm::RemoteSnapshotId(*local_snapshot.as_bytes()),
+        )
+        .unwrap(),
+    );
+    let (_, mut host) = tokio::io::duplex(4096);
+
+    assert!(dispatch_remote_frame_for_session(build.to_frame().unwrap(), &session, &mut host).await.is_err());
+    assert!(backend.calls.lock().unwrap().is_empty());
+    assert!(session.local_capabilities.lock().unwrap().contains_key(&local_snapshot));
 }

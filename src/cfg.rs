@@ -230,7 +230,7 @@ pub struct RemoteSection {
 #[serde(deny_unknown_fields)]
 pub struct RemoteToolSpec {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, rename = "allow-args")]
     pub allow_args: bool,

@@ -1,12 +1,13 @@
 use crate::artifact::{ArtifactLimits, ArtifactPolicy};
-use crate::cfg::{ProjectConfig, RemoteSection};
+use crate::cfg::{ProjectConfig, RemoteSection, RemoteToolSpec};
 use crate::remote::{RemoteEnvironmentPolicy, RemoteToolPolicy};
 use serde::de::{self, MapAccess, Visitor};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
@@ -14,8 +15,10 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub const CONFIG_VERSION: u64 = 1;
 pub const CONFIG_FILE_NAME: &str = "remote-targets.yaml";
@@ -31,6 +34,7 @@ const MAX_NAME_BYTES: usize = 64;
 const MAX_TOOL_PATH_BYTES: usize = 4096;
 const MAX_ENV_NAME_BYTES: usize = 256;
 const MAX_ENV_VALUE_BYTES: usize = 16 * 1024;
+static NEXT_CONFIG_TEMP: AtomicU64 = AtomicU64::new(1);
 
 /// Selects the host-side facility used for a project.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -517,7 +521,7 @@ pub fn default_config_path_with(xdg_config_home: Option<&Path>, home: Option<&Pa
     ConfigPathHelper::from_paths(xdg_config_home, home).config_path()
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct UniqueMap<K, V>(BTreeMap<K, V>);
 
 impl<K, V> Default for UniqueMap<K, V> {
@@ -668,13 +672,14 @@ struct RawResources {
     max_active_builds: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
-#[derive(Debug)]
-enum RawQuantity {
+pub enum RemoteQuantity {
     Integer(u64),
     Text(String),
 }
+
+type RawQuantity = RemoteQuantity;
 
 fn validate_target(name: String, raw: RawTarget) -> Result<SshTarget, String> {
     if raw.transport != "ssh" {
@@ -1243,14 +1248,14 @@ impl Default for ActiveBuildTarget {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRemoteProjectConfig {
     #[serde(default)]
     targets: UniqueMap<String, RawCompactTarget>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCompactTarget {
     ssh: String,
@@ -1261,14 +1266,14 @@ struct RawCompactTarget {
     resources: Option<RawTargetResources>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTargetProject {
     #[serde(default)]
     remote: Option<RawRemoteOverlay>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRemoteOverlay {
     #[serde(default)]
@@ -1281,7 +1286,7 @@ struct RawRemoteOverlay {
     artifacts: Option<Vec<String>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTargetResources {
     #[serde(
@@ -1343,6 +1348,318 @@ struct RawTargetResources {
     max_active_builds: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfigDraft {
+    #[serde(default)]
+    pub targets: BTreeMap<String, RemoteTargetDraft>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteTargetDraft {
+    pub ssh: String,
+    pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<RemoteProjectOverlayDraft>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<RemoteResourceOverridesDraft>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteProjectOverlayDraft {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteOverlayDraft>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteOverlayDraft {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<crate::cfg::RemoteToolSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteResourceOverridesDraft {
+    #[serde(default, rename = "connect-timeout-seconds", skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<RemoteQuantity>,
+    #[serde(default, rename = "sync-timeout-seconds", skip_serializing_if = "Option::is_none")]
+    pub sync_timeout: Option<RemoteQuantity>,
+    #[serde(default, rename = "build-timeout-seconds", skip_serializing_if = "Option::is_none")]
+    pub build_timeout: Option<RemoteQuantity>,
+    #[serde(default, rename = "max-output-bytes", skip_serializing_if = "Option::is_none")]
+    pub max_output: Option<RemoteQuantity>,
+    #[serde(default, rename = "idle-output-timeout-seconds", skip_serializing_if = "Option::is_none")]
+    pub idle_output_timeout: Option<RemoteQuantity>,
+    #[serde(default, rename = "cleanup-timeout-seconds", skip_serializing_if = "Option::is_none")]
+    pub cleanup_timeout: Option<RemoteQuantity>,
+    #[serde(default, rename = "artifact-timeout-seconds", skip_serializing_if = "Option::is_none")]
+    pub artifact_timeout: Option<RemoteQuantity>,
+    #[serde(default, rename = "max-artifact-bytes", skip_serializing_if = "Option::is_none")]
+    pub max_artifact_bytes: Option<RemoteQuantity>,
+    #[serde(default, rename = "max-artifact-total-bytes", skip_serializing_if = "Option::is_none")]
+    pub max_artifact_total_bytes: Option<RemoteQuantity>,
+    #[serde(default, rename = "max-artifact-entries", skip_serializing_if = "Option::is_none")]
+    pub max_artifact_entries: Option<u64>,
+    #[serde(default, rename = "max-worker-uploads", skip_serializing_if = "Option::is_none")]
+    pub max_worker_uploads: Option<u64>,
+    #[serde(default, rename = "max-worker-upload-bytes", skip_serializing_if = "Option::is_none")]
+    pub max_worker_upload_bytes: Option<RemoteQuantity>,
+    #[serde(default, rename = "max-worker-jobs", skip_serializing_if = "Option::is_none")]
+    pub max_worker_jobs: Option<u64>,
+    #[serde(default, rename = "max-worker-job-bytes", skip_serializing_if = "Option::is_none")]
+    pub max_worker_job_bytes: Option<RemoteQuantity>,
+    #[serde(default, rename = "max-worker-artifact-spools", skip_serializing_if = "Option::is_none")]
+    pub max_worker_artifact_spools: Option<u64>,
+    #[serde(default, rename = "max-worker-artifact-spool-bytes", skip_serializing_if = "Option::is_none")]
+    pub max_worker_artifact_spool_bytes: Option<RemoteQuantity>,
+    #[serde(default, rename = "max-worker-state-entries", skip_serializing_if = "Option::is_none")]
+    pub max_worker_state_entries: Option<u64>,
+    #[serde(default, rename = "max-active-builds", skip_serializing_if = "Option::is_none")]
+    pub max_active_builds: Option<u64>,
+}
+
+impl RemoteResourceOverridesDraft {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl From<RawRemoteProjectConfig> for RemoteConfigDraft {
+    fn from(raw: RawRemoteProjectConfig) -> Self {
+        Self { targets: raw.targets.0.into_iter().map(|(label, target)| (label, target.into())).collect() }
+    }
+}
+
+impl From<RawCompactTarget> for RemoteTargetDraft {
+    fn from(raw: RawCompactTarget) -> Self {
+        Self { ssh: raw.ssh, workspace: raw.workspace, project: raw.project.map(Into::into), resources: raw.resources.map(Into::into) }
+    }
+}
+
+impl From<RawTargetProject> for RemoteProjectOverlayDraft {
+    fn from(raw: RawTargetProject) -> Self {
+        Self { remote: raw.remote.map(Into::into) }
+    }
+}
+
+impl From<RawRemoteOverlay> for RemoteOverlayDraft {
+    fn from(raw: RawRemoteOverlay) -> Self {
+        Self { exclude: raw.exclude, environment: raw.environment, tools: raw.tools, artifacts: raw.artifacts }
+    }
+}
+
+impl From<RawTargetResources> for RemoteResourceOverridesDraft {
+    fn from(raw: RawTargetResources) -> Self {
+        Self {
+            connect_timeout: raw.connect_timeout,
+            sync_timeout: raw.sync_timeout,
+            build_timeout: raw.build_timeout,
+            max_output: raw.max_output,
+            idle_output_timeout: raw.idle_output_timeout,
+            cleanup_timeout: raw.cleanup_timeout,
+            artifact_timeout: raw.artifact_timeout,
+            max_artifact_bytes: raw.max_artifact_bytes,
+            max_artifact_total_bytes: raw.max_artifact_total_bytes,
+            max_artifact_entries: raw.max_artifact_entries,
+            max_worker_uploads: raw.max_worker_uploads,
+            max_worker_upload_bytes: raw.max_worker_upload_bytes,
+            max_worker_jobs: raw.max_worker_jobs,
+            max_worker_job_bytes: raw.max_worker_job_bytes,
+            max_worker_artifact_spools: raw.max_worker_artifact_spools,
+            max_worker_artifact_spool_bytes: raw.max_worker_artifact_spool_bytes,
+            max_worker_state_entries: raw.max_worker_state_entries,
+            max_active_builds: raw.max_active_builds,
+        }
+    }
+}
+
+impl RemoteTargetDraft {
+    fn raw_project(&self) -> Option<RawTargetProject> {
+        self.project.as_ref().map(|project| RawTargetProject {
+            remote: project.remote.as_ref().map(|remote| RawRemoteOverlay {
+                exclude: remote.exclude.clone(),
+                environment: remote.environment.clone(),
+                tools: remote.tools.clone(),
+                artifacts: remote.artifacts.clone(),
+            }),
+        })
+    }
+
+    fn raw_resources(&self) -> Option<RawTargetResources> {
+        self.resources.as_ref().map(|resources| RawTargetResources {
+            connect_timeout: resources.connect_timeout.clone(),
+            sync_timeout: resources.sync_timeout.clone(),
+            build_timeout: resources.build_timeout.clone(),
+            max_output: resources.max_output.clone(),
+            idle_output_timeout: resources.idle_output_timeout.clone(),
+            cleanup_timeout: resources.cleanup_timeout.clone(),
+            artifact_timeout: resources.artifact_timeout.clone(),
+            max_artifact_bytes: resources.max_artifact_bytes.clone(),
+            max_artifact_total_bytes: resources.max_artifact_total_bytes.clone(),
+            max_artifact_entries: resources.max_artifact_entries,
+            max_worker_uploads: resources.max_worker_uploads,
+            max_worker_upload_bytes: resources.max_worker_upload_bytes.clone(),
+            max_worker_jobs: resources.max_worker_jobs,
+            max_worker_job_bytes: resources.max_worker_job_bytes.clone(),
+            max_worker_artifact_spools: resources.max_worker_artifact_spools,
+            max_worker_artifact_spool_bytes: resources.max_worker_artifact_spool_bytes.clone(),
+            max_worker_state_entries: resources.max_worker_state_entries,
+            max_active_builds: resources.max_active_builds,
+        })
+    }
+}
+
+impl RemoteConfigDraft {
+    pub fn load_optional(project_root: &Path, base_project: &ProjectConfig) -> Result<Option<Self>, String> {
+        if !project_root.is_absolute() {
+            return Err("project root must be absolute".to_string());
+        }
+        let config_dir = project_root.join(".bunkerbox");
+        match fs::symlink_metadata(&config_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() => {
+                return Err(format!("{} must be a real directory", config_dir.display()))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("inspect {}: {error}", config_dir.display())),
+        }
+        let path = config_dir.join(REMOTE_PROJECT_CONFIG_FILE_NAME);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("failed to inspect {}: {error}", path.display())),
+        };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(format!("{} must be a regular file", path.display()));
+        }
+        let contents = fs::read_to_string(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let raw: RawRemoteProjectConfig = serde_yaml::from_str(&contents).map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        let draft = Self::from(raw);
+        draft.validate(base_project)?;
+        Ok(Some(draft))
+    }
+
+    pub fn validate(&self, base_project: &ProjectConfig) -> Result<(), String> {
+        for (label, target) in &self.targets {
+            self.validate_target(label, target, base_project)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_target(&self, label: &str, target: &RemoteTargetDraft, base_project: &ProjectConfig) -> Result<(), String> {
+        validate_name("target label", label)?;
+        if label == "localhost" {
+            return Err("remote target label 'localhost' is reserved".to_string());
+        }
+        let project = merge_remote_overlay(&base_project.project.remote, target.raw_project().as_ref())?;
+        validate_remote_section(&project)?;
+        let resources = validate_compact_resources(target.raw_resources())?;
+        let _ssh_target = SshTarget::from_compact(label.to_string(), &target.ssh, target.workspace.clone(), resources)?;
+        let artifact_policy = ArtifactPolicy::new(project.artifacts)?;
+        artifact_policy.validate_limits(resources.artifact_limits())?;
+        Ok(())
+    }
+
+    pub fn to_yaml(&self) -> Result<String, String> {
+        let mut serializable = self.clone();
+        for target in serializable.targets.values_mut() {
+            if target.resources.as_ref().is_some_and(RemoteResourceOverridesDraft::is_empty) {
+                target.resources = None;
+            }
+        }
+        serde_yaml::to_string(&serializable).map_err(|error| format!("serialize remote configuration: {error}"))
+    }
+
+    pub fn write_atomic(&self, project_root: &Path, base_project: &ProjectConfig) -> Result<(), String> {
+        self.validate(base_project)?;
+        if !project_root.is_absolute() {
+            return Err("project root must be absolute".to_string());
+        }
+        let config_dir = project_root.join(".bunkerbox");
+        ensure_real_directory(&config_dir)?;
+
+        let destination = config_dir.join(REMOTE_PROJECT_CONFIG_FILE_NAME);
+        ensure_regular_destination(&destination)?;
+
+        let contents = self.to_yaml()?.into_bytes();
+        let mut temporary = None;
+        let mut file = None;
+        for _ in 0..32 {
+            let sequence = NEXT_CONFIG_TEMP.fetch_add(1, Ordering::Relaxed);
+            let path = config_dir.join(format!(".{REMOTE_PROJECT_CONFIG_FILE_NAME}.tmp-{}-{sequence}", std::process::id()));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            match options.open(&path) {
+                Ok(value) => {
+                    temporary = Some(path);
+                    file = Some(value);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(format!("create remote configuration temporary file: {error}")),
+            }
+        }
+        let temporary = temporary.ok_or_else(|| "could not create remote configuration temporary file".to_string())?;
+        let mut file = file.expect("remote configuration temporary file exists with its path");
+        let result = (|| {
+            file.write_all(&contents).map_err(|error| format!("write remote configuration: {error}"))?;
+            file.sync_all().map_err(|error| format!("sync remote configuration: {error}"))?;
+            drop(file);
+            ensure_regular_destination(&destination)?;
+            fs::rename(&temporary, &destination).map_err(|error| format!("publish remote configuration: {error}"))?;
+            File::open(&config_dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync remote configuration directory: {error}"))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+fn ensure_real_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                Err(format!("{} must be a real directory", path.display()))
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(format!("create {}: {error}", path.display())),
+            }
+            let metadata = fs::symlink_metadata(path).map_err(|error| format!("inspect {}: {error}", path.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                return Err(format!("{} must be a real directory", path.display()));
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!("inspect {}: {error}", path.display())),
+    }
+}
+
+fn ensure_regular_destination(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            Err(format!("{} must be a regular file", path.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect {}: {error}", path.display())),
+    }
+}
+
 fn merge_remote_overlay(base: &RemoteSection, target: Option<&RawTargetProject>) -> Result<RemoteSection, String> {
     let Some(target) = target.and_then(|project| project.remote.as_ref()) else { return Ok(base.clone()) };
     let mut merged = base.clone();
@@ -1376,6 +1693,52 @@ fn validate_remote_section(section: &RemoteSection) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub fn validate_remote_target_label(label: &str) -> Result<(), String> {
+    validate_name("target label", label)?;
+    if label == "localhost" {
+        return Err("remote target label 'localhost' is reserved".to_string());
+    }
+    Ok(())
+}
+
+pub fn validate_ssh_destination(value: &str) -> Result<(), String> {
+    parse_ssh_destination(value).map(|_| ())
+}
+
+pub fn validate_workspace_path(value: &str) -> Result<(), String> {
+    validate_remote_path("workspace", value, true).map(|_| ())
+}
+
+pub fn validate_remote_tool_spec(tool: &RemoteToolSpec) -> Result<(), String> {
+    crate::remote::validate_remote_wrapper_name(tool.name.clone())?;
+    if let Some(command) = &tool.command {
+        crate::remote::validate_remote_wrapper_name(command.clone())?;
+    }
+    Ok(())
+}
+
+pub fn validate_remote_environment_names(names: &[String]) -> Result<(), String> {
+    RemoteEnvironmentPolicy::from_names(names.to_vec()).map(|_| ())
+}
+
+pub fn validate_remote_exclusion_entries(entries: &[String]) -> Result<(), String> {
+    crate::snapshot::SnapshotExclusionPolicy::from_patterns(entries.to_vec()).map(|_| ())
+}
+
+pub fn validate_remote_artifact_paths(entries: &[String]) -> Result<(), String> {
+    ArtifactPolicy::new(entries.to_vec()).map(|_| ())
+}
+
+pub fn validate_remote_resource_overrides(resources: &RemoteResourceOverridesDraft) -> Result<ResourceLimits, String> {
+    let target = RemoteTargetDraft {
+        ssh: "builder@localhost".to_string(),
+        workspace: "/workspace".to_string(),
+        project: None,
+        resources: Some(resources.clone()),
+    };
+    validate_compact_resources(target.raw_resources())
 }
 
 fn validate_compact_resources(raw: Option<RawTargetResources>) -> Result<ResourceLimits, String> {

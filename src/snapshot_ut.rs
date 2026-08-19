@@ -168,28 +168,74 @@ fn malformed_exclusions_are_rejected() {
 }
 
 #[test]
-fn every_symlink_is_rejected_without_following_it() {
-    let cases = ["internal-file", "internal-dir", "external", "dangling", "loop-a"];
-    for case in cases {
-        let source = TempDir::new().unwrap();
-        let store = TempDir::new().unwrap();
-        write_file(source.path(), "real/file", b"data");
-        match case {
-            "internal-file" => symlink("real/file", source.path().join(case)).unwrap(),
-            "internal-dir" => symlink("real", source.path().join(case)).unwrap(),
-            "external" => {
-                let outside = TempDir::new().unwrap();
-                symlink(outside.path(), source.path().join(case)).unwrap();
-            }
-            "dangling" => symlink("missing", source.path().join(case)).unwrap(),
-            "loop-a" => {
-                symlink("loop-b", source.path().join("loop-a")).unwrap();
-                symlink("loop-a", source.path().join("loop-b")).unwrap();
-            }
-            _ => unreachable!(),
-        }
-        assert!(build_at(&source, &store, SnapshotLimits::default(), &[]).is_err(), "{case}");
+fn internal_relative_symlink_is_accepted_and_preserved() {
+    let source = TempDir::new().unwrap();
+    let store = TempDir::new().unwrap();
+    write_file(source.path(), "Lib/module.py", b"module");
+    fs::create_dir_all(source.path().join("crates/pylib")).unwrap();
+    symlink("../../Lib/", source.path().join("crates/pylib/Lib")).unwrap();
+
+    let snapshot = build_at(&source, &store, SnapshotLimits::default(), &[]).unwrap();
+    let entry = snapshot.entries().iter().find(|entry| entry.path().as_str() == "crates/pylib/Lib").unwrap();
+    assert_eq!(entry.kind(), SnapshotEntryKind::Symlink);
+    assert_eq!(entry.symlink_target(), Some("../../Lib/"));
+    assert_eq!(entry.size(), 0);
+    assert!(entry.content_digest().is_none());
+
+    let destination = store.path().join("materialized");
+    SnapshotStore::new(store.path()).materialize(snapshot.handle(), &destination).unwrap();
+    let materialized_link = destination.join("crates/pylib/Lib");
+    assert!(fs::symlink_metadata(&materialized_link).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read_link(&materialized_link).unwrap(), Path::new("../../Lib/"));
+    assert_eq!(fs::read(destination.join("crates/pylib/Lib/module.py")).unwrap(), b"module");
+}
+
+#[test]
+fn nested_internal_symlinks_are_accepted_without_dereferencing() {
+    let source = TempDir::new().unwrap();
+    let store = TempDir::new().unwrap();
+    write_file(source.path(), "Lib/module.py", b"module");
+    symlink("Lib", source.path().join("alias")).unwrap();
+    fs::create_dir_all(source.path().join("nested/a")).unwrap();
+    symlink("../../alias", source.path().join("nested/a/link")).unwrap();
+
+    let snapshot = build_at(&source, &store, SnapshotLimits::default(), &[]).unwrap();
+    for (path, target) in [("alias", "Lib"), ("nested/a/link", "../../alias")] {
+        let entry = snapshot.entries().iter().find(|entry| entry.path().as_str() == path).unwrap();
+        assert_eq!(entry.kind(), SnapshotEntryKind::Symlink);
+        assert_eq!(entry.symlink_target(), Some(target));
     }
+
+    let destination = store.path().join("materialized");
+    SnapshotStore::new(store.path()).materialize(snapshot.handle(), &destination).unwrap();
+    assert!(fs::symlink_metadata(destination.join("alias")).unwrap().file_type().is_symlink());
+    assert!(fs::symlink_metadata(destination.join("nested/a/link")).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read(destination.join("nested/a/link/module.py")).unwrap(), b"module");
+}
+
+#[test]
+fn unsafe_symlinks_are_rejected_without_following_them() {
+    let source = TempDir::new().unwrap();
+    let store = TempDir::new().unwrap();
+    symlink("/etc", source.path().join("absolute")).unwrap();
+    assert!(build_at(&source, &store, SnapshotLimits::default(), &[]).is_err());
+
+    let parent = TempDir::new().unwrap();
+    let escaping_root = parent.path().join("root");
+    let outside = parent.path().join("outside");
+    fs::create_dir_all(&escaping_root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    symlink("../outside", escaping_root.join("escape")).unwrap();
+    assert!(builder(&store, SnapshotLimits::default(), &[]).build_root(&escaping_root, session(2)).is_err());
+
+    let source = TempDir::new().unwrap();
+    let store = TempDir::new().unwrap();
+    symlink("missing", source.path().join("broken")).unwrap();
+    assert!(build_at(&source, &store, SnapshotLimits::default(), &[]).is_err());
+
+    symlink("loop-b", source.path().join("loop-a")).unwrap();
+    symlink("loop-a", source.path().join("loop-b")).unwrap();
+    assert!(build_at(&source, &store, SnapshotLimits::default(), &[]).is_err());
 }
 
 #[test]
@@ -356,6 +402,19 @@ fn materialization_rejects_destination_symlink() {
     symlink(outside.path(), &destination).unwrap();
     assert!(SnapshotStore::new(store_dir.path()).materialize(snapshot.handle(), &destination).is_err());
     assert!(outside.path().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn materialization_rejects_symlink_replacement_in_a_parent_directory() {
+    let destination_parent = TempDir::new().unwrap();
+    let destination = destination_parent.path().join("materialized");
+    let outside = TempDir::new().unwrap();
+    fs::create_dir(&destination).unwrap();
+    symlink(outside.path(), destination.join("nested")).unwrap();
+
+    let root = open_directory(&destination).unwrap();
+    assert!(create_relative_symlink(&root, "nested/link", "../target").is_err());
+    assert!(!outside.path().join("link").exists());
 }
 
 #[test]

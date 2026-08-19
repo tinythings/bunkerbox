@@ -10,7 +10,7 @@
 //! allocating a payload buffer, and every length and count inside a payload is
 //! checked before it can drive an allocation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Read, Write};
 
@@ -24,6 +24,8 @@ pub const WORKER_VERSION: u16 = WORKER_PROTOCOL_VERSION;
 pub const WORKER_ARTIFACT_PROTOCOL_VERSION: u16 = 2;
 /// Adds trusted target-PATH command resolution without changing V1/V2 fields.
 pub const WORKER_COMMAND_PROTOCOL_VERSION: u16 = 3;
+/// Adds validated workspace-relative symlink entries to upload manifests.
+pub const WORKER_SYMLINK_PROTOCOL_VERSION: u16 = 4;
 pub const WORKER_FRAME_HEADER_LEN: usize = 4 + 2 + 1 + 4;
 pub const WORKER_FRAME_HEADER_SIZE: usize = WORKER_FRAME_HEADER_LEN;
 pub const WORKER_ID_LEN: usize = 16;
@@ -435,6 +437,7 @@ impl WorkerArtifactEntry {
 pub enum WorkerEntryKind {
     Directory = 1,
     File = 2,
+    Symlink = 3,
 }
 
 impl WorkerEntryKind {
@@ -442,6 +445,7 @@ impl WorkerEntryKind {
         match value {
             1 => Ok(Self::Directory),
             2 => Ok(Self::File),
+            3 => Ok(Self::Symlink),
             _ => Err(invalid(format!("unknown worker entry kind: {value}"))),
         }
     }
@@ -458,11 +462,18 @@ pub struct WorkerUploadEntry {
     pub mode: u32,
     pub size: u64,
     pub digest: Option<WorkerDigest>,
+    pub symlink_target: Option<String>,
 }
 
 impl WorkerUploadEntry {
     pub fn new(path: impl Into<String>, kind: WorkerEntryKind, mode: u32, size: u64, digest: Option<WorkerDigest>) -> WorkerResult<Self> {
-        let entry = Self { path: WorkerRelativePath::for_entry(path)?, kind, mode, size, digest };
+        Self::new_with_target(path, kind, mode, size, digest, None)
+    }
+
+    pub fn new_with_target(
+        path: impl Into<String>, kind: WorkerEntryKind, mode: u32, size: u64, digest: Option<WorkerDigest>, symlink_target: Option<String>,
+    ) -> WorkerResult<Self> {
+        let entry = Self { path: WorkerRelativePath::for_entry(path)?, kind, mode, size, digest, symlink_target };
         entry.validate()?;
         Ok(entry)
     }
@@ -473,6 +484,10 @@ impl WorkerUploadEntry {
 
     pub fn file(path: impl Into<String>, mode: u32, size: u64, digest: WorkerDigest) -> WorkerResult<Self> {
         Self::new(path, WorkerEntryKind::File, mode, size, Some(digest))
+    }
+
+    pub fn symlink(path: impl Into<String>, mode: u32, target: impl Into<String>) -> WorkerResult<Self> {
+        Self::new_with_target(path, WorkerEntryKind::Symlink, mode, 0, None, Some(target.into()))
     }
 
     pub fn path(&self) -> &WorkerRelativePath {
@@ -495,6 +510,10 @@ impl WorkerUploadEntry {
         self.digest.as_ref()
     }
 
+    pub fn symlink_target(&self) -> Option<&str> {
+        self.symlink_target.as_deref()
+    }
+
     pub fn validate(&self) -> WorkerResult<()> {
         validate_relative_path("worker entry path", self.path.as_str(), false)?;
         if self.mode & !0o7777 != 0 {
@@ -509,6 +528,9 @@ impl WorkerUploadEntry {
                 if self.digest.is_some() {
                     return Err(invalid("worker directory entry must not have a digest"));
                 }
+                if self.symlink_target.is_some() {
+                    return Err(invalid("worker directory entry must not have a symlink target"));
+                }
             }
             WorkerEntryKind::File => {
                 if self.size > MAX_WORKER_FILE_BYTES {
@@ -517,6 +539,19 @@ impl WorkerUploadEntry {
                 if self.digest.is_none() {
                     return Err(invalid("worker file entry is missing a digest"));
                 }
+                if self.symlink_target.is_some() {
+                    return Err(invalid("worker file entry must not have a symlink target"));
+                }
+            }
+            WorkerEntryKind::Symlink => {
+                if self.size != 0 {
+                    return Err(invalid("worker symlink entry must have zero size"));
+                }
+                if self.digest.is_some() {
+                    return Err(invalid("worker symlink entry must not have a digest"));
+                }
+                let target = self.symlink_target.as_deref().ok_or_else(|| invalid("worker symlink entry is missing a target"))?;
+                validate_symlink_target(self.path.as_str(), target)?;
             }
         }
         Ok(())
@@ -936,6 +971,14 @@ impl WorkerMessage {
         }
     }
 
+    fn requires_symlink_version(&self) -> bool {
+        match self {
+            Self::UploadBegin { entries, .. } => entries.iter().any(|entry| entry.kind() == WorkerEntryKind::Symlink),
+            Self::UploadEntry { entry, .. } => entry.kind() == WorkerEntryKind::Symlink,
+            _ => false,
+        }
+    }
+
     pub fn encode(&self) -> WorkerResult<Vec<u8>> {
         self.encode_version(WORKER_PROTOCOL_VERSION)
     }
@@ -947,6 +990,9 @@ impl WorkerMessage {
         }
         if version < WORKER_COMMAND_PROTOCOL_VERSION && matches!(self, Self::Build { build, .. } if build.target_command.is_some()) {
             return Err(invalid("worker command identity requires command-capable protocol version"));
+        }
+        if version < WORKER_SYMLINK_PROTOCOL_VERSION && self.requires_symlink_version() {
+            return Err(invalid("worker symlink entries require symlink-capable protocol version"));
         }
         self.validate()?;
         let mut payload = WireWriter::new();
@@ -1143,6 +1189,7 @@ pub fn validate_upload_manifest(entries: &[WorkerUploadEntry]) -> WorkerResult<u
             .checked_add(entry.path.as_str().len())
             .and_then(|bytes| bytes.checked_add(1 + 4 + 8 + 1))
             .and_then(|bytes| bytes.checked_add(if entry.digest.is_some() { WORKER_DIGEST_LEN } else { 0 }))
+            .and_then(|bytes| bytes.checked_add(1 + entry.symlink_target().map_or(0, |target| 4 + target.len())))
             .ok_or_else(|| invalid("worker manifest length overflow"))?;
         manifest_bytes = manifest_bytes.checked_add(encoded_entry_bytes).ok_or_else(|| invalid("worker manifest length overflow"))?;
         if manifest_bytes > MAX_WORKER_MANIFEST_BYTES {
@@ -1153,6 +1200,7 @@ pub fn validate_upload_manifest(entries: &[WorkerUploadEntry]) -> WorkerResult<u
             return Err(invalid(format!("worker upload exceeds maximum size {MAX_WORKER_TOTAL_UPLOAD_BYTES}")));
         }
     }
+    validate_upload_symlinks(entries)?;
     Ok(total_bytes)
 }
 
@@ -1168,14 +1216,14 @@ fn encode_payload(message: &WorkerMessage, writer: &mut WireWriter, version: u16
             writer.id(upload_id.0)?;
             writer.count(entries.len(), MAX_WORKER_UPLOAD_ENTRIES, "worker upload entries")?;
             for entry in entries {
-                encode_entry(writer, entry)?;
+                encode_entry(writer, entry, version)?;
             }
         }
         WorkerMessage::UploadEntry { request_id, session_id, upload_id, entry_index, entry } => {
             encode_correlation(writer, *request_id, *session_id)?;
             writer.id(upload_id.0)?;
             writer.u32(*entry_index)?;
-            encode_entry(writer, entry)?;
+            encode_entry(writer, entry, version)?;
         }
         WorkerMessage::UploadFileChunk { request_id, session_id, upload_id, path, offset, data } => {
             encode_correlation(writer, *request_id, *session_id)?;
@@ -1268,7 +1316,7 @@ fn decode_payload(kind: WorkerFrameKind, payload: &[u8], version: u16) -> Worker
             let count = reader.count(MAX_WORKER_UPLOAD_ENTRIES, "worker upload entries")?;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
-                entries.push(decode_entry(&mut reader)?);
+                entries.push(decode_entry(&mut reader, version)?);
             }
             WorkerMessage::UploadBegin { request_id, session_id, upload_id, entries }
         }
@@ -1276,7 +1324,7 @@ fn decode_payload(kind: WorkerFrameKind, payload: &[u8], version: u16) -> Worker
             let (request_id, session_id) = decode_correlation(&mut reader)?;
             let upload_id = WorkerUploadId(reader.array16()?);
             let entry_index = reader.u32()?;
-            let entry = decode_entry(&mut reader)?;
+            let entry = decode_entry(&mut reader, version)?;
             WorkerMessage::UploadEntry { request_id, session_id, upload_id, entry_index, entry }
         }
         WorkerFrameKind::UploadFileChunk => {
@@ -1480,7 +1528,7 @@ fn decode_environment(reader: &mut WireReader<'_>, field: &str) -> WorkerResult<
     Ok(environment)
 }
 
-fn encode_entry(writer: &mut WireWriter, entry: &WorkerUploadEntry) -> WorkerResult<()> {
+fn encode_entry(writer: &mut WireWriter, entry: &WorkerUploadEntry, version: u16) -> WorkerResult<()> {
     entry.validate()?;
     writer.string(entry.path.as_str(), MAX_WORKER_PATH_BYTES, "worker entry path")?;
     writer.u8(entry.kind.as_u8())?;
@@ -1493,10 +1541,19 @@ fn encode_entry(writer: &mut WireWriter, entry: &WorkerUploadEntry) -> WorkerRes
         }
         None => writer.boolean(false)?,
     }
+    if version >= WORKER_SYMLINK_PROTOCOL_VERSION {
+        match entry.symlink_target() {
+            Some(target) => {
+                writer.boolean(true)?;
+                writer.string(target, MAX_WORKER_PATH_BYTES, "worker symlink target")?;
+            }
+            None => writer.boolean(false)?,
+        }
+    }
     Ok(())
 }
 
-fn decode_entry(reader: &mut WireReader<'_>) -> WorkerResult<WorkerUploadEntry> {
+fn decode_entry(reader: &mut WireReader<'_>, version: u16) -> WorkerResult<WorkerUploadEntry> {
     let path = reader.string(MAX_WORKER_PATH_BYTES, "worker entry path")?;
     let kind = WorkerEntryKind::from_u8(reader.u8()?)?;
     let mode = reader.u32()?;
@@ -1505,7 +1562,15 @@ fn decode_entry(reader: &mut WireReader<'_>) -> WorkerResult<WorkerUploadEntry> 
         true => Some(reader.array32()?),
         false => None,
     };
-    WorkerUploadEntry::new(path, kind, mode, size, digest)
+    let symlink_target = if version >= WORKER_SYMLINK_PROTOCOL_VERSION {
+        match reader.boolean("worker symlink target flag")? {
+            true => Some(reader.string(MAX_WORKER_PATH_BYTES, "worker symlink target")?),
+            false => None,
+        }
+    } else {
+        None
+    };
+    WorkerUploadEntry::new_with_target(path, kind, mode, size, digest, symlink_target)
 }
 
 fn encode_correlation(writer: &mut WireWriter, request_id: WorkerRequestId, session_id: WorkerSessionId) -> WorkerResult<()> {
@@ -1680,6 +1745,67 @@ fn validate_relative_path(field: &str, value: &str, allow_empty: bool) -> Worker
     Ok(())
 }
 
+fn validate_symlink_target(path: &str, target: &str) -> WorkerResult<()> {
+    normalize_symlink_target(path, target).map(|_| ())
+}
+
+fn normalize_symlink_target(path: &str, target: &str) -> WorkerResult<String> {
+    validate_text("worker symlink target", target, MAX_WORKER_PATH_BYTES)?;
+    if target.is_empty() || target.starts_with('/') || target.starts_with('\\') || target.contains('\\') {
+        return Err(invalid("worker symlink target must be non-empty and relative"));
+    }
+    let mut components = path.rsplit_once('/').map_or_else(Vec::new, |(parent, _)| parent.split('/').collect::<Vec<_>>());
+    let target_components = target.split('/').collect::<Vec<_>>();
+    if target_components.len() > MAX_WORKER_PATH_DEPTH {
+        return Err(invalid("worker symlink target exceeds maximum depth"));
+    }
+    for (index, component) in target_components.iter().enumerate() {
+        if component.is_empty() {
+            if index + 1 == target_components.len() {
+                continue;
+            }
+            return Err(invalid("worker symlink target contains an empty component"));
+        }
+        match *component {
+            "." => {}
+            ".." => {
+                components.pop().ok_or_else(|| invalid("worker symlink target escapes workspace"))?;
+            }
+            value => {
+                if value.len() > MAX_WORKER_PATH_COMPONENT_BYTES || value.chars().any(char::is_control) || value.contains(':') {
+                    return Err(invalid("worker symlink target contains an invalid component"));
+                }
+                components.push(value);
+            }
+        }
+    }
+    Ok(components.join("/"))
+}
+
+fn validate_upload_symlinks(entries: &[WorkerUploadEntry]) -> WorkerResult<()> {
+    let by_path = entries.iter().map(|entry| (entry.path().as_str(), entry)).collect::<BTreeMap<_, _>>();
+    for entry in entries.iter().filter(|entry| entry.kind() == WorkerEntryKind::Symlink) {
+        let target = entry.symlink_target().ok_or_else(|| invalid("worker symlink entry is missing a target"))?;
+        let mut current = normalize_symlink_target(entry.path().as_str(), target)?;
+        let mut visited = BTreeSet::new();
+        loop {
+            if current.is_empty() {
+                break;
+            }
+            let target_entry = by_path.get(current.as_str()).ok_or_else(|| invalid("worker symlink target is missing from upload manifest"))?;
+            if target_entry.kind() != WorkerEntryKind::Symlink {
+                break;
+            }
+            if !visited.insert(current.clone()) {
+                return Err(invalid("worker symlink loop detected"));
+            }
+            let nested_target = target_entry.symlink_target().ok_or_else(|| invalid("worker symlink entry is missing a target"))?;
+            current = normalize_symlink_target(target_entry.path().as_str(), nested_target)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_text(field: &str, value: &str, maximum: usize) -> WorkerResult<()> {
     if value.len() > maximum {
         return Err(invalid(format!("{field} exceeds maximum length {maximum}")));
@@ -1702,7 +1828,7 @@ fn invalid(message: impl Into<String>) -> WorkerProtocolError {
 }
 
 fn is_supported_version(version: u16) -> bool {
-    matches!(version, WORKER_PROTOCOL_VERSION | WORKER_ARTIFACT_PROTOCOL_VERSION | WORKER_COMMAND_PROTOCOL_VERSION)
+    matches!(version, WORKER_PROTOCOL_VERSION | WORKER_ARTIFACT_PROTOCOL_VERSION | WORKER_COMMAND_PROTOCOL_VERSION | WORKER_SYMLINK_PROTOCOL_VERSION)
 }
 
 fn validate_version(version: u16) -> WorkerResult<()> {

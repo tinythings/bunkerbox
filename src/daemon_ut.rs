@@ -555,6 +555,44 @@ async fn transparent_exec_request_routes_fresh_managed_cargo_to_selected_remote_
 }
 
 #[tokio::test]
+async fn managed_remote_wrapper_requests_route_to_target_selected_after_daemon_setup() {
+    let (root, catalog) = target_catalog_fixture();
+    let active = ActiveBuildTarget::new();
+    let backend = Arc::new(TargetRecordingBackend { calls: Mutex::new(Vec::new()) });
+    let session_id = WorkspaceSessionId([2; 16]);
+    let target = RemoteTargetId([3; 16]);
+    let session = target_session(root.path().to_path_buf(), active.clone(), backend.clone(), target, session_id);
+    active.select(&catalog, "bsdbox").unwrap();
+
+    let (mut guest, mut host) = tokio::io::duplex(4096);
+    let sync = WireRemoteRequest::sync(WireRequestId([6; 16]), WireWorkspaceSessionId([2; 16]));
+    dispatch_remote_frame_for_session(sync.to_frame().unwrap(), &session, &mut host).await.unwrap();
+    let sync_event = crate::vscomm::RemoteEvent::from_frame(Frame::read_async(&mut guest).await.unwrap()).unwrap();
+    let crate::vscomm::RemoteEventKind::SyncCompleted { snapshot_id } = sync_event.kind else { panic!("expected sync completion") };
+
+    let build = WireRemoteRequest::build(
+        WireRequestId([7; 16]),
+        WireWorkspaceSessionId([2; 16]),
+        WireRemoteBuild::new(
+            WireWorkspaceRelativePath::new("").unwrap(),
+            WireRemoteTool::new("cargo").unwrap(),
+            vec!["build".to_string()],
+            Vec::new(),
+            snapshot_id,
+        )
+        .unwrap(),
+    );
+    dispatch_remote_frame_for_session(build.to_frame().unwrap(), &session, &mut host).await.unwrap();
+    let build_event = crate::vscomm::RemoteEvent::from_frame(Frame::read_async(&mut guest).await.unwrap()).unwrap();
+    assert_eq!(build_event.kind, crate::vscomm::RemoteEventKind::Completed { exit_code: 0 });
+
+    let calls = backend.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].target(), target);
+    assert_eq!(calls[1].target(), target);
+}
+
+#[tokio::test]
 async fn transparent_exec_request_keeps_selected_localhost_on_secured_local_executor() {
     let workspace = tempfile::tempdir().unwrap();
     let active = ActiveBuildTarget::new();

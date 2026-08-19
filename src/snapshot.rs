@@ -3,7 +3,7 @@ use crate::remote::{RemoteExecutionControl, WorkspaceSessionId};
 use crate::workspace::WorkspaceHandle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -53,6 +53,7 @@ impl SnapshotRelativePath {
 pub enum SnapshotEntryKind {
     Directory,
     RegularFile,
+    Symlink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +63,7 @@ pub struct SnapshotEntry {
     mode: u16,
     size: u64,
     content_digest: Option<[u8; 32]>,
+    symlink_target: Option<String>,
 }
 
 impl SnapshotEntry {
@@ -83,6 +85,10 @@ impl SnapshotEntry {
 
     pub fn content_digest(&self) -> Option<&[u8; 32]> {
         self.content_digest.as_ref()
+    }
+
+    pub fn symlink_target(&self) -> Option<&str> {
+        self.symlink_target.as_deref()
     }
 }
 
@@ -306,6 +312,10 @@ impl SnapshotStore {
                         &control,
                     )?;
                 }
+                SnapshotEntryKind::Symlink => {
+                    let target = entry.symlink_target.as_deref().ok_or_else(|| "symlink snapshot entry has no target".to_string())?;
+                    create_relative_symlink(&destination_root, entry.path.as_str(), target)?;
+                }
             }
         }
         if control.is_cancelled() {
@@ -515,8 +525,10 @@ impl SnapshotBuilder {
             next_buffer: vec![0; SNAPSHOT_COPY_BUFFER_BYTES],
             control,
         };
-        walk_directory(root.as_raw_fd(), "", 0, &self.limits, &self.exclusions, &mut state)?;
+        walk_directory(&canonical_root, root.as_raw_fd(), "", 0, &self.limits, &self.exclusions, &mut state)?;
         state.entries.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
+        validate_snapshot_structure(&state.entries)?;
+        validate_snapshot_symlinks(&state.entries)?;
         let id = snapshot_id(&state.entries);
         let stored = StoredSnapshot::from_entries(session_id, &state.entries, state.total_file_bytes);
         let manifest = serde_json::to_vec(&stored).map_err(|error| format!("encode snapshot manifest: {error}"))?;
@@ -576,7 +588,8 @@ struct WalkState {
 }
 
 fn walk_directory(
-    directory_fd: RawFd, parent: &str, depth: usize, limits: &SnapshotLimits, exclusions: &SnapshotExclusionPolicy, state: &mut WalkState,
+    canonical_root: &Path, directory_fd: RawFd, parent: &str, depth: usize, limits: &SnapshotLimits, exclusions: &SnapshotExclusionPolicy,
+    state: &mut WalkState,
 ) -> Result<(), String> {
     if state.control.is_cancelled() {
         return Err("snapshot creation cancelled".to_string());
@@ -613,8 +626,9 @@ fn walk_directory(
                     mode,
                     size: 0,
                     content_digest: None,
+                    symlink_target: None,
                 });
-                walk_directory(child.as_raw_fd(), &relative, depth + 1, limits, exclusions, state)?;
+                walk_directory(canonical_root, child.as_raw_fd(), &relative, depth + 1, limits, exclusions, state)?;
             }
             SnapshotEntryKind::RegularFile => {
                 add_entry_limit(state.entries.len(), limits)?;
@@ -637,6 +651,20 @@ fn walk_directory(
                     mode: normalized_mode(child_stat.st_mode),
                     size,
                     content_digest: Some(digest),
+                    symlink_target: None,
+                });
+            }
+            SnapshotEntryKind::Symlink => {
+                add_entry_limit(state.entries.len(), limits)?;
+                let target = read_symlink_at(directory_fd, &name, &relative)?;
+                validate_symlink_target(canonical_root, &relative, &target, limits)?;
+                state.entries.push(SnapshotEntry {
+                    path: SnapshotRelativePath::new(relative)?,
+                    kind: SnapshotEntryKind::Symlink,
+                    mode: normalized_mode(child_stat.st_mode),
+                    size: 0,
+                    content_digest: None,
+                    symlink_target: Some(target),
                 });
             }
         }
@@ -743,11 +771,119 @@ fn validate_component(value: &str, max: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn read_symlink_at(parent: RawFd, name: &OsStr, path: &str) -> Result<String, String> {
+    let name = CString::new(name.as_bytes()).map_err(|_| format!("snapshot symlink contains NUL: {path}"))?;
+    let mut buffer = vec![0u8; MAX_SNAPSHOT_PATH_BYTES + 1];
+    let length = unsafe { libc::readlinkat(parent, name.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    if length < 0 {
+        return Err(format!("read snapshot symlink {path}: {}", io::Error::last_os_error()));
+    }
+    let length = usize::try_from(length).map_err(|_| format!("snapshot symlink target length is invalid: {path}"))?;
+    if length >= buffer.len() {
+        return Err(format!("snapshot symlink target is too long: {path}"));
+    }
+    std::str::from_utf8(&buffer[..length]).map(str::to_string).map_err(|_| format!("snapshot symlink target is not UTF-8: {path}"))
+}
+
+fn validate_symlink_target_syntax(target: &str, max_path: usize, max_component: usize, max_depth: usize) -> Result<(), String> {
+    if target.is_empty() || target.starts_with('/') || target.contains('\\') || target.len() > max_path || target.as_bytes().contains(&0) {
+        return Err(format!("invalid snapshot symlink target: {target}"));
+    }
+    let components = target.split('/').collect::<Vec<_>>();
+    if components.len() > max_depth {
+        return Err(format!("snapshot symlink target exceeds maximum depth: {target}"));
+    }
+    for (index, component) in components.iter().enumerate() {
+        if component.is_empty() {
+            if index + 1 == components.len() {
+                continue;
+            }
+            return Err(format!("snapshot symlink target contains an empty component: {target}"));
+        }
+        if *component != "." && *component != ".." {
+            validate_component(component, max_component)?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_symlink_target(link_path: &str, target: &str) -> Result<String, String> {
+    let mut components = link_path.rsplit_once('/').map_or_else(Vec::new, |(parent, _)| parent.split('/').collect::<Vec<_>>());
+    validate_symlink_target_syntax(target, MAX_SNAPSHOT_PATH_BYTES, MAX_SNAPSHOT_COMPONENT_BYTES, MAX_SNAPSHOT_DEPTH)?;
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop().ok_or_else(|| format!("snapshot symlink target escapes workspace: {link_path} -> {target}"))?;
+            }
+            value => components.push(value),
+        }
+    }
+    Ok(components.join("/"))
+}
+
+fn validate_symlink_target(canonical_root: &Path, link_path: &str, target: &str, limits: &SnapshotLimits) -> Result<(), String> {
+    let _normalized = normalize_symlink_target(link_path, target)?;
+    let parent = link_path.rsplit_once('/').map_or(Path::new(""), |(parent, _)| Path::new(parent));
+    let candidate = canonical_root.join(parent).join(target);
+    let resolved = fs::canonicalize(&candidate).map_err(|error| format!("resolve snapshot symlink {link_path}: {error}"))?;
+    if resolved.strip_prefix(canonical_root).is_err() {
+        return Err(format!("snapshot symlink target escapes workspace: {link_path} -> {target}"));
+    }
+    validate_symlink_target_syntax(target, limits.max_path_bytes, limits.max_component_bytes, limits.max_depth)
+}
+
+fn validate_snapshot_structure(entries: &[SnapshotEntry]) -> Result<(), String> {
+    let kinds = entries.iter().map(|entry| (entry.path.as_str(), entry.kind)).collect::<BTreeMap<_, _>>();
+    for entry in entries {
+        let mut prefix = String::new();
+        for component in entry.path.as_str().split('/').take(entry.path.as_str().split('/').count().saturating_sub(1)) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if kinds.get(prefix.as_str()) != Some(&SnapshotEntryKind::Directory) {
+                return Err(format!("snapshot entry is missing directory parent: {prefix}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_symlinks(entries: &[SnapshotEntry]) -> Result<(), String> {
+    let by_path = entries.iter().map(|entry| (entry.path.as_str(), entry)).collect::<BTreeMap<_, _>>();
+    for entry in entries.iter().filter(|entry| entry.kind == SnapshotEntryKind::Symlink) {
+        let target = entry.symlink_target.as_deref().ok_or_else(|| format!("symlink snapshot entry has no target: {}", entry.path.as_str()))?;
+        let mut current = normalize_symlink_target(entry.path.as_str(), target)?;
+        let mut visited = BTreeSet::new();
+        loop {
+            if current.is_empty() {
+                break;
+            }
+            let target_entry = by_path
+                .get(current.as_str())
+                .ok_or_else(|| format!("snapshot symlink target is missing from snapshot: {} -> {target}", entry.path.as_str()))?;
+            if target_entry.kind != SnapshotEntryKind::Symlink {
+                break;
+            }
+            if !visited.insert(current.clone()) {
+                return Err(format!("snapshot symlink loop detected at: {}", entry.path.as_str()));
+            }
+            let nested_target = target_entry
+                .symlink_target
+                .as_deref()
+                .ok_or_else(|| format!("symlink snapshot entry has no target: {}", target_entry.path.as_str()))?;
+            current = normalize_symlink_target(target_entry.path.as_str(), nested_target)?;
+        }
+    }
+    Ok(())
+}
+
 fn child_kind(stat: &libc::stat, path: &str) -> Result<SnapshotEntryKind, String> {
     match stat.st_mode & libc::S_IFMT {
         libc::S_IFDIR => Ok(SnapshotEntryKind::Directory),
         libc::S_IFREG => Ok(SnapshotEntryKind::RegularFile),
-        libc::S_IFLNK => Err(format!("snapshot rejects symlink: {path}")),
+        libc::S_IFLNK => Ok(SnapshotEntryKind::Symlink),
         _ => Err(format!("snapshot rejects special file: {path}")),
     }
 }
@@ -875,6 +1011,23 @@ fn create_relative_file(root: &File, relative: &str, mode: u16) -> Result<File, 
     .map_err(|error| format!("create materialized file {relative}: {error}"))
 }
 
+fn create_relative_symlink(root: &File, relative: &str, target: &str) -> Result<(), String> {
+    let _normalized_target = normalize_symlink_target(relative, target)?;
+    let mut components = relative.split('/').collect::<Vec<_>>();
+    let file_name = components.pop().ok_or_else(|| "empty materialization symlink path".to_string())?;
+    let mut parent = root.try_clone().map_err(|error| format!("clone materialization symlink root: {error}"))?;
+    for component in components {
+        parent = open_at(parent.as_raw_fd(), OsStr::new(component), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .map_err(|error| format!("open materialized symlink parent {relative}: {error}"))?;
+    }
+    let file_name = CString::new(file_name.as_bytes()).map_err(|_| "NUL in materialization symlink path".to_string())?;
+    let target = CString::new(target.as_bytes()).map_err(|_| format!("NUL in materialization symlink target: {relative}"))?;
+    if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), file_name.as_ptr()) } != 0 {
+        return Err(format!("create materialized symlink {relative}: {}", io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 fn open_relative_file(root: &File, relative: &str, flags: i32) -> Result<File, String> {
     let mut components = relative.split('/').collect::<Vec<_>>();
     let file_name = components.pop().ok_or_else(|| "empty snapshot content path".to_string())?;
@@ -995,6 +1148,8 @@ struct StoredEntry {
     mode: u16,
     size: u64,
     content_digest: Option<[u8; 32]>,
+    #[serde(default)]
+    symlink_target: Option<String>,
 }
 
 impl StoredSnapshot {
@@ -1009,6 +1164,7 @@ impl StoredSnapshot {
                     mode: entry.mode,
                     size: entry.size,
                     content_digest: entry.content_digest,
+                    symlink_target: entry.symlink_target.clone(),
                 })
                 .collect(),
             total_file_bytes,
@@ -1030,24 +1186,44 @@ impl StoredSnapshot {
                     return Err("snapshot manifest entries are not strictly ordered".to_string());
                 }
                 previous_path = Some(path.as_str().to_string());
-                if matches!(entry.kind, SnapshotEntryKind::Directory) && (entry.size != 0 || entry.content_digest.is_some()) {
-                    return Err("invalid directory snapshot entry".to_string());
-                }
-                if matches!(entry.kind, SnapshotEntryKind::RegularFile) && entry.content_digest.is_none() {
-                    return Err("invalid regular-file snapshot entry".to_string());
-                }
-                if matches!(entry.kind, SnapshotEntryKind::RegularFile) {
-                    if entry.size > MAX_SNAPSHOT_FILE_BYTES {
-                        return Err("stored snapshot file exceeds maximum size".to_string());
+                match entry.kind {
+                    SnapshotEntryKind::Directory => {
+                        if entry.size != 0 || entry.content_digest.is_some() || entry.symlink_target.is_some() {
+                            return Err("invalid directory snapshot entry".to_string());
+                        }
                     }
-                    total_file_bytes = total_file_bytes.checked_add(entry.size).ok_or_else(|| "snapshot manifest size overflow".to_string())?;
-                    if total_file_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
-                        return Err("stored snapshot exceeds maximum total size".to_string());
+                    SnapshotEntryKind::RegularFile => {
+                        if entry.content_digest.is_none() || entry.symlink_target.is_some() {
+                            return Err("invalid regular-file snapshot entry".to_string());
+                        }
+                        if entry.size > MAX_SNAPSHOT_FILE_BYTES {
+                            return Err("stored snapshot file exceeds maximum size".to_string());
+                        }
+                        total_file_bytes = total_file_bytes.checked_add(entry.size).ok_or_else(|| "snapshot manifest size overflow".to_string())?;
+                        if total_file_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
+                            return Err("stored snapshot exceeds maximum total size".to_string());
+                        }
+                    }
+                    SnapshotEntryKind::Symlink => {
+                        let target = entry.symlink_target.as_deref().ok_or_else(|| "invalid symlink snapshot entry".to_string())?;
+                        if entry.size != 0 || entry.content_digest.is_some() {
+                            return Err("invalid symlink snapshot entry".to_string());
+                        }
+                        validate_symlink_target_syntax(target, MAX_SNAPSHOT_PATH_BYTES, MAX_SNAPSHOT_COMPONENT_BYTES, MAX_SNAPSHOT_DEPTH)?;
                     }
                 }
-                Ok(SnapshotEntry { path, kind: entry.kind, mode: entry.mode & 0o777, size: entry.size, content_digest: entry.content_digest })
+                Ok(SnapshotEntry {
+                    path,
+                    kind: entry.kind,
+                    mode: entry.mode & 0o777,
+                    size: entry.size,
+                    content_digest: entry.content_digest,
+                    symlink_target: entry.symlink_target,
+                })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        validate_snapshot_structure(&entries)?;
+        validate_snapshot_symlinks(&entries)?;
         if total_file_bytes != self.total_file_bytes {
             return Err("snapshot manifest total size mismatch".to_string());
         }
@@ -1061,6 +1237,7 @@ fn snapshot_id(entries: &[SnapshotEntry]) -> SnapshotId {
         canonical.push(match entry.kind {
             SnapshotEntryKind::Directory => 0,
             SnapshotEntryKind::RegularFile => 1,
+            SnapshotEntryKind::Symlink => 2,
         });
         canonical.extend_from_slice(&(entry.path.as_str().len() as u32).to_le_bytes());
         canonical.extend_from_slice(entry.path.as_str().as_bytes());
@@ -1068,6 +1245,10 @@ fn snapshot_id(entries: &[SnapshotEntry]) -> SnapshotId {
         canonical.extend_from_slice(&entry.size.to_le_bytes());
         if let Some(digest) = entry.content_digest {
             canonical.extend_from_slice(&digest);
+        }
+        if let Some(target) = entry.symlink_target() {
+            canonical.extend_from_slice(&(target.len() as u32).to_le_bytes());
+            canonical.extend_from_slice(target.as_bytes());
         }
     }
     SnapshotId(Sha256::digest(canonical).into())

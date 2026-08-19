@@ -3,6 +3,7 @@ use crate::storage::{ArtifactSpool, UploadStore, UploadTransaction};
 use bunkerbox_worker_protocol::{
     WorkerErrorKind, WorkerMessage, WorkerOperation, WorkerRequestId, WorkerSessionId, WorkerUploadId, MAX_WORKER_CHUNK_BYTES,
     MAX_WORKER_ERROR_BYTES, WORKER_ARTIFACT_PROTOCOL_VERSION, WORKER_COMMAND_PROTOCOL_VERSION, WORKER_PROTOCOL_VERSION,
+    WORKER_SYMLINK_PROTOCOL_VERSION,
 };
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
@@ -86,7 +87,11 @@ impl WorkerService {
         if version != hello_version {
             return Err("worker Hello version does not match frame version".to_string());
         }
-        if version != WORKER_PROTOCOL_VERSION && version != WORKER_ARTIFACT_PROTOCOL_VERSION && version != WORKER_COMMAND_PROTOCOL_VERSION {
+        if version != WORKER_PROTOCOL_VERSION
+            && version != WORKER_ARTIFACT_PROTOCOL_VERSION
+            && version != WORKER_COMMAND_PROTOCOL_VERSION
+            && version != WORKER_SYMLINK_PROTOCOL_VERSION
+        {
             return Err(format!("unsupported worker protocol version: {version}"));
         }
         if session_id.0 == [0; 16] {

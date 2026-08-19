@@ -38,6 +38,14 @@ fn entries(contents: &[u8]) -> Vec<WorkerUploadEntry> {
     ]
 }
 
+fn symlink_entries() -> Vec<WorkerUploadEntry> {
+    vec![
+        WorkerUploadEntry::directory("src", 0o755).unwrap(),
+        WorkerUploadEntry::symlink("src/link", 0o777, "../target").unwrap(),
+        WorkerUploadEntry::directory("target", 0o755).unwrap(),
+    ]
+}
+
 #[test]
 fn completed_upload_is_reopened_and_materialized_by_opaque_identity() {
     let (_temp, store) = store_fixture();
@@ -56,6 +64,43 @@ fn completed_upload_is_reopened_and_materialized_by_opaque_identity() {
     (&file).read_to_end(&mut actual).unwrap();
     assert_eq!(actual, contents);
     assert!(store.open_completed(WorkerSessionId([9; 16]), UPLOAD).is_err());
+}
+
+#[test]
+fn completed_upload_recreates_relative_symlinks_without_file_contents() {
+    let (_temp, store) = store_fixture();
+    let mut transaction = store.begin(SESSION, UPLOAD, symlink_entries()).unwrap();
+    transaction.commit().unwrap();
+    drop(transaction);
+
+    let stored = store.open_completed(SESSION, UPLOAD).unwrap();
+    let jobs = store.jobs_directory().unwrap();
+    let job = JobWorkspace::create(&jobs).unwrap();
+    stored.materialize(job.root()).unwrap();
+
+    let link = open_relative_file(job.root(), "src/link");
+    assert!(link.is_err());
+    let src = platform::open_dir_at(job.root(), "src").unwrap();
+    let metadata = platform::stat_at(&src, "link").unwrap();
+    assert_eq!(metadata.st_mode & libc::S_IFMT, libc::S_IFLNK);
+}
+
+#[test]
+fn worker_materialization_rejects_replaced_symlink_parent() {
+    let (temp, store) = store_fixture();
+    let mut transaction = store.begin(SESSION, UPLOAD, symlink_entries()).unwrap();
+    transaction.commit().unwrap();
+    drop(transaction);
+
+    let stored = store.open_completed(SESSION, UPLOAD).unwrap();
+    let jobs = store.jobs_directory().unwrap();
+    let job = JobWorkspace::create(&jobs).unwrap();
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    platform::create_symlink_at(job.root(), "src", outside.to_str().unwrap()).unwrap();
+
+    assert!(stored.materialize(job.root()).is_err());
+    assert!(!outside.join("link").exists());
 }
 
 #[test]

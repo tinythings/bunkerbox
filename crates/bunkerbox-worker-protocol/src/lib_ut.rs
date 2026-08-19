@@ -212,6 +212,34 @@ fn manifests_require_sorted_paths_and_valid_metadata() {
 }
 
 #[test]
+fn symlink_entries_round_trip_only_in_the_symlink_protocol() {
+    let (request_id, session_id, upload_id) = ids();
+    let message = WorkerMessage::UploadBegin {
+        request_id,
+        session_id,
+        upload_id,
+        entries: vec![
+            WorkerUploadEntry::directory("src", 0o755).unwrap(),
+            WorkerUploadEntry::symlink("src/link", 0o777, "../target").unwrap(),
+            WorkerUploadEntry::directory("target", 0o755).unwrap(),
+        ],
+    };
+
+    assert!(message.encode_version(WORKER_COMMAND_PROTOCOL_VERSION).is_err());
+    let frame = message.encode_version(WORKER_SYMLINK_PROTOCOL_VERSION).unwrap();
+    let (version, decoded) = WorkerMessage::decode_versioned(&frame).unwrap();
+    assert_eq!(version, WORKER_SYMLINK_PROTOCOL_VERSION);
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn symlink_targets_cannot_be_absolute_or_escape() {
+    assert!(WorkerUploadEntry::symlink("link", 0o777, "/etc").is_err());
+    assert!(WorkerUploadEntry::symlink("src/link", 0o777, "../../outside").is_err());
+    assert!(WorkerUploadEntry::symlink("link", 0o777, "").is_err());
+}
+
+#[test]
 fn duplicate_environment_keys_and_bad_argv_are_rejected() {
     assert!(WorkerBuild::new(
         "make",

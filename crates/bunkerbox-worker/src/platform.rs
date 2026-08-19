@@ -77,6 +77,15 @@ pub fn create_dir_at(parent: &File, name: &str, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+pub fn create_symlink_at(parent: &File, name: &str, target: &str) -> io::Result<()> {
+    let name = c_string(name)?;
+    let target = c_string(target)?;
+    if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub fn chmod_fd(file: &File, mode: u32) -> io::Result<()> {
     if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
         return Err(io::Error::last_os_error());

@@ -158,13 +158,14 @@ where
     let Ok((_, first)) = worker_protocol::read_message_versioned(&mut reader).await else { return 72 };
     messages.lock().unwrap().push(first.clone());
     if matches!(mode, ScriptMode::ProtocolError) {
-        worker_protocol::write_message(
+        worker_protocol::write_message_versioned(
             &mut writer,
             &WorkerMessage::error(request_id, session_id, WorkerOperation::Upload, WorkerErrorKind::WorkerProtocol, "scripted protocol failure"),
+            hello_version,
         )
         .await
         .unwrap();
-        while worker_protocol::read_message(&mut reader).await.is_ok() {}
+        while worker_protocol::read_message_versioned(&mut reader).await.is_ok() {}
         return 0;
     }
     match first {

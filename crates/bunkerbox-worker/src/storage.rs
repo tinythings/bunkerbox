@@ -21,7 +21,7 @@ const LOCK_FILE: &str = "lock";
 const FILES_DIRECTORY: &str = "files";
 const QUOTA_LOCK_FILE: &str = "quota.lock";
 const MANIFEST_MAGIC: [u8; 4] = *b"BBWM";
-const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_VERSION: u16 = 2;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_STALE_SESSIONS: usize = 64;
 const MAX_STALE_UPLOADS_PER_SESSION: usize = 256;
@@ -511,6 +511,7 @@ impl UploadTransaction {
                         },
                     );
                 }
+                WorkerEntryKind::Symlink => {}
             }
         }
         platform::sync_fd(&self.files).map_err(|error| format!("flush worker upload files: {error}"))?;
@@ -603,6 +604,10 @@ impl StoredUpload {
                     validate_regular_file(&source_metadata, entry.size(), entry.mode(), entry.path().as_str())?;
                     let target = create_relative_file(destination, entry.path().as_str(), entry.mode())?;
                     copy_and_verify_with_interrupt(&source, &target, entry, disconnected)?;
+                }
+                WorkerEntryKind::Symlink => {
+                    let target = entry.symlink_target().ok_or_else(|| "worker symlink entry has no target".to_string())?;
+                    create_relative_symlink(destination, entry.path().as_str(), target)?;
                 }
             }
         }
@@ -782,6 +787,13 @@ impl StoredManifest {
                 }
                 None => bytes.push(0),
             }
+            match entry.symlink_target() {
+                Some(target) => {
+                    bytes.push(1);
+                    put_string(&mut bytes, target)?;
+                }
+                None => bytes.push(0),
+            }
             if bytes.len() > MAX_WORKER_MANIFEST_BYTES {
                 return Err("worker stored manifest exceeds maximum length".to_string());
             }
@@ -812,7 +824,12 @@ impl StoredManifest {
                 1 => Some(reader.array32()?),
                 _ => return Err("worker stored manifest has invalid digest flag".to_string()),
             };
-            entries.push(WorkerUploadEntry::new(path, kind, mode, size, digest).map_err(protocol_error)?);
+            let symlink_target = match reader.u8()? {
+                0 => None,
+                1 => Some(reader.string()?),
+                _ => return Err("worker stored manifest has invalid symlink target flag".to_string()),
+            };
+            entries.push(WorkerUploadEntry::new_with_target(path, kind, mode, size, digest, symlink_target).map_err(protocol_error)?);
         }
         reader.finish()?;
         validate_upload_manifest(&entries).map_err(protocol_error)?;
@@ -986,6 +1003,13 @@ fn create_relative_file(root: &File, relative: &str, mode: u32) -> Result<File, 
     Ok(file)
 }
 
+fn create_relative_symlink(root: &File, relative: &str, target: &str) -> Result<(), String> {
+    let components = components(relative)?;
+    let (file_name, parents) = components.split_last().ok_or_else(|| "worker symlink path is empty".to_string())?;
+    let parent = open_relative_directory_components(root, parents)?;
+    platform::create_symlink_at(&parent, file_name, target).map_err(|error| format!("create worker symlink {relative}: {error}"))
+}
+
 fn open_relative_file(root: &File, relative: &str) -> Result<File, String> {
     let components = components(relative)?;
     let (file_name, parents) = components.split_last().ok_or_else(|| "worker file path is empty".to_string())?;
@@ -1023,8 +1047,8 @@ fn validate_manifest_structure(entries: &[WorkerUploadEntry]) -> Result<(), Stri
                 prefix.push('/');
             }
             prefix.push_str(component);
-            if matches!(kinds.get(prefix.as_str()), Some(WorkerEntryKind::File)) {
-                return Err(format!("worker manifest path collides with a file: {}", entry.path().as_str()));
+            if matches!(kinds.get(prefix.as_str()), Some(kind) if *kind != WorkerEntryKind::Directory) {
+                return Err(format!("worker manifest path collides with a non-directory: {}", entry.path().as_str()));
             }
         }
     }

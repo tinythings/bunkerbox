@@ -9,7 +9,7 @@ use crate::snapshot::SnapshotEntryKind;
 use crate::worker_protocol::{
     self, WorkerArtifactEntry, WorkerArtifactPath, WorkerArtifactSetId, WorkerBuild, WorkerErrorKind, WorkerMessage, WorkerOperation,
     WorkerRelativePath, WorkerRequestId, WorkerSessionId, WorkerUploadEntry, WorkerUploadId, MAX_WORKER_CHUNK_BYTES, MAX_WORKER_FILE_BYTES,
-    WORKER_ARTIFACT_PROTOCOL_VERSION, WORKER_COMMAND_PROTOCOL_VERSION, WORKER_PROTOCOL_VERSION,
+    WORKER_ARTIFACT_PROTOCOL_VERSION, WORKER_COMMAND_PROTOCOL_VERSION, WORKER_PROTOCOL_VERSION, WORKER_SYMLINK_PROTOCOL_VERSION,
 };
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -28,13 +28,14 @@ const MAX_SSH_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn build_protocol_version(target: &SshTarget, artifacts: bool) -> u16 {
-    if target.compact_destination() {
+    let version = if target.compact_destination() {
         WORKER_COMMAND_PROTOCOL_VERSION
     } else if artifacts {
         WORKER_ARTIFACT_PROTOCOL_VERSION
     } else {
         WORKER_PROTOCOL_VERSION
-    }
+    };
+    version.max(WORKER_SYMLINK_PROTOCOL_VERSION)
 }
 
 type WorkerReader = Box<dyn AsyncRead + Send + Unpin>;
@@ -371,7 +372,7 @@ impl SshExecution {
         let mut connection = match phase(
             async {
                 let mut connection = WorkerConnection::spawn(&self.factory, &self.target)?;
-                connection.handshake(WorkerRequestId(request_id), session_id_for(&self.session), WORKER_PROTOCOL_VERSION).await?;
+                connection.handshake(WorkerRequestId(request_id), session_id_for(&self.session), build_protocol_version(&self.target, false)).await?;
                 Ok(connection)
             },
             remaining(sync_deadline).min(self.target.resources().connect_timeout()),
@@ -1085,6 +1086,12 @@ fn worker_entry(entry: &crate::snapshot::SnapshotEntry) -> Result<WorkerUploadEn
             *entry.content_digest().ok_or_else(|| worker_protocol("regular snapshot entry has no digest"))?,
         )
         .map_err(worker_io_error),
+        SnapshotEntryKind::Symlink => WorkerUploadEntry::symlink(
+            entry.path().as_str(),
+            entry.mode() as u32,
+            entry.symlink_target().ok_or_else(|| worker_protocol("symlink snapshot entry has no target"))?,
+        )
+        .map_err(worker_io_error),
     }
 }
 
@@ -1093,7 +1100,7 @@ fn preflight_upload(
 ) -> Result<(), RemoteBackendError> {
     worker_protocol::validate_upload_manifest(entries).map_err(|error| upload_preflight_error(error.to_string()))?;
     WorkerMessage::UploadBegin { request_id: WorkerRequestId(request_id), session_id, upload_id, entries: entries.to_vec() }
-        .encode()
+        .encode_version(WORKER_SYMLINK_PROTOCOL_VERSION)
         .map_err(|error| upload_preflight_error(error.to_string()))?;
     Ok(())
 }

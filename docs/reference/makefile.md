@@ -22,6 +22,38 @@ make check
 
 It formats the code and runs lint checks.
 
+## mxrun Builds
+
+Development, release, and testing targets use the local mxrun target when mxrun
+is enabled:
+
+```sh
+make mxrun-init
+make dev
+make release
+make test
+```
+
+The integration test target is delegated in the same way:
+
+```sh
+make integration-test
+```
+
+Use these targets to control delegation:
+
+```sh
+make mxrun
+make set-local-builds
+make set-remote-builds
+```
+
+Extra mxrun command-line options can be passed with `MXRUN_ARGS`:
+
+```sh
+MXRUN_ARGS="--mirror-results" make test
+```
+
 ## Setup
 
 Use this to prepare the host runtime pieces needed by Bunkerbox:

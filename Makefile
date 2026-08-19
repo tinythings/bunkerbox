@@ -10,9 +10,6 @@ IMAGE ?=
 OCI ?=
 MXRUN_BIN ?= mxrun
 MXRUN_ARGS ?=
-MX_ACTIVE := $(shell awk -F= '/^active=/ {print $$2}' .mxrun-env 2>/dev/null)
-export MXRUN_ARGS
-export MXRUN_BIN
 C_TITLE := \033[1;38;2;215;0;175m
 C_COMMAND := \033[38;2;175;255;215m
 C_DESCRIPTION := \033[38;2;128;128;128m
@@ -64,7 +61,7 @@ help:
 	@printf '  $(C_COMMAND)%-20s$(C_OFF) $(C_DESCRIPTION)%s$(C_OFF)\n' "set-local-builds" "Disable mxrun delegation"
 	@printf '  $(C_COMMAND)%-20s$(C_OFF) $(C_DESCRIPTION)%s$(C_OFF)\n' "set-remote-builds" "Enable mxrun delegation"
 	@printf '\n'
-	@if [ "$(MX_ACTIVE)" = "yes" ]; then \
+	@if [ "$$(awk -F= '/^active=/ {print $$2}' .mxrun-env 2>/dev/null)" = "yes" ]; then \
 		printf "$(C_OFF)mxrun enabled; builds use the configured target matrix.$(C_OFF)\n"; \
 	else \
 		printf "$(C_OFF)mxrun disabled; builds run through local targets.$(C_OFF)\n"; \
@@ -76,7 +73,7 @@ ensure-toolchain:
 	rustup target add $(VSCOMM_TARGET)
 
 dev:
-	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _dev; else scripts/maybe-mxrun.sh dev || $(MAKE) _dev; fi
+	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _dev; else MXRUN_BIN="$(MXRUN_BIN)" MXRUN_ARGS="$(MXRUN_ARGS)" scripts/maybe-mxrun.sh dev || $(MAKE) _dev; fi
 
 _dev: ensure-toolchain
 	cargo build --bin bunkerbox --bin bunkerbox-image
@@ -94,13 +91,13 @@ _dev: ensure-toolchain
 	cp target/$(VSCOMM_TARGET)/debug/bunkerbox-netrelay target/debug/bunkerbox-netrelay
 
 worker-dev:
-	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _worker-dev; else scripts/maybe-mxrun.sh worker-dev || $(MAKE) _worker-dev; fi
+	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _worker-dev; else MXRUN_BIN="$(MXRUN_BIN)" MXRUN_ARGS="$(MXRUN_ARGS)" scripts/maybe-mxrun.sh worker-dev || $(MAKE) _worker-dev; fi
 
 _worker-dev:
-	cargo build -p bunkerbox-worker
+	scripts/worker.sh worker-dev
 
 release:
-	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _release; else scripts/maybe-mxrun.sh release || $(MAKE) _release; fi
+	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _release; else MXRUN_BIN="$(MXRUN_BIN)" MXRUN_ARGS="$(MXRUN_ARGS)" scripts/maybe-mxrun.sh release || $(MAKE) _release; fi
 
 _release: ensure-toolchain
 	cargo build --bin bunkerbox --bin bunkerbox-image --release
@@ -117,42 +114,42 @@ _release: ensure-toolchain
 	cp target/$(VSCOMM_TARGET)/release/bunkerbox-netrelay target/release/bunkerbox-netrelay
 
 worker:
-	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _worker; else scripts/maybe-mxrun.sh worker || $(MAKE) _worker; fi
+	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _worker; else MXRUN_BIN="$(MXRUN_BIN)" MXRUN_ARGS="$(MXRUN_ARGS)" scripts/maybe-mxrun.sh worker || $(MAKE) _worker; fi
 
 _worker:
-	cargo build -p bunkerbox-worker --release
+	scripts/worker.sh worker
 
 check:
-	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _check; else scripts/maybe-mxrun.sh check || $(MAKE) _check; fi
+	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _check; else MXRUN_BIN="$(MXRUN_BIN)" MXRUN_ARGS="$(MXRUN_ARGS)" scripts/maybe-mxrun.sh check || $(MAKE) _check; fi
 
 _check:
 	cargo fmt --all
 	cargo clippy --all-targets --all-features -- -D warnings || cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
 
 test:
-	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _test; else scripts/maybe-mxrun.sh test || $(MAKE) _test; fi
+	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _test; else MXRUN_BIN="$(MXRUN_BIN)" MXRUN_ARGS="$(MXRUN_ARGS)" scripts/maybe-mxrun.sh test || $(MAKE) _test; fi
 
 _test:
 	cargo nextest run
 
 integration-test:
-	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _integration-test; else scripts/maybe-mxrun.sh integration-test || $(MAKE) _integration-test; fi
+	@if [ -n "$$SSH_CONNECTION" ]; then $(MAKE) _integration-test; else MXRUN_BIN="$(MXRUN_BIN)" MXRUN_ARGS="$(MXRUN_ARGS)" scripts/maybe-mxrun.sh integration-test || $(MAKE) _integration-test; fi
 
 _integration-test: _dev
 	cargo nextest run --test test_base --test test_sandbox
 
 mxrun-toggle:
 	@if [ -f .mxrun-env ] && grep -q '^active=yes' .mxrun-env 2>/dev/null; then \
-		sh scripts/mxrun-set-local.sh; \
+		MXRUN_BIN="$(MXRUN_BIN)" sh scripts/mxrun-set-local.sh; \
 	else \
-		sh scripts/mxrun-set-remote.sh; \
+		MXRUN_BIN="$(MXRUN_BIN)" sh scripts/mxrun-set-remote.sh; \
 	fi
 
 set-local-builds:
-	sh scripts/mxrun-set-local.sh
+	MXRUN_BIN="$(MXRUN_BIN)" sh scripts/mxrun-set-local.sh
 
 set-remote-builds:
-	sh scripts/mxrun-set-remote.sh
+	MXRUN_BIN="$(MXRUN_BIN)" sh scripts/mxrun-set-remote.sh
 
 mxrun-init:
 	@command -v $(MXRUN_BIN) >/dev/null 2>&1 || { echo "Missing $(MXRUN_BIN). Install it first." >&2; exit 1; }

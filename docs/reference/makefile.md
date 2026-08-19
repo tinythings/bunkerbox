@@ -45,6 +45,12 @@ The remote worker target must be present in `remote-mxrun.conf`; these targets
 do not build the host binaries.
 The worker dispatch selects it with mxrun's `--config remote-mxrun.conf`
 command-line option.
+Once `make worker-dev` or `make worker` runs on a target, the Makefile detects
+that target's `uname -s` and `uname -m` values and dispatches to the matching
+`scripts/<platform>.sh` worker toolchain script.
+The platform script provisions Rust under the invoking user's home directory
+when needed. It does not use `sudo`; missing system prerequisites produce an
+explicit root-required error.
 
 The integration test target is delegated in the same way:
 

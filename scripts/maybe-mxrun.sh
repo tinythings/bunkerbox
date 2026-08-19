@@ -14,9 +14,9 @@ ACTIVE=no
 if [ "$ACTIVE" = "yes" ] && [ -f mxrun.conf ]; then
 	command -v "${MXRUN_BIN:-mxrun}" >/dev/null 2>&1 || { echo "Missing ${MXRUN_BIN:-mxrun} binary. Install it first." >&2; exit 1; }
 	case "$ENTRY" in
-		dev|check)
+		dev|worker-dev|check)
 			LABEL="Development Build Mode" ;;
-		release)
+		release|worker)
 			LABEL="Release Build Mode" ;;
 		test)
 			LABEL="Testing Everything" ;;
@@ -26,7 +26,12 @@ if [ "$ACTIVE" = "yes" ] && [ -f mxrun.conf ]; then
 			LABEL="Bunkerbox Build" ;;
 	esac
 	# shellcheck disable=SC2086
-	MXRUN_CONFIG=mxrun.conf "${MXRUN_BIN:-mxrun}" run --label="$LABEL" ${MXRUN_ARGS:-} "$ENTRY" || true
+	case "$ENTRY" in
+		worker-dev|worker)
+			"${MXRUN_BIN:-mxrun}" --config remote-mxrun.conf run --label="$LABEL" ${MXRUN_ARGS:-} "$ENTRY" || true ;;
+		*)
+			MXRUN_CONFIG=mxrun.conf "${MXRUN_BIN:-mxrun}" run --label="$LABEL" ${MXRUN_ARGS:-} "$ENTRY" || true ;;
+	esac
 	# mxrun handled the request or was interrupted; do not fall through locally.
 	exit 0
 fi

@@ -34,6 +34,18 @@ make release
 make test
 ```
 
+Remote worker-only builds use the same mxrun dispatch:
+
+```sh
+make worker-dev
+make worker
+```
+
+The remote worker target must be present in `remote-mxrun.conf`; these targets
+do not build the host binaries.
+The worker dispatch selects it with mxrun's `--config remote-mxrun.conf`
+command-line option.
+
 The integration test target is delegated in the same way:
 
 ```sh

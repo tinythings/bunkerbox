@@ -195,6 +195,7 @@ version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "base64",
+ "bunkerbox-worker-protocol",
  "clap",
  "colored",
  "crossterm 0.28.1",
@@ -212,6 +213,23 @@ dependencies = [
  "tokio",
  "tokio-vsock",
  "vt100",
+]
+
+[[package]]
+name = "bunkerbox-worker"
+version = "0.1.0"
+dependencies = [
+ "bunkerbox-worker-protocol",
+ "libc",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "bunkerbox-worker-protocol"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

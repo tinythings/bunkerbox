@@ -22,6 +22,56 @@ make check
 
 It formats the code and runs lint checks.
 
+## mxrun Builds
+
+Development, release, and testing targets use the local mxrun target when mxrun
+is enabled:
+
+```sh
+make mxrun-init
+make dev
+make release
+make test
+```
+
+Remote worker-only builds use the same mxrun dispatch:
+
+```sh
+make worker-dev
+make worker
+```
+
+The remote worker target must be present in `remote-mxrun.conf`; these targets
+do not build the host binaries.
+The worker dispatch selects it with mxrun's `--config remote-mxrun.conf`
+command-line option.
+Once `make worker-dev` or `make worker` runs on a target, the Makefile detects
+that target's `uname -s` and `uname -m` values and dispatches to the matching
+`scripts/<platform>.sh` worker toolchain script.
+The platform script provisions Rust under the invoking user's home directory
+when needed. It does not use `sudo`; missing system prerequisites produce an
+explicit root-required error.
+
+The integration test target is delegated in the same way:
+
+```sh
+make integration-test
+```
+
+Use these targets to control delegation:
+
+```sh
+make mxrun
+make set-local-builds
+make set-remote-builds
+```
+
+Extra mxrun command-line options can be passed with `MXRUN_ARGS`:
+
+```sh
+MXRUN_ARGS="--mirror-results" make test
+```
+
 ## Setup
 
 Use this to prepare the host runtime pieces needed by Bunkerbox:

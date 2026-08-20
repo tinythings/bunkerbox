@@ -93,6 +93,9 @@ impl PopupWidget {
 
     pub fn hide(&mut self) {
         self.visible = false;
+        if matches!(&self.content, PopupContent::Password { .. }) {
+            self.content = PopupContent::Info { title: None, message: String::new(), fg: palette::FG };
+        }
     }
 
     pub fn handle_password_key(&mut self, key: &crossterm::event::KeyEvent) {

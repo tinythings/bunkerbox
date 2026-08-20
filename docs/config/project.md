@@ -184,6 +184,41 @@ If your project has both a `Cargo.toml` and a `Makefile`, both show up.
 Detection only runs when the list is empty — once you've added a command,
 you're in full control.
 
+### `remote`
+
+The optional `remote` section controls transparent remote wrappers. It is
+host-owned policy; it does not give the guest permission to choose a target.
+
+```yaml
+project:
+  remote:
+    exclude: [target/]
+    environment: [CC, CXX]
+    tools:
+      - name: make
+        allow-args: true
+      - name: cargo
+        allow-args: true
+    artifacts: [build/app]
+```
+
+`environment`, `tools`, and `artifacts` are validated allowlists. Artifact
+paths are normalized workspace-relative paths and never come from a guest
+request. `command` is an optional basename-only target override, such as
+`make` to `gmake`; absolute paths and shell strings are rejected.
+
+Remote targets are declared separately in `.bunkerbox/remote.conf`. If that
+file is absent, Bunkerbox starts with the implicit `localhost` target only.
+The host TUI starts on `localhost`; use `Ctrl+Alt+B` to select a remote target
+or `Ctrl+Alt+S` to open the host-owned Remote Setup forms. Setup can edit the
+target label, compact SSH destination, workspace, remote tools, environment
+names, snapshot exclusions, artifact paths, and resource limits. Save writes
+`.bunkerbox/remote.conf` atomically and applies changes on the next Bunkerbox
+run only. It does not probe SSH or test a connection. A malformed existing
+configuration is shown as an error and is never silently overwritten.
+The guest and AI have no target-selection command, and a remote failure never
+falls back to local execution.
+
 ## Legacy migration
 
 Older versions of Bunkerbox used `.bunkerbox/env.conf` with a flat structure.

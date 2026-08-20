@@ -1,0 +1,14 @@
+[package]
+name = "bunkerbox-worker-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["async"]
+async = ["dep:tokio"]
+
+[dependencies]
+tokio = { version = "1", features = ["io-util"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }

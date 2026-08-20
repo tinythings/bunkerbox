@@ -45,6 +45,48 @@ fn load_or_create_loads_existing_config() {
     assert_eq!(cfg.project.exclude, vec!["build/", "logs/"]);
 }
 
+#[test]
+fn load_or_create_parses_remote_exclusions() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(root.path(), "project:\n  remote:\n    exclude:\n      - .tmp\n      - docs/generated\n");
+
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+
+    assert_eq!(cfg.project.remote.exclude, vec![".tmp", "docs/generated"]);
+}
+
+#[test]
+fn remote_exclusions_default_to_empty() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(root.path(), "project:\n  remote:\n    exclude: []\n");
+
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+
+    assert!(cfg.project.remote.exclude.is_empty());
+    assert!(ProjectConfig::default().project.remote.exclude.is_empty());
+}
+
+#[test]
+fn load_or_create_rejects_invalid_remote_exclusions() {
+    for exclusion in ["/absolute", "foo/../bar"] {
+        let root = TempDir::new().unwrap();
+        write_project_conf(root.path(), &format!("project:\n  remote:\n    exclude:\n      - \"{exclusion}\"\n"));
+
+        assert!(ProjectConfig::load_or_create(root.path()).is_err(), "{exclusion}");
+    }
+}
+
+#[test]
+fn remote_exclusions_do_not_change_general_workspace_exclusions() {
+    let cfg = ProjectConfig {
+        project: ProjectSection { remote: RemoteSection { exclude: vec![".tmp".into()], ..Default::default() }, ..Default::default() },
+        ..Default::default()
+    };
+
+    assert!(cfg.project.exclude.is_empty());
+    assert!(!cfg.effective_exclude(None).iter().any(|pattern| pattern.trim_end_matches('/') == ".tmp"));
+}
+
 /// Invalid YAML in project.conf produces an error.
 #[test]
 fn load_or_create_invalid_yaml_is_error() {
@@ -486,4 +528,92 @@ fn load_or_create_accepts_paranoid_exact() {
     let root = TempDir::new().unwrap();
     write_project_conf(root.path(), "project:\n  env: paranoid\n  passthrough:\n    - \"make\"\n    - \"cargo\"\n");
     assert!(ProjectConfig::load_or_create(root.path()).is_ok());
+}
+
+#[test]
+fn load_or_create_validates_remote_policy_configuration() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(
+        root.path(),
+        "project:\n  remote:\n    environment:\n      - PROJECT_MODE\n    tools:\n      - name: make\n        allow-args: false\n",
+    );
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+    assert_eq!(cfg.project.remote.environment, vec!["PROJECT_MODE"]);
+    assert_eq!(cfg.project.remote.tools, vec![RemoteToolSpec { name: "make".into(), command: None, allow_args: false }]);
+
+    write_project_conf(root.path(), "project:\n  remote:\n    tools:\n      - name: cargo\n        allow-args: true\n");
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+    assert_eq!(cfg.project.remote.tools, vec![RemoteToolSpec { name: "cargo".into(), command: None, allow_args: true }]);
+
+    write_project_conf(root.path(), "project:\n  remote:\n    tools:\n      - name: make\n        command: gmake\n        allow-args: true\n");
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+    assert_eq!(cfg.project.remote.tools[0].command.as_deref(), Some("gmake"));
+    write_project_conf(
+        root.path(),
+        "project:\n  remote:\n    tools:\n      - name: make\n        command: /usr/bin/make\n        allow-args: true\n",
+    );
+    assert!(ProjectConfig::load_or_create(root.path()).is_err());
+}
+
+#[test]
+fn load_or_create_accepts_arbitrary_remote_tool_names_but_rejects_control_names() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(
+        root.path(),
+        "project:\n  remote:\n    tools:\n      - name: build-my-car\n        allow-args: true\n      - name: ninja+debug\n        allow-args: false\n",
+    );
+    let cfg = ProjectConfig::load_or_create(root.path()).unwrap();
+    assert_eq!(cfg.project.remote.tools.len(), 2);
+
+    for name in ["bunkerbox", "bunkerbox-remote", ".bunkerbox-remote-tools"] {
+        write_project_conf(root.path(), &format!("project:\n  remote:\n    tools:\n      - name: {name}\n        allow-args: true\n"));
+        assert!(ProjectConfig::load_or_create(root.path()).is_err(), "accepted reserved remote tool: {name}");
+    }
+}
+
+#[test]
+fn load_or_create_rejects_forbidden_remote_environment() {
+    let root = TempDir::new().unwrap();
+    write_project_conf(root.path(), "project:\n  remote:\n    environment:\n      - SSH_AUTH_SOCK\n");
+    assert!(ProjectConfig::load_or_create(root.path()).is_err());
+}
+
+#[test]
+fn remote_global_active_build_limit_defaults_and_rejects_invalid_values() {
+    let config = RuntimeConfig {
+        oci: PathBuf::from("/usr/bin/oci"),
+        image: "image".into(),
+        network: None,
+        allow: None,
+        workspace: None,
+        workspace_quota: None,
+        workspace_exclude: None,
+        home: None,
+        home_path: None,
+        encrypt: None,
+        session_mb: None,
+        session_cleanup: None,
+        command: None,
+        remote_max_active_builds: None,
+    };
+    assert_eq!(config.remote_max_active_builds().unwrap(), 2);
+    for value in [Some(0), Some((crate::remote::RemoteAdmissionLimits::MAX + 1) as u64)] {
+        let config = RuntimeConfig {
+            oci: PathBuf::from("/usr/bin/oci"),
+            image: "image".into(),
+            network: None,
+            allow: None,
+            workspace: None,
+            workspace_quota: None,
+            workspace_exclude: None,
+            home: None,
+            home_path: None,
+            encrypt: None,
+            session_mb: None,
+            session_cleanup: None,
+            command: None,
+            remote_max_active_builds: value,
+        };
+        assert!(config.remote_max_active_builds().is_err());
+    }
 }

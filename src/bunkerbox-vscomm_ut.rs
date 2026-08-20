@@ -1,4 +1,56 @@
 use super::{handle_response, handle_response_to, Frame, FrameType};
+use bunkerbox::remote_client::{execute_remote_request_to, remote_build_request, remote_sync_request, RemoteCompletion};
+use bunkerbox::vscomm::{Frame as RemoteFrame, RemoteEvent, RemoteEventKind, RequestId, WorkspaceSessionId};
+use std::io::{self, Read, Write};
+
+struct MemoryStream {
+    input: io::Cursor<Vec<u8>>,
+    output: Vec<u8>,
+}
+
+struct FlushWriter {
+    bytes: Vec<u8>,
+    flushes: usize,
+}
+
+impl Write for FlushWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushes += 1;
+        Ok(())
+    }
+}
+
+impl MemoryStream {
+    fn new(frames: Vec<RemoteFrame>) -> Self {
+        let mut input = Vec::new();
+        for frame in frames {
+            frame.write(&mut input).unwrap();
+        }
+        Self { input: io::Cursor::new(input), output: Vec::new() }
+    }
+}
+
+impl Read for MemoryStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.input.read(buf)
+    }
+}
+
+impl Write for MemoryStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[test]
 fn forward_stdout_and_stderr_frames() {
@@ -14,4 +66,66 @@ fn forward_stdout_and_stderr_frames() {
 #[test]
 fn preserve_exit_status() {
     assert_eq!(handle_response(Frame::new(FrameType::Exit, (-17i32).to_le_bytes().to_vec())).unwrap(), Some(-17));
+}
+
+#[test]
+fn explicit_remote_client_preserves_streams_status_and_request_id() {
+    let request_id = RequestId([9; 16]);
+    let request = remote_build_request(
+        request_id,
+        WorkspaceSessionId([8; 16]),
+        "src",
+        "make",
+        vec!["release mode".into()],
+        vec![],
+        bunkerbox::remote::RemoteSnapshotId::from_bytes([9; 16]),
+    )
+    .unwrap();
+    let responses = vec![
+        RemoteEvent { request_id, kind: RemoteEventKind::Stdout(b"out".to_vec()) }.to_frame().unwrap(),
+        RemoteEvent { request_id, kind: RemoteEventKind::Stderr(b"err".to_vec()) }.to_frame().unwrap(),
+        RemoteEvent { request_id, kind: RemoteEventKind::Completed { exit_code: 23 } }.to_frame().unwrap(),
+    ];
+    let mut stream = MemoryStream::new(responses);
+    let mut stdout = FlushWriter { bytes: Vec::new(), flushes: 0 };
+    let mut stderr = FlushWriter { bytes: Vec::new(), flushes: 0 };
+
+    assert_eq!(execute_remote_request_to(&mut stream, request, &mut stdout, &mut stderr).unwrap(), RemoteCompletion::Completed(23));
+    assert_eq!(stdout.bytes, b"out");
+    assert_eq!(stderr.bytes, b"err");
+    assert_eq!(stdout.flushes, 1);
+    assert_eq!(stderr.flushes, 1);
+
+    let sent = RemoteFrame::read(&mut io::Cursor::new(stream.output)).unwrap();
+    let decoded = bunkerbox::vscomm::RemoteRequest::from_frame(sent).unwrap();
+    assert_eq!(decoded.request_id, request_id);
+    let bunkerbox::vscomm::RemoteOperation::Build(build) = decoded.operation else { panic!("expected build") };
+    assert_eq!(build.cwd.as_str(), "src");
+    assert_eq!(build.argv, ["release mode"]);
+}
+
+#[test]
+fn explicit_remote_client_returns_remote_failure_without_local_fallback() {
+    let request_id = RequestId([4; 16]);
+    let request = remote_sync_request(request_id, WorkspaceSessionId([5; 16]));
+    let response = RemoteEvent {
+        request_id,
+        kind: RemoteEventKind::Error { code: bunkerbox::vscomm::RemoteErrorCode::Failed, message: "backend unavailable".into() },
+    };
+    let mut stream = MemoryStream::new(vec![response.to_frame().unwrap()]);
+
+    let error = execute_remote_request_to(&mut stream, request, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+    assert_eq!(error, "backend unavailable");
+}
+
+#[test]
+fn explicit_remote_client_rejects_mismatched_request_id() {
+    let request_id = RequestId([4; 16]);
+    let response = RemoteEvent { request_id: RequestId([5; 16]), kind: RemoteEventKind::Completed { exit_code: 0 } };
+    let mut stream = MemoryStream::new(vec![response.to_frame().unwrap()]);
+
+    let error =
+        execute_remote_request_to(&mut stream, super::remote_sync_request(request_id, WorkspaceSessionId([5; 16])), &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
+    assert_eq!(error, "remote event request ID mismatch");
 }

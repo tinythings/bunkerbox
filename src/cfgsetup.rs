@@ -29,8 +29,11 @@ pub fn run(runtime: Option<&RuntimeConfig>) -> Result<(), String> {
     let profiles = pick_profiles(&detected_relaxed)?;
     let overrides = pick_overrides(runtime)?;
 
-    let cfg =
-        ProjectConfig { project: ProjectSection { env: env_mode, quota: Some(quota), exclude: Vec::new(), passthrough }, image: overrides, profiles };
+    let cfg = ProjectConfig {
+        project: ProjectSection { env: env_mode, quota: Some(quota), exclude: Vec::new(), passthrough, remote: Default::default() },
+        image: overrides,
+        profiles,
+    };
 
     let path = repo_root.join(ProjectConfig::PATH);
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("failed to create {}: {e}", path.parent().unwrap().display()))?;

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::remote::{validate_remote_wrapper_name, RemoteEnvironmentPolicy};
+use crate::snapshot::SnapshotExclusionPolicy;
 use crate::vscomm::buildsys::{self, PassthroughMode};
 
 pub const DEFAULT_SHARE_DIR: &str = "/usr/share/bunkerbox";
@@ -99,6 +101,8 @@ pub struct RuntimeConfig {
     pub session_cleanup: Option<Vec<String>>,
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub remote_max_active_builds: Option<u64>,
 }
 
 impl RuntimeConfig {
@@ -141,6 +145,15 @@ impl RuntimeConfig {
         self.session_mb.unwrap_or(50)
     }
 
+    pub fn remote_max_active_builds(&self) -> Result<usize, String> {
+        let value = self.remote_max_active_builds.unwrap_or(2);
+        let value = usize::try_from(value).map_err(|_| "remote_max_active_builds is too large".to_string())?;
+        if value == 0 || value > crate::remote::RemoteAdmissionLimits::MAX {
+            return Err(format!("remote_max_active_builds must be between 1 and {}", crate::remote::RemoteAdmissionLimits::MAX));
+        }
+        Ok(value)
+    }
+
     pub fn effective_session_cleanup(&self) -> Vec<String> {
         let user = self.session_cleanup.as_deref().unwrap_or(&[]);
         DEFAULT_SESSION_CLEANUP.iter().map(|s| s.to_string()).chain(user.iter().cloned()).collect()
@@ -176,7 +189,7 @@ pub struct AppliedRuntime {
     pub encrypt: Option<Vec<String>>,
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectConfig {
     #[serde(default)]
     pub project: ProjectSection,
@@ -186,7 +199,7 @@ pub struct ProjectConfig {
     pub profiles: Vec<String>,
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectSection {
     #[serde(default)]
     pub env: EnvMode,
@@ -196,9 +209,34 @@ pub struct ProjectSection {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub passthrough: Vec<String>,
+    #[serde(default)]
+    pub remote: RemoteSection,
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSection {
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub environment: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<RemoteToolSpec>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteToolSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, rename = "allow-args")]
+    pub allow_args: bool,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImageOverrides {
     #[serde(default)]
     pub workspace: Option<WorkspaceMode>,
@@ -238,6 +276,7 @@ impl ProjectConfig {
                 quota: Some("auto".into()),
                 exclude: Vec::new(),
                 passthrough: buildsys::scan(repo_root, PassthroughMode::Relaxed),
+                remote: RemoteSection::default(),
             },
             image: ImageOverrides::default(),
             profiles: Vec::new(),
@@ -258,6 +297,19 @@ impl ProjectConfig {
                 }
             }
         }
+        RemoteEnvironmentPolicy::from_names(self.project.remote.environment.clone())?;
+        SnapshotExclusionPolicy::from_patterns(self.project.remote.exclude.clone())?;
+        let mut tools = std::collections::BTreeSet::new();
+        for tool in &self.project.remote.tools {
+            validate_remote_wrapper_name(tool.name.clone())?;
+            if let Some(command) = &tool.command {
+                validate_remote_wrapper_name(command.clone())?;
+            }
+            if !tools.insert(tool.name.clone()) {
+                return Err(format!("duplicate remote tool: {}", tool.name));
+            }
+        }
+        crate::artifact::ArtifactPolicy::new(self.project.remote.artifacts.clone())?;
         Ok(())
     }
 
@@ -277,7 +329,13 @@ impl ProjectConfig {
                 .map_err(|e| format!("failed to parse legacy {}: {e}", legacy_path.display()))?;
 
         let cfg = ProjectConfig {
-            project: ProjectSection { env: EnvMode::default(), quota: old.quota, exclude: old.exclude, passthrough: old.passthrough },
+            project: ProjectSection {
+                env: EnvMode::default(),
+                quota: old.quota,
+                exclude: old.exclude,
+                passthrough: old.passthrough,
+                remote: RemoteSection::default(),
+            },
             image: ImageOverrides::default(),
             profiles: Vec::new(),
         };
@@ -345,6 +403,50 @@ impl ProjectConfig {
         } else {
             for cmd in pt {
                 y.push_str(&format!("    - \"{cmd}\"\n"));
+            }
+        }
+
+        if !self.project.remote.exclude.is_empty()
+            || !self.project.remote.environment.is_empty()
+            || !self.project.remote.tools.is_empty()
+            || !self.project.remote.artifacts.is_empty()
+        {
+            y.push_str("  remote:\n");
+            y.push_str("    exclude:\n");
+            if self.project.remote.exclude.is_empty() {
+                y.push_str("      []\n");
+            } else {
+                for pattern in &self.project.remote.exclude {
+                    y.push_str(&format!("      - {pattern}\n"));
+                }
+            }
+            y.push_str("    environment:\n");
+            if self.project.remote.environment.is_empty() {
+                y.push_str("      []\n");
+            } else {
+                for name in &self.project.remote.environment {
+                    y.push_str(&format!("      - \"{name}\"\n"));
+                }
+            }
+            y.push_str("    tools:\n");
+            if self.project.remote.tools.is_empty() {
+                y.push_str("      []\n");
+            } else {
+                for tool in &self.project.remote.tools {
+                    y.push_str(&format!("      - name: \"{}\"\n", tool.name));
+                    if let Some(command) = &tool.command {
+                        y.push_str(&format!("        command: \"{command}\"\n"));
+                    }
+                    y.push_str(&format!("        allow-args: {}\n", tool.allow_args));
+                }
+            }
+            y.push_str("    artifacts:\n");
+            if self.project.remote.artifacts.is_empty() {
+                y.push_str("      []\n");
+            } else {
+                for artifact in &self.project.remote.artifacts {
+                    y.push_str(&format!("      - \"{artifact}\"\n"));
+                }
             }
         }
 

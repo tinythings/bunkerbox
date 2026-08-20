@@ -1,15 +1,22 @@
+#[cfg(test)]
+use bunkerbox::cfg::RemoteToolSpec;
 use bunkerbox::cfg::{ProjectConfig, WorkspaceMode};
-use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, logging, overlay, tui, vscomm, workspace};
+use bunkerbox::{cfg, cfgsetup, clidef, cmdrun, daemon, kata, logging, loopback, overlay, remote_target, snapshot, tui, vscomm, workspace};
+use rand::RngCore;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const WORKSPACE_HANDOFF_MAGIC: &[u8; 4] = b"WS01";
+const STARTUP_READY_MAGIC: &[u8; 4] = b"RDY1";
 const MAX_WORKSPACE_HANDOFF_BYTES: usize = 64 * 1024;
+
+type RemoteSessions = std::collections::BTreeMap<String, Arc<loopback::RunRemoteSession>>;
+type SetupState = (workspace::WorkspaceHandle, RemoteSessions, daemon::VsockDaemon);
 
 fn main() {
     if let Err(err) = run() {
@@ -28,9 +35,11 @@ fn run() -> Result<(), String> {
     if cfg::RuntimeConfig::invoked_name()? != clidef::APPNAME {
         let share_dir = share_dir_from_args()?;
         if let Some(config) = cfg::RuntimeConfig::for_invoked_name(&share_dir)? {
-            let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
-            let _guard = rt.enter();
-            return run_packaged_runtime(config, workspace_override, &share_dir);
+            return tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?.block_on(async move {
+                tokio::task::spawn_blocking(move || run_packaged_runtime(config, workspace_override, &share_dir))
+                    .await
+                    .map_err(|error| format!("packaged runtime thread failed: {error}"))?
+            });
         }
     }
 
@@ -185,14 +194,24 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
     let repo_root = workspace::project_root()?;
     let env = ProjectConfig::load_or_create(&repo_root)?;
+    let (target_catalog, remote_config_error) = match remote_target::BuildTargetCatalog::load_optional(&repo_root, &env) {
+        Ok(Some(catalog)) => (catalog, None),
+        Ok(None) => (remote_target::BuildTargetCatalog::localhost_only(repo_root.clone(), env.clone())?, None),
+        Err(error) => {
+            logging::diagnostic(&format!("remote.conf disabled for this run: {error}"));
+            (remote_target::BuildTargetCatalog::localhost_only(repo_root.clone(), env.clone())?, Some(error))
+        }
+    };
+    let active_target = remote_target::ActiveBuildTarget::new();
 
     let merged_allow: Vec<String> = config.allow.clone().unwrap_or_default().into_iter().chain(env.image.allow.clone().unwrap_or_default()).collect();
 
     let passthrough = env.project.passthrough.clone();
     let env_mode = env.project.env;
     let profiles = env.profiles.clone();
+    let remote_environment_names = target_catalog.environment_names();
+    let remote_tool_names = target_catalog.wrapper_names();
     let share_dir_owned = share_dir.to_path_buf();
-    let daemon_holder: Arc<Mutex<Option<daemon::VsockDaemon>>> = Arc::new(Mutex::new(None));
 
     let mut sock_fds = [-1i32, -1];
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr()) } != 0 {
@@ -208,7 +227,7 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
 
     let (cols, rows) = crossterm::terminal::size().map_err(|e| format!("terminal size: {e}"))?;
 
-    let winsize = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let winsize = libc::winsize { ws_row: tui::guest_rows(rows), ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
 
     let mut master: RawFd = -1;
     let pid = unsafe { libc::forkpty(&mut master, std::ptr::null_mut(), std::ptr::null(), &winsize) };
@@ -225,52 +244,27 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
         bunkerbox::logging::set_status_fd(status_fd);
         bunkerbox::logging::log("Starting...");
 
-        if !std::process::Command::new("sudo")
-            .arg("-n")
-            .arg("true")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            let pass = bunkerbox::logging::prompt_password("Sudo password", "Enter your sudo password")?;
-
-            let mut child = std::process::Command::new("sudo")
-                .arg("-S")
-                .arg("-v")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("failed to run sudo: {e}"))?;
-
-            use std::io::Write;
-            child.stdin.as_mut().unwrap().write_all(pass.as_bytes()).map_err(|e| format!("failed to write sudo password: {e}"))?;
-            drop(child.stdin.take());
-
-            let status = child.wait().map_err(|e| format!("sudo failed: {e}"))?;
-            if !status.success() {
-                return Err("sudo: authentication failed".to_string());
-            }
+        let mut setup_child = unsafe { File::from_raw_fd(setup_child_fd) };
+        if let Err(error) = ensure_sudo() {
+            logging::log(&format!("Startup failed: {error}"));
+            return Err(error);
         }
-
-        std::thread::spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(240));
-            let _ = std::process::Command::new("sudo")
-                .arg("-n")
-                .arg("-v")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        });
-
-        let ws = workspace::resolve(workspace_mode, quota, exclude.as_deref(), &name)?;
-        write_workspace_handoff(setup_child_fd, ws.path())?;
-
-        let vsock_enabled = !passthrough.is_empty();
-        let code = match kata::run(&config, ws, &container_name, share_dir, &name, vsock_enabled, status_fd) {
+        write_startup_ready(&mut setup_child)?;
+        let (workspace_path, remote_session) = read_run_handoff(&mut setup_child)?;
+        let code = match kata::run(
+            &config,
+            kata::WorkspaceBinding {
+                path: &workspace_path,
+                remote_session,
+                remote_tools: &remote_tool_names,
+                remote_environment: &remote_environment_names,
+            },
+            &container_name,
+            share_dir,
+            &name,
+            true,
+            status_fd,
+        ) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("bunkerbox: {e}");
@@ -296,43 +290,140 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     unsafe { libc::close(child_fd) };
     unsafe { libc::close(setup_child_fd) };
 
+    let mut startup_fds = [-1i32, -1];
+    if unsafe { libc::pipe(startup_fds.as_mut_ptr()) } != 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            libc::close(master);
+        }
+        return Err(format!("startup status pipe: {}", std::io::Error::last_os_error()));
+    }
+    let (startup_status_read, startup_status_write) = (startup_fds[0], startup_fds[1]);
+
     let overlay: Arc<Mutex<tui::OverlayState>> = Arc::new(Mutex::new(tui::OverlayState::new()));
-    let status_listener = start_status_listener(overlay.clone())?;
+    if let Some(error) = &remote_config_error {
+        tui::show_host_error(&overlay, "remote.conf", error);
+    }
+    let status_listener = match start_status_listener(overlay.clone()) {
+        Ok(listener) => listener,
+        Err(error) => {
+            unsafe {
+                libc::close(startup_status_read);
+                libc::close(startup_status_write);
+                libc::kill(pid, libc::SIGTERM);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+                libc::close(master);
+            }
+            return Err(error);
+        }
+    };
 
     let setup_handle = tokio::runtime::Handle::current().clone();
-    let daemon_slot = daemon_holder.clone();
-    let setup_thread = std::thread::spawn(move || -> Result<(), String> {
-        let workspace = read_workspace_handoff(setup_parent_fd)?;
-        if passthrough.is_empty() {
-            return Ok(());
+    let target_catalog_for_setup = target_catalog.clone();
+    let active_target_for_setup = active_target.clone();
+    let setup_thread = std::thread::spawn(move || -> Result<SetupState, String> {
+        let mut setup_parent = unsafe { File::from_raw_fd(setup_parent_fd) };
+        let startup_status = unsafe { File::from_raw_fd(startup_status_write) };
+        logging::set_status_fd(startup_status.as_raw_fd());
+        let _runtime_guard = setup_handle.enter();
+
+        if let Err(error) = read_startup_ready(&mut setup_parent) {
+            logging::log(&format!("Startup failed: {error}"));
+            return Err(error);
         }
 
-        let _guard = setup_handle.enter();
-        let daemon = daemon::VsockDaemon::start(passthrough, env_mode, workspace, profiles, share_dir_owned, merged_allow)?;
-        *daemon_slot.lock().map_err(|_| "daemon state lock poisoned".to_string())? = Some(daemon);
-        Ok(())
+        let setup_result = (|| -> Result<SetupState, String> {
+            logging::log("Preparing workspace...");
+            let workspace = workspace::resolve(workspace_mode, quota, exclude.as_deref(), &name)?;
+            let remote_session = new_session_id();
+            logging::log("Preparing remote session...");
+            loopback::cleanup_stale_roots(&std::env::temp_dir())?;
+            let mut sessions = RemoteSessions::new();
+            for remote_target in target_catalog_for_setup.remote_targets() {
+                let target_label = remote_target.summary().label();
+                let snapshot_root =
+                    std::env::temp_dir().join(format!("bunkerbox-snapshots-{}-{}-{target_label}", std::process::id(), remote_session.to_hex()));
+                let jobs_root =
+                    std::env::temp_dir().join(format!("bunkerbox-remote-{}-{}-{target_label}", std::process::id(), remote_session.to_hex()));
+                let snapshot_store = snapshot::SnapshotStore::new(&snapshot_root);
+                let mut target_project = target_catalog_for_setup.base_project().clone();
+                target_project.project.remote = remote_target.project().clone();
+                let exclusion_policy = snapshot::SnapshotExclusionPolicy::from_remote_config(&target_project, exclude.as_deref())?;
+                let snapshot_builder = snapshot::SnapshotBuilder::new(snapshot_store.clone(), snapshot::SnapshotLimits::default(), exclusion_policy);
+                let session = Arc::new(loopback::RunRemoteSession::new(
+                    bunkerbox::remote::WorkspaceSessionId(remote_session.0),
+                    new_target_id(),
+                    workspace.path().to_path_buf(),
+                    snapshot_store,
+                    snapshot_builder,
+                    jobs_root,
+                )?);
+                sessions.insert(target_label.to_string(), session);
+            }
+            logging::log("Starting remote daemon...");
+            let global_active = config.remote_max_active_builds()?;
+            let daemon = daemon::VsockDaemon::start_with_target_catalog(
+                passthrough,
+                env_mode,
+                workspace.path().to_path_buf(),
+                profiles,
+                share_dir_owned,
+                merged_allow,
+                target_catalog_for_setup,
+                active_target_for_setup,
+                sessions.clone(),
+                bunkerbox::remote::WorkspaceSessionId(remote_session.0),
+                global_active,
+            )?;
+            if let Err(error) = write_run_handoff(&mut setup_parent, workspace.path(), remote_session) {
+                tokio::runtime::Handle::current().block_on(daemon.shutdown());
+                return Err(error);
+            }
+            Ok((workspace, sessions, daemon))
+        })();
+
+        if let Err(error) = &setup_result {
+            logging::log(&format!("Startup failed: {error}"));
+        }
+        setup_result
     });
 
-    let tui_result = tui::event_loop(master, rows, cols, parent_fd, overlay);
-
-    let mut status: i32 = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-    unsafe { libc::close(master) };
+    let tui_result = tui::event_loop(master, rows, cols, parent_fd, startup_status_read, overlay, target_catalog, active_target);
+    let tui_error = tui_result.err();
+    if tui_error.is_some() {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
 
     let setup_result = match setup_thread.join() {
         Ok(result) => result,
         Err(_) => Err("workspace setup thread panicked".to_string()),
     };
 
-    if let Some(d) = daemon_holder.lock().map_err(|_| "daemon state lock poisoned".to_string())?.take() {
-        tokio::runtime::Handle::current().block_on(d.shutdown());
-    }
+    let mut status: i32 = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    unsafe { libc::close(master) };
+    unsafe { libc::close(startup_status_read) };
+
+    let (setup_state, setup_error) = match setup_result {
+        Ok((workspace, sessions, daemon)) => {
+            tokio::runtime::Handle::current().block_on(daemon.shutdown());
+            drop(sessions);
+            drop(workspace);
+            (true, None)
+        }
+        Err(error) => (false, Some(error)),
+    };
 
     tokio::runtime::Handle::current().block_on(status_listener.shutdown());
 
-    tui_result?;
-    setup_result?;
-
+    if let Some(error) = tui_error {
+        return Err(error);
+    }
+    if let Some(error) = setup_error {
+        return Err(error);
+    }
+    debug_assert!(setup_state);
     if status != 0 {
         return Err(format!("child exited with status {status}"));
     }
@@ -340,17 +431,119 @@ fn run_packaged_runtime(config: cfg::RuntimeConfig, workspace_override: Option<W
     Ok(())
 }
 
-fn write_workspace_handoff(fd: RawFd, path: &Path) -> Result<(), String> {
-    let bytes = path.as_os_str().as_bytes();
-    let frame = encode_workspace_handoff(bytes)?;
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    io::Write::write_all(&mut file, &frame).map_err(|err| format!("write workspace handoff: {err}"))
+fn new_session_id() -> vscomm::WorkspaceSessionId {
+    loop {
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        if bytes != [0; 16] {
+            return vscomm::WorkspaceSessionId(bytes);
+        }
+    }
 }
 
-fn read_workspace_handoff(fd: RawFd) -> Result<PathBuf, String> {
-    let mut file = unsafe { File::from_raw_fd(fd) };
+fn new_target_id() -> bunkerbox::remote::RemoteTargetId {
+    loop {
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        if bytes != [0; 16] {
+            return bunkerbox::remote::RemoteTargetId(bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+fn remote_tool_names(entries: &[RemoteToolSpec]) -> Vec<String> {
+    entries.iter().map(|tool| tool.name.clone()).collect()
+}
+
+fn write_run_handoff(file: &mut File, path: &Path, session_id: vscomm::WorkspaceSessionId) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("workspace handoff path must be absolute".to_string());
+    }
+    let mut payload = path.as_os_str().as_bytes().to_vec();
+    if payload.contains(&0) {
+        return Err("workspace path contains NUL".to_string());
+    }
+    payload.push(0);
+    payload.extend_from_slice(&session_id.0);
+    let frame = encode_workspace_handoff(&payload)?;
+    io::Write::write_all(file, &frame).map_err(|err| format!("write run handoff: {err}"))
+}
+
+fn write_startup_ready(file: &mut File) -> Result<(), String> {
+    io::Write::write_all(file, STARTUP_READY_MAGIC).map_err(|err| format!("write startup readiness: {err}"))
+}
+
+fn read_startup_ready(file: &mut File) -> Result<(), String> {
+    let mut ready = [0u8; STARTUP_READY_MAGIC.len()];
+    io::Read::read_exact(file, &mut ready).map_err(|err| format!("read startup readiness: {err}"))?;
+    if &ready != STARTUP_READY_MAGIC {
+        return Err("startup readiness has an invalid type".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_sudo() -> Result<(), String> {
+    if !std::process::Command::new("sudo")
+        .arg("-n")
+        .arg("true")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        let pass = bunkerbox::logging::prompt_password("Sudo password", "Enter your sudo password")?;
+        let mut child = std::process::Command::new("sudo")
+            .arg("-S")
+            .arg("-v")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to run sudo: {error}"))?;
+        io::Write::write_all(child.stdin.as_mut().ok_or_else(|| "failed to open sudo stdin".to_string())?, pass.as_bytes())
+            .map_err(|error| format!("failed to write sudo password: {error}"))?;
+        drop(child.stdin.take());
+        if !child.wait().map_err(|error| format!("sudo failed: {error}"))?.success() {
+            return Err("sudo: authentication failed".to_string());
+        }
+    }
+
+    std::thread::spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(240));
+        let _ = std::process::Command::new("sudo")
+            .arg("-n")
+            .arg("-v")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
+    Ok(())
+}
+
+fn read_run_handoff(file: &mut File) -> Result<(PathBuf, vscomm::WorkspaceSessionId), String> {
+    let payload = read_workspace_handoff(file)?;
+    let bytes = payload.as_os_str().as_bytes();
+    if bytes.len() < 17 || bytes[bytes.len() - 17] != 0 {
+        return Err("run handoff is malformed".to_string());
+    }
+    let path = PathBuf::from(OsString::from_vec(bytes[..bytes.len() - 17].to_vec()));
+    if !path.is_absolute() {
+        return Err("run handoff path must be absolute".to_string());
+    }
+    let mut session = [0u8; 16];
+    session.copy_from_slice(&bytes[bytes.len() - 16..]);
+    if session == [0; 16] {
+        return Err("run handoff session is zero".to_string());
+    }
+    Ok((path, vscomm::WorkspaceSessionId(session)))
+}
+
+fn read_workspace_handoff(file: &mut File) -> Result<PathBuf, String> {
     let mut header = [0u8; 8];
-    io::Read::read_exact(&mut file, &mut header).map_err(|err| format!("read workspace handoff header: {err}"))?;
+    io::Read::read_exact(file, &mut header).map_err(|err| format!("read workspace handoff header: {err}"))?;
 
     let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if payload_len > MAX_WORKSPACE_HANDOFF_BYTES {
@@ -358,7 +551,7 @@ fn read_workspace_handoff(fd: RawFd) -> Result<PathBuf, String> {
     }
 
     let mut payload = vec![0u8; payload_len];
-    io::Read::read_exact(&mut file, &mut payload).map_err(|err| format!("read workspace handoff: {err}"))?;
+    io::Read::read_exact(file, &mut payload).map_err(|err| format!("read workspace handoff: {err}"))?;
 
     let mut frame = header.to_vec();
     frame.extend_from_slice(&payload);
@@ -422,8 +615,6 @@ fn start_status_listener(overlay: Arc<Mutex<tui::OverlayState>>) -> Result<Statu
 async fn status_listener(
     listener: tokio_vsock::VsockListener, overlay: Arc<Mutex<tui::OverlayState>>, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    use tokio::io::AsyncReadExt;
-
     loop {
         let (mut stream, _peer) = tokio::select! {
             result = listener.accept() => match result {
@@ -435,28 +626,14 @@ async fn status_listener(
 
         let overlay = overlay.clone();
         tokio::spawn(async move {
-            let mut header = [0u8; 6];
-            if stream.read_exact(&mut header).await.is_err() {
-                return;
-            }
-
-            let frame_type_raw = u16::from_le_bytes([header[0], header[1]]);
-            let payload_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
-
-            let Some(ft) = vscomm::FrameType::from_u16(frame_type_raw) else {
+            let Ok(frame) = vscomm::Frame::read_async(&mut stream).await else {
                 return;
             };
-
-            if !matches!(ft, vscomm::FrameType::UiCommand) {
+            if !matches!(frame.frame_type, vscomm::FrameType::UiCommand) {
                 return;
             }
 
-            let mut payload = vec![0u8; payload_len];
-            if payload_len > 0 && stream.read_exact(&mut payload).await.is_err() {
-                return;
-            }
-
-            if let Some((widget, cmd, opts, val)) = vscomm::decode_ui_payload(&payload) {
+            if let Some((widget, cmd, opts, val)) = vscomm::decode_ui_payload(&frame.payload) {
                 if widget == "error" && cmd == "show" {
                     let title = if opts.is_empty() { "Bunkerbox error" } else { opts };
                     logging::diagnostic(&format!("TUI error [{title}]: {val}"));

@@ -370,11 +370,14 @@ impl SshExecution {
         }
         self.control.set_phase(crate::remote::RemoteLifecyclePhase::Connecting);
         let mut connection = match phase(
-            async {
-                let mut connection = WorkerConnection::spawn(&self.factory, &self.target)?;
-                connection.handshake(WorkerRequestId(request_id), session_id_for(&self.session), build_protocol_version(&self.target, false)).await?;
-                Ok(connection)
-            },
+            WorkerConnection::connect(
+                &self.factory,
+                &self.target,
+                WorkerRequestId(request_id),
+                session_id_for(&self.session),
+                build_protocol_version(&self.target, false),
+                self.target.resources().cleanup_timeout(),
+            ),
             remaining(sync_deadline).min(self.target.resources().connect_timeout()),
             &self.control,
             crate::remote::RemoteTimeoutCause::Connection,
@@ -408,7 +411,7 @@ impl SshExecution {
         drop(export);
 
         if let Err(error) = result {
-            connection.kill_and_reap(self.target.resources().cleanup_timeout()).await;
+            let error = connection.capture_early_failure(error, self.target.resources().cleanup_timeout()).await;
             self.cleanup_upload(request_id, upload_id).await;
             let _ = self.session.abort_snapshot_capability(snapshot_id);
             return Err(error);
@@ -523,17 +526,14 @@ impl SshExecution {
 
         self.control.set_phase(crate::remote::RemoteLifecyclePhase::Connecting);
         let mut connection = match phase(
-            async {
-                let mut connection = WorkerConnection::spawn(&self.factory, &self.target)?;
-                connection
-                    .handshake(
-                        WorkerRequestId(request_id),
-                        WorkerSessionId(self.session.session_id().0),
-                        build_protocol_version(&self.target, self.artifact_policy.is_enabled()),
-                    )
-                    .await?;
-                Ok(connection)
-            },
+            WorkerConnection::connect(
+                &self.factory,
+                &self.target,
+                WorkerRequestId(request_id),
+                WorkerSessionId(self.session.session_id().0),
+                build_protocol_version(&self.target, self.artifact_policy.is_enabled()),
+                self.target.resources().cleanup_timeout(),
+            ),
             self.target.resources().connect_timeout(),
             &self.control,
             crate::remote::RemoteTimeoutCause::Connection,
@@ -579,7 +579,7 @@ impl SshExecution {
             } else {
                 false
             };
-            connection.kill_and_reap(self.target.resources().cleanup_timeout()).await;
+            let error = connection.capture_early_failure(error, self.target.resources().cleanup_timeout()).await;
             if !cleanup_succeeded {
                 self.cleanup_upload(request_id, upload_id).await;
             }
@@ -649,6 +649,17 @@ impl WorkerConnection {
         let stderr = process.take_stderr().ok_or_else(|| unavailable("SSH transport has no stderr"))?;
         let stderr_task = tokio::spawn(read_diagnostic(stderr));
         Ok(Self { process, writer: Some(writer), reader, stderr_task: Some(stderr_task), version: WORKER_PROTOCOL_VERSION })
+    }
+
+    async fn connect(
+        factory: &Arc<dyn SshProcessFactory>, target: &SshTarget, request_id: WorkerRequestId, session_id: WorkerSessionId, version: u16,
+        cleanup_timeout: Duration,
+    ) -> Result<Self, RemoteBackendError> {
+        let mut connection = Self::spawn(factory, target)?;
+        match connection.handshake(request_id, session_id, version).await {
+            Ok(()) => Ok(connection),
+            Err(error) => Err(connection.capture_early_failure(error, cleanup_timeout).await),
+        }
     }
 
     async fn handshake(&mut self, request_id: WorkerRequestId, session_id: WorkerSessionId, version: u16) -> Result<(), RemoteBackendError> {
@@ -748,6 +759,27 @@ impl WorkerConnection {
         let _ = timeout(cleanup_timeout.min(PROCESS_REAP_TIMEOUT), self.process.wait()).await;
         if let Some(task) = self.stderr_task.take() {
             task.abort();
+        }
+    }
+
+    async fn capture_early_failure(&mut self, error: RemoteBackendError, cleanup_timeout: Duration) -> RemoteBackendError {
+        self.writer.take();
+        self.process.kill_group();
+        let deadline = Instant::now() + cleanup_timeout.min(PROCESS_REAP_TIMEOUT);
+        let _ = timeout(remaining(deadline), self.process.wait()).await;
+        let diagnostic = self.collect_diagnostic(remaining(deadline)).await;
+        append_worker_diagnostic(error, &diagnostic)
+    }
+
+    async fn collect_diagnostic(&mut self, duration: Duration) -> Vec<u8> {
+        let Some(mut task) = self.stderr_task.take() else { return Vec::new() };
+        match timeout(duration, &mut task).await {
+            Ok(Ok(diagnostic)) => diagnostic,
+            Ok(Err(_)) => Vec::new(),
+            Err(_) => {
+                task.abort();
+                Vec::new()
+            }
         }
     }
 }
@@ -1168,6 +1200,15 @@ fn worker_io_error(error: worker_protocol::WorkerProtocolError) -> RemoteBackend
         RemoteBackendError::Transport { class, message: error.to_string() }
     } else {
         disconnected(error.to_string())
+    }
+}
+
+fn append_worker_diagnostic(error: RemoteBackendError, diagnostic: &[u8]) -> RemoteBackendError {
+    match error {
+        RemoteBackendError::Transport { class, message } if !diagnostic.is_empty() => {
+            RemoteBackendError::Transport { class, message: format!("{message}\nworker stderr: {}", String::from_utf8_lossy(diagnostic)) }
+        }
+        error => error,
     }
 }
 

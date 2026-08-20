@@ -51,6 +51,8 @@ enum ScriptMode {
     Success,
     WrongVersion,
     ProtocolError,
+    ExitBeforeHello { diagnostic_bytes: usize },
+    ExitDuringUpload { diagnostic_bytes: usize },
     ArtifactSuccess,
     ArtifactManifestError,
     ArtifactTransferError,
@@ -77,11 +79,11 @@ impl SshProcessFactory for ScriptedFactory {
 
         let (host_writer, worker_reader) = tokio::io::duplex(8192);
         let (worker_writer, host_reader) = tokio::io::duplex(8192);
-        let (host_stderr, _worker_stderr) = tokio::io::duplex(256);
+        let (host_stderr, worker_stderr) = tokio::io::duplex(MAX_SSH_DIAGNOSTIC_BYTES + 1024);
         let (status_tx, status_rx) = oneshot::channel();
         let messages = self.messages.clone();
         tokio::spawn(async move {
-            let status = scripted_worker(worker_reader, worker_writer, mode, messages).await;
+            let status = scripted_worker(worker_reader, worker_writer, worker_stderr, mode, messages).await;
             let _ = status_tx.send(status);
         });
 
@@ -133,11 +135,17 @@ impl SshProcess for ScriptedProcess {
     }
 }
 
-async fn scripted_worker<R, W>(mut reader: R, mut writer: W, mode: ScriptMode, messages: Arc<Mutex<Vec<WorkerMessage>>>) -> i32
+async fn scripted_worker<R, W, E>(mut reader: R, mut writer: W, mut stderr: E, mode: ScriptMode, messages: Arc<Mutex<Vec<WorkerMessage>>>) -> i32
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
 {
+    if let ScriptMode::ExitBeforeHello { diagnostic_bytes } = mode {
+        let _ = worker_protocol::read_message_versioned(&mut reader).await;
+        write_scripted_diagnostic(&mut stderr, diagnostic_bytes).await;
+        return 79;
+    }
     let Ok((hello_version, WorkerMessage::Hello { request_id, session_id, .. })) = worker_protocol::read_message_versioned(&mut reader).await else {
         return 71;
     };
@@ -157,6 +165,10 @@ where
 
     let Ok((_, first)) = worker_protocol::read_message_versioned(&mut reader).await else { return 72 };
     messages.lock().unwrap().push(first.clone());
+    if let ScriptMode::ExitDuringUpload { diagnostic_bytes } = mode {
+        write_scripted_diagnostic(&mut stderr, diagnostic_bytes).await;
+        return 80;
+    }
     if matches!(mode, ScriptMode::ProtocolError) {
         worker_protocol::write_message_versioned(
             &mut writer,
@@ -300,6 +312,16 @@ where
         }
         _ => 78,
     }
+}
+
+async fn write_scripted_diagnostic<W: AsyncWrite + Unpin>(stderr: &mut W, bytes: usize) {
+    let mut diagnostic = Vec::new();
+    while diagnostic.len() < bytes {
+        diagnostic.extend_from_slice(b"scripted worker diagnostic: missing worker dependency\n");
+    }
+    diagnostic.truncate(bytes);
+    let _ = stderr.write_all(&diagnostic).await;
+    let _ = stderr.flush().await;
 }
 
 struct Fixture {
@@ -477,6 +499,60 @@ async fn worker_protocol_failure_is_terminal_without_local_fallback() {
     let error = backend.execute(authorize_sync(&fixture), tx).await.unwrap_err();
     assert!(matches!(error, RemoteBackendError::Transport { class: RemoteFailureClass::WorkerProtocol, .. }), "{error:?}");
     assert_eq!(fixture.session.snapshot_capability_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_handshake_failure_includes_worker_stderr() {
+    let fixture = fixture();
+    let factory = ScriptedFactory::new(vec![ScriptMode::ExitBeforeHello { diagnostic_bytes: 96 }]);
+    let backend = SshBackend::new(fixture.session.clone(), fixture.ssh_target.clone()).unwrap().with_process_factory(factory);
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+    let error = backend.execute(authorize_sync(&fixture), tx).await.unwrap_err();
+    let RemoteBackendError::Transport { class, message } = error else { panic!("expected transport failure") };
+    assert_eq!(class, RemoteFailureClass::WorkerProtocol);
+    assert!(message.contains("invalid worker protocol: truncated worker frame header"));
+    assert!(message.contains("\nworker stderr: scripted worker diagnostic: missing worker dependency"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_upload_failure_includes_worker_stderr() {
+    let fixture = fixture();
+    let factory = ScriptedFactory::new(vec![ScriptMode::ExitDuringUpload { diagnostic_bytes: 96 }]);
+    let backend = SshBackend::new(fixture.session.clone(), fixture.ssh_target.clone()).unwrap().with_process_factory(factory);
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+    let error = backend.execute(authorize_sync(&fixture), tx).await.unwrap_err();
+    let RemoteBackendError::Transport { message, .. } = error else { panic!("expected transport failure") };
+    assert!(message.contains("worker I/O error") || message.contains("invalid worker protocol"));
+    assert!(message.contains("\nworker stderr: scripted worker diagnostic: missing worker dependency"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_failure_without_worker_stderr_preserves_the_original_error() {
+    let fixture = fixture();
+    let factory = ScriptedFactory::new(vec![ScriptMode::ExitBeforeHello { diagnostic_bytes: 0 }]);
+    let backend = SshBackend::new(fixture.session.clone(), fixture.ssh_target.clone()).unwrap().with_process_factory(factory);
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+    let error = backend.execute(authorize_sync(&fixture), tx).await.unwrap_err();
+    let RemoteBackendError::Transport { class, message } = error else { panic!("expected transport failure") };
+    assert_eq!(class, RemoteFailureClass::WorkerProtocol);
+    assert_eq!(message, "invalid worker protocol: truncated worker frame header");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_worker_stderr_diagnostic_is_bounded() {
+    let fixture = fixture();
+    let factory = ScriptedFactory::new(vec![ScriptMode::ExitBeforeHello { diagnostic_bytes: MAX_SSH_DIAGNOSTIC_BYTES + 1024 }]);
+    let backend = SshBackend::new(fixture.session.clone(), fixture.ssh_target.clone()).unwrap().with_process_factory(factory);
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+    let error = backend.execute(authorize_sync(&fixture), tx).await.unwrap_err();
+    let RemoteBackendError::Transport { message, .. } = error else { panic!("expected transport failure") };
+    let diagnostic = message.split_once("\nworker stderr: ").map(|(_, diagnostic)| diagnostic).expect("worker diagnostic is present");
+    assert_eq!(diagnostic.len(), MAX_SSH_DIAGNOSTIC_BYTES);
+    assert!(diagnostic.starts_with("scripted worker diagnostic: missing worker dependency"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

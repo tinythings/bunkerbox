@@ -528,6 +528,30 @@ fn local_exec_request_still_builds_on_the_local_path() {
     assert!(super::build_command(&session, &request, &cwd).is_ok());
 }
 
+#[test]
+fn logical_workspace_root_maps_to_the_absolute_local_workspace_root() {
+    let cwd = super::guest_workspace_cwd(&WorkspaceRelativePath::new("").unwrap());
+    assert_eq!(cwd, Path::new("/workspace"));
+}
+
+#[test]
+fn logical_workspace_subdirectory_maps_to_an_absolute_local_workspace_path() {
+    let cwd = super::guest_workspace_cwd(&WorkspaceRelativePath::new("nested/project").unwrap());
+    assert_eq!(cwd, Path::new("/workspace/nested/project"));
+}
+
+#[test]
+fn empty_logical_workspace_cwd_never_becomes_an_empty_local_executor_cwd() {
+    let cwd = super::guest_workspace_cwd(&WorkspaceRelativePath::new("").unwrap());
+    assert!(!cwd.as_os_str().is_empty());
+}
+
+#[test]
+fn escaping_logical_workspace_cwd_remains_rejected() {
+    assert!(WorkspaceRelativePath::new("../escape").is_err());
+    assert!(WorkspaceRelativePath::new("/workspace/escape").is_err());
+}
+
 #[tokio::test]
 async fn transparent_exec_request_routes_fresh_managed_cargo_to_selected_remote_target() {
     let (root, catalog) = target_catalog_fixture();
@@ -555,7 +579,7 @@ async fn transparent_exec_request_routes_fresh_managed_cargo_to_selected_remote_
 }
 
 #[tokio::test]
-async fn managed_remote_wrapper_requests_route_to_target_selected_after_daemon_setup() {
+async fn managed_remote_wrapper_requests_with_bsdbox_selected_never_enter_local_cwd_conversion() {
     let (root, catalog) = target_catalog_fixture();
     let active = ActiveBuildTarget::new();
     let backend = Arc::new(TargetRecordingBackend { calls: Mutex::new(Vec::new()) });
@@ -590,6 +614,7 @@ async fn managed_remote_wrapper_requests_route_to_target_selected_after_daemon_s
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].target(), target);
     assert_eq!(calls[1].target(), target);
+    assert!(session.local_capabilities.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

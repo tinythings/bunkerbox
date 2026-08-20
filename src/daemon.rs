@@ -1147,7 +1147,10 @@ async fn dispatch_local_remote_request<W: AsyncWriteExt + Unpin>(
                 .await;
             }
             let exec_request = ExecRequest {
-                cwd: build.cwd().as_str().to_string(),
+                cwd: guest_workspace_cwd(build.cwd())
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| "local workspace cwd is not valid UTF-8".to_string())?,
                 command: build.tool().as_str().to_string(),
                 args: build.argv().to_vec(),
                 env: build.env().to_vec(),
@@ -1190,6 +1193,14 @@ async fn dispatch_local_remote_request<W: AsyncWriteExt + Unpin>(
             )
             .await
         }
+    }
+}
+
+fn guest_workspace_cwd(cwd: &WorkspaceRelativePath) -> PathBuf {
+    if cwd.as_str().is_empty() {
+        PathBuf::from("/workspace")
+    } else {
+        Path::new("/workspace").join(cwd.as_str())
     }
 }
 
